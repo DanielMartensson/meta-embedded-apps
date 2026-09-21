@@ -1,7 +1,6 @@
 SUMMARY = "NanoBrowser - minimal Qt6 QML browser built on Qt WebEngine"
 DESCRIPTION = "NanoBrowser is a lightweight QML browser for embedded Linux built \
-on Qt WebEngine, targeted at STM32MP2 based devices. It renders via Vulkan with \
-an OpenGL fallback."
+on Qt WebEngine. It renders via Vulkan with an OpenGL fallback."
 HOMEPAGE = "https://github.com/DanielMartensson/NanoBrowser"
 BUGTRACKER = "https://github.com/DanielMartensson/NanoBrowser/issues"
 

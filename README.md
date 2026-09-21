@@ -50,6 +50,6 @@ Cargo needs crates.io access during OpenNOW `do_compile`.
 
 | App | Notes |
 | --- | --- |
-| OpenNOW | Needs Wayland, Vulkan, `libsdl3`. Use the `opennow` launcher to enable hardware decode: VA-API backend → libva `v4l2-request` driver → `/dev/video0` (STM32MP2 stateless decoder); in-app select backend `VA-API` + codec `H.264` |
+| OpenNOW | Needs Wayland, Vulkan, `libsdl3`. Use the `opennow` launcher to enable hardware decode: VA-API backend → libva `v4l2-request` driver → `/dev/video0` (V4L2 stateless decoder); in-app select backend `VA-API` + codec `H.264` |
 | NanoBrowser | As root run `QTWEBENGINE_DISABLE_SANDBOX=1` |
 | YtGst | Needs GStreamer plugins, `yt-dlp` and `pulseaudio` |

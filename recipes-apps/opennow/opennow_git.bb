@@ -2,10 +2,10 @@ SUMMARY = "OpenNOW - open source cloud gaming client (GeForce NOW style)"
 DESCRIPTION = "OpenNOW is an open-source client for cloud gaming built on a Qt 6 \
 Quick user interface with a native Rust streaming engine. It targets embedded \
 and desktop Linux with a controller-first experience. The recipe builds the \
-opennow-qt QML application and the Rust core/streamer binaries. The primary \
-target is the STM32MP257F (aarch64) but the recipe is machine-agnostic: \
-OPENNOW_RUST_TARGET selects the Rust triple and PACKAGECONFIG controls which \
-hardware-decode backends are packaged and how the runtime reaches them."
+opennow-qt QML application and the Rust core/streamer binaries. The recipe is \
+machine-agnostic: OPENNOW_RUST_TARGET selects the Rust triple and PACKAGECONFIG \
+controls which hardware-decode backends are packaged and how the runtime \
+reaches them."
 HOMEPAGE = "https://github.com/OpenCloudGaming/OpenNOW"
 BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 
@@ -58,7 +58,7 @@ PACKAGECONFIG[v4l2-request] = ",,,,"
 
 # Driver and search path exported by the `opennow` launcher so the VA-API
 # backend is pointed at a V4L2 stateless user-space driver (e.g. a
-# libva-v4l2-request backend in front of the STM32MP2 hantro node
+# libva-v4l2-request backend in front of the platform stateless decoder node
 # /dev/video0). Override per machine or distribution.
 OPENNOW_LIBVA_DRIVER ?= "v4l2_request"
 OPENNOW_LIBVA_DRIVERS_PATH ?= "${libdir}/dri"
