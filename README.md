@@ -51,14 +51,35 @@ bitbake opennow nanobrowser ytgst
 ## Runtime notes
 
 - **OpenNOW** needs Wayland (Weston), Vulkan (`vulkan-loader`) and the
-  SDL 3 runtime (`libsdl3`) for controller input. VA-API is used only at build
-  time on STM32MP2 (no video driver); decoding is V4L2.
+  SDL 3 runtime (`libsdl3`) for controller input.
 - **NanoBrowser** needs `QTWEBENGINE_DISABLE_SANDBOX=1` (or a setuid sandbox)
   when started as root; e.g.
   `QTWEBENGINE_DISABLE_SANDBOX=1 QT_QUICK_BACKEND=software nanobrowser` is a
   useful safe fallback if GPU issues occur.
 - **YtGst** calls `yt-dlp` from `PATH` (installed to `${bindir}`) and requires
   the GStreamer runtime plugin set and audio (`pulseaudio`).
+
+### OpenNOW hardware-accelerated decode (selectable, not STM32-specific)
+
+The STM32MP2 video codec (`/dev/video0`, hantro V4L2 **stateless**) is not
+served by OpenNOW's native stateful-H.264 V4L2 path, so decoding falls back to
+the bundled FFmpeg software decoder. To use the silicon decoder:
+
+- Add a V4L2-stateless user-space media driver to the image (e.g. a
+  `libva-v4l2-request` libVA backend). OpenNOW's VA-API backend
+  (`vaapi` PACKAGECONFIG, `libva` runtime dep) then decodes on the hardware
+  via `/dev/video0`.
+- Launch OpenNOW through the `opennow` launcher helper (installed when the
+  `v4l2-request` PACKAGECONFIG is enabled). It exports
+  `LIBVA_DRIVER_NAME`/`LIBVA_DRIVERS_PATH` from `OPENNOW_LIBVA_DRIVER` and
+  `OPENNOW_LIBVA_DRIVERS_PATH` before exec'ing `opennow-qt`.
+- Inside the app select stream -> decoder/backend `VA-API` and codec `H.264`
+  so `auto` does not prefer the (software) FFmpeg/Vulkan path.
+
+The same mechanism works on other embedded boards that expose a stateless
+decoder through a libVA driver; nothing in the recipe is pinned to STM32.
+Override `PACKAGECONFIG`, `OPENNOW_LIBVA_DRIVER`/`OPENNOW_LIBVA_DRIVERS_PATH`
+per machine or distribution.
 
 ## Updating a pinned revision
 

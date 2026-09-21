@@ -2,8 +2,10 @@ SUMMARY = "OpenNOW - open source cloud gaming client (GeForce NOW style)"
 DESCRIPTION = "OpenNOW is an open-source client for cloud gaming built on a Qt 6 \
 Quick user interface with a native Rust streaming engine. It targets embedded \
 and desktop Linux with a controller-first experience. The recipe builds the \
-opennow-qt QML application and the Rust core/streamer binaries cross-compiled \
-for the STM32MP257F (aarch64)."
+opennow-qt QML application and the Rust core/streamer binaries. The primary \
+target is the STM32MP257F (aarch64) but the recipe is machine-agnostic: \
+OPENNOW_RUST_TARGET selects the Rust triple and PACKAGECONFIG controls which \
+hardware-decode backends are packaged and how the runtime reaches them."
 HOMEPAGE = "https://github.com/OpenCloudGaming/OpenNOW"
 BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 
@@ -33,6 +35,7 @@ DEPENDS = " \
     qtshadertools-native \
     libsdl3 \
     vulkan-loader \
+    vulkan-headers \
     libva \
     wayland \
     wayland-protocols \
@@ -43,6 +46,22 @@ DEPENDS = " \
 "
 
 OPENNOW_RUST_TARGET ?= "aarch64-unknown-linux-gnu"
+
+# Selectable runtime hardware-decode support. Upstream always enables the
+# Linux media backends (VA-API, Vulkan, native V4L2) at build time, so these
+# flags only control what is packaged and whether the `opennow` launcher
+# helper exports the environment needed to reach a platform video decoder.
+PACKAGECONFIG ??= "vulkan vaapi v4l2-request"
+PACKAGECONFIG[vulkan] = ",,,vulkan-loader,"
+PACKAGECONFIG[vaapi] = ",,,libva,"
+PACKAGECONFIG[v4l2-request] = ",,,,"
+
+# Driver and search path exported by the `opennow` launcher so the VA-API
+# backend is pointed at a V4L2 stateless user-space driver (e.g. a
+# libva-v4l2-request backend in front of the STM32MP2 hantro node
+# /dev/video0). Override per machine or distribution.
+OPENNOW_LIBVA_DRIVER ?= "v4l2_request"
+OPENNOW_LIBVA_DRIVERS_PATH ?= "${libdir}/dri"
 
 OECMAKE_SOURCEPATH = "${S}/opennow-qt"
 OECMAKE_BUILD_TYPE = "Release"
@@ -67,8 +86,22 @@ RDEPENDS:${PN} += " \
     qtmultimedia-plugins \
     libsdl3 \
     wayland \
-    vulkan-loader \
-    libva \
 "
+
+# The `opennow` launcher exports the hardware-decode environment and then
+# execs the QML application. It is only installed when a V4L2 stateless
+# user-space media driver is part of the image.
+do_install:append() {
+    if ${@bb.utils.contains('PACKAGECONFIG', 'v4l2-request', 'true', 'false', d)}; then
+        install -d ${D}${bindir}
+        cat > ${D}${bindir}/opennow <<EOF
+#!/bin/sh
+export LIBVA_DRIVER_NAME="${OPENNOW_LIBVA_DRIVER}"
+export LIBVA_DRIVERS_PATH="${OPENNOW_LIBVA_DRIVERS_PATH}"
+exec ${bindir}/opennow-qt
+EOF
+        chmod 0755 ${D}${bindir}/opennow
+    fi
+}
 
 FILES:${PN} += "${datadir}/doc/opennow ${datadir}/metainfo"
