@@ -5,9 +5,7 @@ BSP). This branch is only a landing page.
 
 ## Branch contents
 
-The actual layer code lives on the
-[`scarthgap`](https://github.com/DanielMartensson/meta-embedded-apps/tree/scarthgap)
-branch. The following applications are built by recipes in that branch:
+The following applications are built by recipes in that branch:
 
 | Application | Recipe | Branch |
 | --- | --- | --- |
