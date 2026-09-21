@@ -1,8 +1,6 @@
 # meta-embedded-apps
 
-Yocto meta-layer for the Watermelon-Wine **STM32MP257F** board (OpenSTLinux
-`scarthgap`). Builds three apps from upstream git plus the dependency recipes
-missing from the layer stack.
+Yocto meta-layer for `scarthgap`.
 
 ## This branch contains
 
