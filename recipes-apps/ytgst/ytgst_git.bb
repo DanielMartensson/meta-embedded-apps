@@ -45,7 +45,7 @@ RDEPENDS:${PN} += " \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-good-qt6 \
     gstreamer1.0-plugins-bad \
-    gstreamer1.0-gl \
+    gstreamer1.0-plugins-bad-gl \
     yt-dlp \
     pulseaudio \
 "

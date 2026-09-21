@@ -15,7 +15,7 @@ LIC_FILES_CHKSUM = " \
 "
 
 SRC_URI = "git://github.com/libsdl-org/SDL.git;protocol=https;branch=main"
-SRCREV = "fa2c02bb6e21974a89ea9824bc53c9932abe5f9c"
+SRCREV = "67bf94eed520569fa2eb615922547e8f419f49f3"
 PV = "3.4.16"
 
 S = "${WORKDIR}/git"
@@ -39,7 +39,7 @@ DEPENDS = " \
     udev \
 "
 DEPENDS:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'opengl', 'virtual/libgles2 virtual/egl', '', d)}"
-DEPENDS:append = " ${@bb.utils.filter('DISTRO_FEATURES', 'pulseaudio alsa', d)}"
+DEPENDS:append = " ${@bb.utils.contains('DISTRO_FEATURES', 'alsa', 'alsa-lib', '', d)}"
 
 EXTRA_OECMAKE = " \
     -DSDL_TEST_LIBRARY=OFF \
