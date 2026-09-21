@@ -16,17 +16,16 @@ Yocto meta-layer for `scarthgap`.
 | `recipes-multimedia/gstreamer` bbappend | YtGst (Qt6 QML video sink `qml6glsink`) |
 | `recipes-support/yt-dlp` | YtGst (runtime downloader) |
 
-## Companion layers (from the Watermelon-Wine manifest / `BBLAYERS`)
+## Companion layers (must be on `BBLAYERS` to build this layer)
 
 | Layer | Provides |
 | --- | --- |
+| `openembedded-core` / `meta-oe` / `meta-python` / `meta-multimedia` | Base BSP / package recipes |
 | `meta-qt6` | Qt 6.8 (`qtbase`, `qtmultimedia`, `qtwebengine`, `qtshadertools`, ...) |
 | `meta-rust-bin` | Rust ≥ 1.85 / `cargo-native` with `aarch64-unknown-linux-gnu` std |
 | `meta-clang` | Clang toolchain (required by QtWebEngine on aarch64) |
-| `meta-st-stm32mp` / `meta-st-openstlinux` | STM32MP2 BSP (OpenSTLinux) |
-| `openembedded-core` / `meta-oe` / `meta-python` / `meta-multimedia` | Base BSP layers |
 
-All layers are pulled in via the BSP manifest; the old `meta-opennow`,
+These are pulled in via the BSP manifest; the old `meta-opennow`,
 `meta-imtube` and `meta-wpeqt` layers are **not** used.
 
 ## Build
