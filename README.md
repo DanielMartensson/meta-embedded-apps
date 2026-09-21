@@ -1,7 +1,6 @@
 # meta-embedded-apps
 
-Yocto meta-layer for the Watermelon-Wine **STM32MP257F** board (OpenSTLinux
-BSP). This branch is only a landing page.
+Yocto meta-layer for applications at embedded systems.
 
 ## Branch contents
 
