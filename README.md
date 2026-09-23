@@ -8,8 +8,8 @@ meta-layer for that release series. `main` is only the index.
 
 | Branch | Status | Contents |
 | --- | --- | --- |
-| `scarthgap` | Active | Meta-layer for Yocto `scarthgap` |
 | `main` | Index only | This landing page |
+| `scarthgap` | Active | Meta-layer for Yocto `scarthgap` |
 | *(next release)* | — | New release branches are added here following the same naming |
 
 ## Applications
