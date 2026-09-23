@@ -42,8 +42,12 @@ Cargo needs crates.io access during OpenNOW `do_compile`.
 | --- | --- | --- |
 | `PACKAGECONFIG` | `vulkan vaapi v4l2-request` | Selectable runtime backends for OpenNOW |
 | `OPENNOW_RUST_TARGET` | `aarch64-unknown-linux-gnu` | OpenNOW Rust target triple |
-| `OPENNOW_LIBVA_DRIVER` | `v4l2_request` | libVA driver exported by the `opennow` launcher |
+| `OPENNOW_LIBVA_DRIVER` | `v4l2_request` | Video decoder driver (libVA, exported by the `opennow` launcher) |
 | `OPENNOW_LIBVA_DRIVERS_PATH` | `${libdir}/dri` | libVA driver search path |
+| `OPENNOW_VK_DRIVER_FILES` | empty | Vulkan ICDs to load (`VK_DRIVER_FILES`) |
+| `OPENNOW_VK_ICD_FILENAMES` | empty | Legacy Vulkan ICD list (`VK_ICD_FILENAMES`) |
+| `OPENNOW_VK_DEVICE_INDEX` | empty | Which physical GPU to use (`VK_DEVICE_INDEX`) |
+| `OPENNOW_QT_RHI_BACKEND` | empty | Qt rendering backend (`vulkan`, `opengl`, ...) |
 | `YTGST_VIDEO_DECODER` | `v4l2h264dec` | YtGst decoder element |
 
 ## Runtime notes
