@@ -57,8 +57,6 @@ These layers must be present on `BBLAYERS` to build this layer:
 | `meta-rust-bin` | Rust ≥ 1.85 / `cargo-native` with `aarch64-unknown-linux-gnu` std |
 | `meta-clang` | Clang toolchain (required by QtWebEngine on aarch64) |
 
-> The older `meta-opennow`, `meta-imtube` and `meta-wpeqt` layers are not used.
-
 ---
 
 ## Prerequisites
