@@ -27,6 +27,11 @@ inherit cmake lib_package pkgconfig
 # SDL 3.x installs SDL3Config.cmake and SDL3Targets.cmake.
 PROVIDES = "virtual/libsdl3"
 
+# SDL3 installs its LICENSE.txt under ${datadir}/licenses/SDL3 (no CMake
+# option to disable this); ship it so the installed-vs-shipped QA check
+# does not fail.
+FILES:${PN} += "${datadir}/licenses"
+
 # Feed the auto-detection in SDL's CMake so the Wayland video driver, Vulkan,
 # KMSDRM input/EVDev and audio backends are found in the target sysroot.
 DEPENDS = " \
