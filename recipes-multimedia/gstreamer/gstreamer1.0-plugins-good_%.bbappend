@@ -4,7 +4,7 @@
 # Enabling the upstream qt6 meson feature (no source patches involved).
 PACKAGECONFIG:append = " qt6"
 
-PACKAGECONFIG[qt6] = "-Dqt6=enabled,-Dqt6=disabled,qtbase qtdeclarative"
+PACKAGECONFIG[qt6] = "-Dqt6=enabled,-Dqt6=disabled,qtbase qtdeclarative qtbase-native qtdeclarative-native qttools-native"
 
 FILES:${PN}-qt6 += "${datadir}/qt6/qml/org/freedesktop/gstreamer/Qt6GLVideoItem \
                     ${libdir}/qt6/qml/org/freedesktop/gstreamer/Qt6GLVideoItem"
