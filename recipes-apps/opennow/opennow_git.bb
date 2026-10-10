@@ -225,7 +225,8 @@ do_compile:prepend() {
 
 # Upstream install(TARGETS opennow-qt ...) plus the Rust artifacts copied next
 # to the executable, so the default cmake do_install covers everything.
-inherit cmake pkgconfig
+inherit qt6-cmake pkgconfig
+DEPENDS:append = " qtdeclarative-native"
 
 RDEPENDS:${PN} += " \
     qtbase-plugins \

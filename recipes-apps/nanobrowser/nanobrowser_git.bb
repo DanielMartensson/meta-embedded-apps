@@ -21,7 +21,8 @@ DEPENDS = " \
     qtwebengine \
 "
 
-inherit cmake
+inherit qt6-cmake
+DEPENDS:append = " qtdeclarative-native"
 
 # The project has no install() rule; the QML module is compiled into the binary
 # via qt_add_qml_module, so a single executable is enough.

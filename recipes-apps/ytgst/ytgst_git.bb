@@ -28,7 +28,8 @@ YTGST_VIDEO_DECODER ?= "v4l2h264dec"
 
 EXTRA_OECMAKE:append = " -DYTGST_VIDEO_DECODER=${YTGST_VIDEO_DECODER}"
 
-inherit cmake pkgconfig
+inherit qt6-cmake pkgconfig
+DEPENDS:append = " qtdeclarative-native"
 
 # Upstream install(TARGETS ytgst BUNDLE DESTINATION .) would put the binary at
 # the install prefix root. Install it cleanly into ${bindir}.
