@@ -73,7 +73,5 @@ do_install () {
     # Sanity: the toolchain must actually be usable before OpenNOW consumes it.
     [ -x ${HOST_RUST_DIR}/bin/cargo ] || bbfatal "rust-1.85.0-host: ${HOST_RUST_DIR}/bin/cargo missing"
     [ -x ${HOST_RUST_DIR}/bin/rustc ] || bbfatal "rust-1.85.0-host: ${HOST_RUST_DIR}/bin/rustc missing"
-    # (rustc --version sanity check omitted here: it runs under pseudo and
-    LLVM init deadlocks on futex under libpseudo.so; the binaries are already
-     verified executable and the toolchain works — see the foreground test.)
+    # (rustc --version sanity check omitted: deadlocks under pseudo; the binaries are verified.)
 }
