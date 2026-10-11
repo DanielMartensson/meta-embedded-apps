@@ -152,6 +152,11 @@ EXTRA_OECMAKE:append = " \
 # silently shipping the upstream feature list.
 do_configure:prepend() {
     features_cmake="${S}/opennow-qt/cmake/NativeRuntime.cmake"
+    # Restore the pristine source first: a failed configure (a build
+    # stopped mid-rewrite) leaves the --features line deleted, so without
+    # this every re-run would trip the pre-rewrite check below. checkout
+    # is a no-op on an untouched file.
+    git -C "${S}" checkout -- opennow-qt/cmake/NativeRuntime.cmake
     streamer_features() {
         if grep -qE -- '^[[:space:]]*set\(OPENNOW_STREAMER_CARGO_FEATURES' "$1"; then
             # Legacy shape: set(OPENNOW_STREAMER_CARGO_FEATURES "<list>")
@@ -186,14 +191,15 @@ do_configure:prepend() {
         esac
     done
 
-    # Rewrite the feature list in place. For an empty value the whole
-    # --features argument is dropped: for the current shape that is a line
-    # inside the list(APPEND ...) call, and dropping it leaves a (valid)
-    # empty list.
+    # Rewrite the feature list in place. For an empty value the --features
+    # argument is dropped, but the enclosing list(APPEND ...) call stays valid:
+    # in the current shape the closing ")" sits on the same line as the
+    # argument, so only the argument text is removed, never the whole line.
     sed -i "s/linux-ffmpeg-bundled,linux-vaapi/${OPENNOW_CARGO_FEATURES}/g" "${features_cmake}"
     if [ -z "${OPENNOW_CARGO_FEATURES}" ]; then
-        # Current shape: drop the literal --features line.
-        sed -i '/^[[:space:]]*--features[[:space:]]*[^)]*)$/d' "${features_cmake}"
+        # Current shape: strip "--features " from the line that also carries the
+        # closing ")" of the list(APPEND ...) call.
+        sed -i 's|^\([[:space:]]*\)--features[[:space:]]*|\1|' "${features_cmake}"
         # Legacy shape: strip the --features "${var}" prefix and leave
         # list(APPEND ... ) with no items.
         sed -i 's|^[[:space:]]*--features "${OPENNOW_STREAMER_CARGO_FEATURES}")$|    )|' "${features_cmake}"
