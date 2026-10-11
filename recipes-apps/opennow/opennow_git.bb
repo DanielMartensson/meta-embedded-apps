@@ -58,7 +58,7 @@ DEPENDS = " \
     wayland-native \
     libdrm \
     udev \
-    cargo-native \
+    rust-1.85.0-host \
 "
 
 # Leave empty by default: Yocto builds with the cross toolchain as the native
@@ -151,6 +151,11 @@ EXTRA_OECMAKE:append = " \
 # list(APPEND ...) block fails at configure with a clear message instead of
 # silently shipping the upstream feature list.
 do_configure:prepend() {
+    # OpenNOW needs Rust 1.85 (edition 2024); the default native toolchain
+    # is 1.75. Use the dedicated 1.85 host toolchain and drop the stale
+    # CMake cache (it caches cargo/rustc paths from a previous build).
+    export PATH="${TMPDIR}/rust-1.85.0-host/bin:${PATH}"
+    rm -rf ${WORKDIR}/build
     features_cmake="${S}/opennow-qt/cmake/NativeRuntime.cmake"
     # Restore the pristine source first: a failed configure (a build
     # stopped mid-rewrite) leaves the --features line deleted, so without
@@ -231,6 +236,7 @@ do_configure:prepend() {
 # the workdir (crates are fetched from crates.io during do_compile, so do_compile
 # needs network access unless you vendor them; see the README).
 do_compile:prepend() {
+    export PATH="${TMPDIR}/rust-1.85.0-host/bin:${PATH}"
     export CARGO_HOME="${WORKDIR}/cargo-home"
     # Only needed when building for a foreign triple. Derived from
     # OPENNOW_RUST_TARGET so it works for any architecture rather than being
