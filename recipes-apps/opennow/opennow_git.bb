@@ -152,10 +152,10 @@ EXTRA_OECMAKE:append = " \
 # silently shipping the upstream feature list.
 do_configure:prepend() {
     # OpenNOW needs Rust 1.85 (edition 2024); the default native toolchain
-    # is 1.75. Use the dedicated 1.85 host toolchain and drop the stale
-    # CMake cache (it caches cargo/rustc paths from a previous build).
+    # is 1.75. Use the dedicated 1.85 host toolchain. bitbake clears the
+    # stale CMake build dir on every do_configure re-run
+    # (do_configure[cleandirs] = ${B}), so no manual rm is needed here.
     export PATH="${TMPDIR}/rust-1.85.0-host/bin:${PATH}"
-    rm -rf ${WORKDIR}/build
     features_cmake="${S}/opennow-qt/cmake/NativeRuntime.cmake"
     # Restore the pristine source first: a failed configure (a build
     # stopped mid-rewrite) leaves the --features line deleted, so without
