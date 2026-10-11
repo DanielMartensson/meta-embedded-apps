@@ -13,7 +13,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
 SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main"
-SRCREV = "a7fe40838a56ac0899533dd373b49d85246ab638"
+SRCREV = "bee18c118dbc89f42319436dcdb172d5b9e15e0c"
 
 PV = "1.0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -123,32 +123,43 @@ EXTRA_OECMAKE:append = " \
     -DOPENNOW_RUST_TARGET=${OPENNOW_RUST_TARGET} \
    "
 
-# Upstream hardcodes the embedded streamer's cargo feature list in
+# Upstream hardcodes the embedded streamer cargo feature list in
 # opennow-qt/cmake/NativeRuntime.cmake to "linux-ffmpeg-bundled,linux-vaapi"
-# and appends "--features ${...}" to every cargo invocation. Two details make
-# this a source edit rather than a -D override:
+# and appends it to every cargo invocation. It is a source edit rather than a
+# -D override because:
 #
-#   - The set() is marked CACHE STRING, so -D does reach it, but only a
-#     non-empty value is useful. An empty value still leaves
-#     list(APPEND ... --features "") in place, and cargo rejects that with
-#     "none of the selected packages contains these features". The argument has
-#     to be removed from the source, not just blanked.
+#   - the list is written as a CMake list element across two lines, so the
+#     plain substitution must also handle the empty case: leaving
+#     "--features " (empty) in the cargo command makes cargo abort with
+#     "none of the selected packages contains these features". The argument
+#     has to be removed from the source, not just blanked.
 #   - ffmpeg-sys-next's FFMPEG_DIR escape hatch sits behind a
 #     CARGO_FEATURE_BUILD check that the bundled feature turns on, so there is
 #     no supported way to keep bundled and redirect its source anyway.
 #
-# This runs at do_configure, not do_compile: "inherit cmake" configures in
-# do_configure and builds in do_compile, and the cargo arguments are baked into
-# the custom commands when they are generated during configure.
+# Upstream reformatted the feature list at some point: older revisions wrote
+# set(OPENNOW_STREAMER_CARGO_FEATURES "linux-ffmpeg-bundled,linux-vaapi")
+# (a CACHE STRING), v1.0.2 writes a literal list element inside
+# list(APPEND OPENNOW_STREAMER_CARGO_FEATURE_ARGS). The detection below
+# switches on which shape is present.
 #
-# The checks read the value out of the set() call rather than grepping the file.
-# Grepping the file is wrong: the comment above the set() names "linux-vaapi" as
-# an example of a reduced list, so a whole-file match finds that comment and
-# fails the build on an untouched tree.
+# This runs at do_configure, not do_compile: "inherit cmake" configures in
+# do_configure and builds in do_compile, and the cargo arguments are baked
+# into the custom commands when they are generated during configure.
+#
+# The checks re-verify the result after rewriting, so upstream reformating the
+# list(APPEND ...) block fails at configure with a clear message instead of
+# silently shipping the upstream feature list.
 do_configure:prepend() {
     features_cmake="${S}/opennow-qt/cmake/NativeRuntime.cmake"
     streamer_features() {
-        sed -n 's/^[[:space:]]*set(OPENNOW_STREAMER_CARGO_FEATURES[[:space:]]*"\([^"]*\)".*/\1/p' "$1"
+        if grep -qE -- '^[[:space:]]*set\(OPENNOW_STREAMER_CARGO_FEATURES' "$1"; then
+            # Legacy shape: set(OPENNOW_STREAMER_CARGO_FEATURES "<list>")
+            sed -n 's/^[[:space:]]*set(OPENNOW_STREAMER_CARGO_FEATURES[[:space:]]*"\([^"]*\)".*/\1/p' "$1"
+        else
+            # Current shape: literal --features line inside list(APPEND ...)
+            sed -n 's/^[[:space:]]*--[[:space:]]*features[[:space:]]*\(.*\)[[:space:]]*)$/\1/p' "$1"
+        fi
     }
     current="$(streamer_features "${features_cmake}")"
     if [ "${current}" != "linux-ffmpeg-bundled,linux-vaapi" ]; then
@@ -175,13 +186,16 @@ do_configure:prepend() {
         esac
     done
 
-    # The cache value is rewritten in every case, so the default list leaves the
-    # file even when the --features argument is about to be dropped as well.
+    # Rewrite the feature list in place. For an empty value the whole
+    # --features argument is dropped: for the current shape that is a line
+    # inside the list(APPEND ...) call, and dropping it leaves a (valid)
+    # empty list.
     sed -i "s/linux-ffmpeg-bundled,linux-vaapi/${OPENNOW_CARGO_FEATURES}/g" "${features_cmake}"
     if [ -z "${OPENNOW_CARGO_FEATURES}" ]; then
-        # Drop the --features argument. Leaving it in with an empty value makes
-        # cargo abort, and list(APPEND var) with no items is valid CMake that
-        # expands to nothing in the custom command.
+        # Current shape: drop the literal --features line.
+        sed -i '/^[[:space:]]*--features[[:space:]]*[^)]*)$/d' "${features_cmake}"
+        # Legacy shape: strip the --features "${var}" prefix and leave
+        # list(APPEND ... ) with no items.
         sed -i 's|^[[:space:]]*--features "${OPENNOW_STREAMER_CARGO_FEATURES}")$|    )|' "${features_cmake}"
     fi
 
@@ -207,7 +221,6 @@ do_configure:prepend() {
         bbfatal "opennow: ${features_cmake} still passes a cargo --features argument derived from OPENNOW_STREAMER_CARGO_FEATURES after OPENNOW_CARGO_FEATURES was emptied. Cargo rejects an empty feature list, so this would fail the build at do_compile. Upstream most likely reformatted the list(APPEND ...) block; re-check do_configure:prepend before building."
     fi
 }
-
 # The Rust builds run triggered from CMake. Give cargo a writable home inside
 # the workdir (crates are fetched from crates.io during do_compile, so do_compile
 # needs network access unless you vendor them; see the README).
