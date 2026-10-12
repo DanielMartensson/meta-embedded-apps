@@ -128,8 +128,7 @@ EXTRA_OECMAKE:append = " \
 # CMAKE_FIND_ROOT_PATH entries. The Rust toolchain lives in a dedicated
 # host dir, not in any of those paths, so preset the executables
 # explicitly (verified: -D preset short-circuits find_program).
-EXTRA_OECMAKE:append = "-DCARGO_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/cargo"
-EXTRA_OECMAKE:append = "-DOPENNOW_LICENSE_RUSTC_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/rustc"
+EXTRA_OECMAKE:append = " -DCARGO_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/cargo -DOPENNOW_LICENSE_RUSTC_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/rustc"
 
 # Upstream hardcodes the embedded streamer cargo feature list in
 # opennow-qt/cmake/NativeRuntime.cmake to "linux-ffmpeg-bundled,linux-vaapi"
