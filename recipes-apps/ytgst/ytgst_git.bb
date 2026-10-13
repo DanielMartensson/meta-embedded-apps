@@ -38,15 +38,19 @@ do_install() {
     install -m 0755 ${B}/ytgst ${D}${bindir}/ytgst
 }
 
+# GStreamer element usage (from YtGst source):
+#   qml6glsink  -> good, qml6 feature -> gstreamer1.0-plugins-good-qml6
+#   glupload / glcolorconvert / capsfilter / playbin / autoaudiosink
+#                -> base main plugin lib -> gstreamer1.0-plugins-base
+# (glupload/glcolorconvert were moved from -bad to -base in GStreamer 1.15+;
+#  -bad has no gl subpackage in 1.22.12)
 RDEPENDS:${PN} += " \
     qtbase-plugins \
     qtdeclarative-qmlplugins \
     gstreamer1.0 \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-good-qt6 \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-bad-gl \
+    gstreamer1.0-plugins-good-qml6 \
     yt-dlp \
     pulseaudio \
 "
