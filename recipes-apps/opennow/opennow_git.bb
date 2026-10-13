@@ -12,10 +12,10 @@ BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
-SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main"
-SRCREV = "bee18c118dbc89f42319436dcdb172d5b9e15e0c"
+SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev"
+SRCREV = "2b87972c0bb210466552a0974b2dbe5aea935b8c"
 
-PV = "1.0.2+git${SRCPV}"
+PV = "1.0.3+git${SRCPV}"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
@@ -285,7 +285,7 @@ do_compile:prepend() {
     # export PATH="${PATH}:/usr/bin" would clobber the rust prefix
     # and make cargo fail with rustc not found.
     export PATH="${TMPDIR}/rust-1.89.0-host/bin:${PATH}:/usr/bin"
-    export CARGO_HOME="${WORKDIR}/cargo-home"
+    export CARGO_HOME="${HOME}/.cargo"
     # The LAN DNS is intermittently flaky; give cargo a generous retry/timeout
     # window so transient "could not resolve host" failures recover instead of
     # aborting the whole task. Harmless when the cache is already primed.
@@ -380,6 +380,13 @@ do_compile:prepend() {
 inherit qt6-cmake pkgconfig
 DEPENDS:append = " qtdeclarative-native"
 
+# Reorder PACKAGES so the base package is processed first in the normal
+# (50-priority) group. OpenSTLinux's default (meta/conf/bitbake.conf) puts the
+# base LAST, so opennow-dev would claim the bare libopennow_streamer_ffi.so
+# (soname == itself, no version) via /usr/lib/lib*.so before base runs.
+# Base's default FILES pattern is versioned (lib*.so.*), so base also needs
+# the explicit claim below to own the bare FFI lib at runtime.
+PACKAGES = "opennow opennow-staticdev opennow-dev opennow-doc opennow-locale opennow-src opennow-dbg"
 RDEPENDS:${PN} += " \
     qtbase-plugins \
     qtdeclarative-qmlplugins \
@@ -435,3 +442,8 @@ INSANE_SKIP:${PN} += "ldflags"
 # are not claimed by any -dev/-dbg/-src split, so claim them in the base
 # package to avoid the [installed-vs-shipped] QA error.
 FILES:${PN} += "${datadir}/icons"
+# The FFI shared library is a runtime dependency of the base package
+# binaries. Upstream installs it into ${libdir}; the OE default split would
+# place it in the -dev package, but a runtime .so must not live in -dev
+# (QA: dev-elf/ldflags/dev-deps). Claim it explicitly for the base package.
+FILES:${PN} += "${libdir}/libopennow_streamer_ffi.so"
