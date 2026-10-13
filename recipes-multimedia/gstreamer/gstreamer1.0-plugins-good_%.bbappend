@@ -5,6 +5,8 @@
 PACKAGECONFIG:append = " qt6"
 
 PACKAGECONFIG[qt6] = "-Dqt6=enabled,-Dqt6=disabled,qtbase qtdeclarative qtbase-native qtdeclarative-native qttools-native"
+# extends PATH so meson sees native Qt6 moc uic rcc in the native sysroot usr/libexec
+PATH:append = ":${STAGING_LIBEXECDIR_NATIVE}"
 
 FILES:${PN}-qt6 += "${datadir}/qt6/qml/org/freedesktop/gstreamer/Qt6GLVideoItem \
                     ${libdir}/qt6/qml/org/freedesktop/gstreamer/Qt6GLVideoItem"

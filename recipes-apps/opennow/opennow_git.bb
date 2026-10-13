@@ -13,7 +13,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
 SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main"
-SRCREV = "bee18c118dbc89f42319436dcdb172d5b9e15e0c"
+SRCREV = "34afc8345504956ec4d5c6a5a3933bc7922e7599"
 
 PV = "1.0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -31,7 +31,7 @@ S = "${WORKDIR}/git"
 #   - Vulkan  : mandatory on Linux (find_package(Vulkan REQUIRED))
 #   - libva   : build-time only, see the note below
 #   - libdrm/udev: build-time only, see the note below
-#   - Rust>=1.85 / cargo: edition 2024 build (provided by meta-rust-bin)
+#   - Rust>=1.89 / cargo: edition 2024 build (provided by meta-rust-bin)
 #   - wayland-native: wayland-scanner
 #
 # libva, libdrm and udev are build-time requirements, not runtime ones, unless
@@ -58,7 +58,7 @@ DEPENDS = " \
     wayland-native \
     libdrm \
     udev \
-    rust-1.85.0-host \
+    rust-1.89.0-host \
 "
 
 # Leave empty by default: Yocto builds with the cross toolchain as the native
@@ -128,7 +128,7 @@ EXTRA_OECMAKE:append = " \
 # CMAKE_FIND_ROOT_PATH entries. The Rust toolchain lives in a dedicated
 # host dir, not in any of those paths, so preset the executables
 # explicitly (verified: -D preset short-circuits find_program).
-EXTRA_OECMAKE:append = " -DCARGO_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/cargo -DOPENNOW_LICENSE_RUSTC_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/rustc"
+EXTRA_OECMAKE:append = " -DCARGO_EXECUTABLE=${TMPDIR}/rust-1.89.0-host/bin/cargo -DOPENNOW_LICENSE_RUSTC_EXECUTABLE=${TMPDIR}/rust-1.89.0-host/bin/rustc"
 
 # Upstream hardcodes the embedded streamer cargo feature list in
 # opennow-qt/cmake/NativeRuntime.cmake to "linux-ffmpeg-bundled,linux-vaapi"
@@ -158,11 +158,11 @@ EXTRA_OECMAKE:append = " -DCARGO_EXECUTABLE=${TMPDIR}/rust-1.85.0-host/bin/cargo
 # list(APPEND ...) block fails at configure with a clear message instead of
 # silently shipping the upstream feature list.
 do_configure:prepend() {
-    # OpenNOW needs Rust 1.85 (edition 2024); the default native toolchain
-    # is 1.75. Use the dedicated 1.85 host toolchain. bitbake clears the
+    # OpenNOW needs Rust 1.89 (edition 2024); the default native toolchain
+    # is 1.75. Use the dedicated 1.89 host toolchain. bitbake clears the
     # stale CMake build dir on every do_configure re-run
     # (do_configure[cleandirs] = ${B}), so no manual rm is needed here.
-    export PATH="${TMPDIR}/rust-1.85.0-host/bin:${PATH}"
+    export PATH="${TMPDIR}/rust-1.89.0-host/bin:${PATH}"
     features_cmake="${S}/opennow-qt/cmake/NativeRuntime.cmake"
     # Restore the pristine source first: a failed configure (a build
     # stopped mid-rewrite) leaves the --features line deleted, so without
@@ -243,8 +243,35 @@ do_configure:prepend() {
 # the workdir (crates are fetched from crates.io during do_compile, so do_compile
 # needs network access unless you vendor them; see the README).
 do_compile:prepend() {
-    export PATH="${TMPDIR}/rust-1.85.0-host/bin:${PATH}"
+    # Host-side cargo build scripts link with a host C compiler (cc),
+    # which lives in the build machine /usr/bin. This distro task
+    # base PATH never contains /usr/bin (HOSTPATH is not exported for
+    # tasks and the uninative sysroot has no compiler), so add it to
+    # the single PATH export here: rust-1.89.0-host/bin first, then
+    # the base PATH (native sysroot, recipe-sysroot, hosttools), then
+    # /usr/bin last for the host tools missing elsewhere
+    # (cc, gcc, g++, ld, ar, as).
+    # The task run file stores each export expanded and the last one
+    # wins, so this must remain ONE export: a second, later line
+    # export PATH="${PATH}:/usr/bin" would clobber the rust prefix
+    # and make cargo fail with rustc not found.
+    export PATH="${TMPDIR}/rust-1.89.0-host/bin:${PATH}:/usr/bin"
     export CARGO_HOME="${WORKDIR}/cargo-home"
+    # The LAN DNS is intermittently flaky; give cargo a generous retry/timeout
+    # window so transient "could not resolve host" failures recover instead of
+    # aborting the whole task. Harmless when the cache is already primed.
+    export CARGO_NET_RETRY=8
+    export CARGO_NET_TIMEOUT=30
+    # cc-rs (used by host-side Rust build scripts, e.g. the `ring` crate for
+    # the opennow-license-report notices generator) resolves its compiler by
+    # checking, in order: CC_<triple> / CC_<triple_underscore> /
+    # {TARGET|HOST}_CC / CC.  Here CC is the aarch64 TARGET compiler (correct
+    # for the `--target aarch64` build).  But the same task also builds a
+    # native x86_64 HOST tool; that build would otherwise fall through to CC
+    # (the aarch64 compiler, which rejects x86-only flags such as -m64).
+    # Steer host builds at the host compiler via HOST_CC (checked before CC)
+    # without touching CC (the target build still uses it).
+    export HOST_CC="gcc"
     # Only needed when building for a foreign triple. Derived from
     # OPENNOW_RUST_TARGET so it works for any architecture rather than being
     # hard-coded to one. With the default empty target, cargo builds for the
@@ -252,6 +279,38 @@ do_compile:prepend() {
     if [ -n "${OPENNOW_RUST_TARGET}" ]; then
         triple="$(echo "${OPENNOW_RUST_TARGET}" | tr '[:lower:]-' '[:upper:]_')"
         export "CARGO_TARGET_${triple}_LINKER=${TARGET_PREFIX}gcc"
+
+        # Target toolchain sysroot fix ------------------------------------------
+        # The aarch64 cross toolchain staged in ${WORKDIR}/recipe-sysroot-native
+        # has a dead default sysroot (/not/exist), so any bare
+        # `aarch64-ostl-linux-gcc`/`g++` invocation cannot find the target
+        # libc/crt that live in ${WORKDIR}/recipe-sysroot. Two consumers
+        # hit this and neither passes --sysroot on its own:
+        #   - rustc's target link: CARGO_TARGET_<TRIPLE>_LINKER (a bare name
+        #     resolved via PATH);
+        #   - CMake-driven sys crates (e.g. sdl2-sys): CMAKE_C/CXX_COMPILER,
+        #     resolved via PATH and cached as a full path in each
+        #     CMakeCache.txt with the --sysroot flag dropped.
+        # Replace the unversioned C/C++ drivers in place with a wrapper that
+        # re-executes the real driver, adding the machine flags and an
+        # absolute --sysroot=${WORKDIR}/recipe-sysroot (absolute, so it
+        # resolves from any cwd). In place (not a PATH shadow) so every
+        # consumer reaches the fix no matter how it names the compiler: the
+        # bare name via PATH and the cached full path both resolve to this
+        # same file, which is now the wrapper. The unversioned names are
+        # target-only, so the host (x86_64) toolchain is never touched.
+        # Idempotent: a wrapper's first bytes are the sh shebang; a restored
+        # real ELF driver is not, so a re-run or re-stage converges.
+        tcdir="${WORKDIR}/recipe-sysroot-native/usr/bin/${TARGET_PREFIX%?}"
+        for n in gcc g++ c++; do
+            p="${tcdir}/aarch64-ostl-linux-${n}"
+            [ -f "${p}" ] || continue
+            [ "$(head -c 9 "${p}" 2>/dev/null)" = "#!/bin/sh" ] && continue
+            mv "${p}" "${p}.real"
+            printf '#!/bin/sh\n# opennow-sysroot-wrap\nexec %s/aarch64-ostl-linux-%s.real -mcpu=cortex-a35+crc -mbranch-protection=standard --sysroot="%s/recipe-sysroot" "$@"\n' \
+                "${tcdir}" "${n}" "${WORKDIR}" > "${p}"
+            chmod +x "${p}"
+        done
     fi
 }
 
@@ -293,3 +352,25 @@ EOF
 }
 
 FILES:${PN} += "${datadir}/doc/opennow ${datadir}/metainfo"
+
+# The OpenNOW release build ships its binaries and the FFI shared library
+# pre-stripped (no debug sections in either the raw cargo output or the
+# packaged files). There is no debug info left to strip or to move to a -dbg
+# package, so OE's "already-stripped" QA check is expected and harmless;
+# skip it (same idiom used for other pre-stripped recipes in this tree).
+INSANE_SKIP:${PN} += "already-stripped"
+
+# The "ldflags" QA path test (package_qa_hash_style) is active because LDFLAGS
+# carries --hash-style=gnu, and it flags any ELF with a symbol table that lacks
+# a GNU_HASH table. The C++ part (opennow-qt) is linked by qmake with
+# -Wl,--hash-style=gnu and passes; the Rust parts are linked by rustc's linker
+# (lld) which does not emit the GNU hash table that test looks for, so they
+# fail it even though the build is correct. Skip exactly this one check for
+# the base package (all fatal GNU_HASH messages land in ${PN}).
+INSANE_SKIP:${PN} += "ldflags"
+
+# Upstream cmake also installs the OpenNOW desktop icons under
+# ${datadir}/icons (hicolor PNGs + OpenNOW.svg). They are runtime data and
+# are not claimed by any -dev/-dbg/-src split, so claim them in the base
+# package to avoid the [installed-vs-shipped] QA error.
+FILES:${PN} += "${datadir}/icons"
