@@ -13,9 +13,9 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
 SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main"
-SRCREV = "34afc8345504956ec4d5c6a5a3933bc7922e7599"
+SRCREV = "bee18c118dbc89f42319436dcdb172d5b9e15e0c"
 
-PV = "1.0.1+git${SRCPV}"
+PV = "1.0.2+git${SRCPV}"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
@@ -238,6 +238,35 @@ do_configure:prepend() {
         && code_lines "${features_cmake}" | grep -qiE -- '-{1,2}features.*OPENNOW_STREAMER_CARGO_FEATURES'; then
         bbfatal "opennow: ${features_cmake} still passes a cargo --features argument derived from OPENNOW_STREAMER_CARGO_FEATURES after OPENNOW_CARGO_FEATURES was emptied. Cargo rejects an empty feature list, so this would fail the build at do_compile. Upstream most likely reformatted the list(APPEND ...) block; re-check do_configure:prepend before building."
     fi
+
+    # ---------------------------------------------------------------------------
+    # Upstream 1.0.2 bug: the nvst-peer-probe rule passes a Cargo feature as
+    # a bare word (positionally) instead of --features.
+    #
+    # add_custom_command(...) for the nvst-peer-probe binary expands to
+    #
+    #     --package opennow-streamer-transport
+    #     sony-peer-probe
+    #     --bin nvst-peer-probe
+    #
+    # cargo rejects this ("unexpected argument 'sony-peer-probe' found").
+    # `sony-peer-probe' is a feature of opennow-streamer-transport
+    # ([features] sony-peer-probe = []) that the binary requires
+    # ([[bin]] required-features = ["sony-peer-probe"]).
+    #
+    # The git checkout at the top of this function resets NativeRuntime.cmake
+    # on every run, so this rewrite is idempotent and convergent. The two
+    # checks fail at configure (not deep inside cargo) if the rule was
+    # reformatted differently than this recipe assumes.
+    if code_lines "${features_cmake}" | grep -qE -- '^[[:space:]]+sony-peer-probe[[:space:]]*$'; then
+        sed -i 's|^\([[:space:]]\+\)sony-peer-probe[[:space:]]*$|\1--features sony-peer-probe|' "${features_cmake}"
+    fi
+    if code_lines "${features_cmake}" | grep -qE -- '^[[:space:]]+sony-peer-probe[[:space:]]*$'; then
+        bbfatal "opennow: the bare 'sony-peer-probe' argument is still present in the nvst-peer-probe cargo rule of ${features_cmake} after the rewrite; the sed did not match. Upstream most likely reformatted this rule; re-check do_configure:prepend before building."
+    fi
+    if ! code_lines "${features_cmake}" | grep -qE -- '[[:space:]]--features[[:space:]]+sony-peer-probe'; then
+        bbfatal "opennow: the nvst-peer-probe cargo rule in ${features_cmake} does not pass '--features sony-peer-probe' after the rewrite; the binary requires the sony-peer-probe feature and the bare-feature-word form would abort cargo. Upstream most likely reformatted this rule differently than the patterns above expect; re-check do_configure:prepend before building."
+    fi
 }
 # The Rust builds run triggered from CMake. Give cargo a writable home inside
 # the workdir (crates are fetched from crates.io during do_compile, so do_compile
@@ -276,6 +305,32 @@ do_compile:prepend() {
     # OPENNOW_RUST_TARGET so it works for any architecture rather than being
     # hard-coded to one. With the default empty target, cargo builds for the
     # host triple, which the cross toolchain already matches.
+    # aarch64 target-toolchain sysroot wrapper (applied unconditionally):
+    # the cross toolchain's default sysroot is dead (/not/exist), so aarch64
+    # links fail (ld: cannot find crt1.o/crti.o/crtbegin.o/-lgcc/-lgcc_s/-lc)
+    # even when OPENNOW_RUST_TARGET is empty, in which case cargo builds for
+    # its own "host" triple and C-compiling deps (cc/clang-sys/bindgen)
+    # invoke the aarch64 driver without --sysroot. The wrapper is idempotent:
+    # it skips drivers that are already wrapped (by this block or by the
+    # conditional block below) and re-invokes the original driver with
+    # -mcpu=cortex-a35+crc -mbranch-protection=standard --sysroot.
+    # The aarch64 cross toolchain is staged under recipe-sysroot-native
+    # with prefix aarch64-ostl-linux (its default sysroot is dead,
+    # /not/exist), so every bare driver invocation needs --sysroot.
+    # NOTE: TARGET_PREFIX is not defined in the do_compile environment,
+    # so a ${TARGET_PREFIX%?}-derived path silently emptied out and the
+    # wrapper no-oped; use the literal toolchain prefix.
+    tcdir="${WORKDIR}/recipe-sysroot-native/usr/bin/aarch64-ostl-linux"
+    for n in gcc g++ c++; do
+        pw="${tcdir}/aarch64-ostl-linux-${n}"
+        [ -f "${pw}" ] || continue
+        [ "$(head -c 9 "${pw}" 2>/dev/null)" = "#!/bin/sh" ] && continue
+        mv "${pw}" "${pw}.real"
+        printf '#!/bin/sh\n# opennow-sysroot-wrap-uncond\nexec %s/aarch64-ostl-linux-%s.real -mcpu=cortex-a35+crc -mbranch-protection=standard --sysroot="%s/recipe-sysroot" "$@"\n' \
+            "${tcdir}" "${n}" "${WORKDIR}" > "${pw}"
+        chmod +x "${pw}"
+    done
+
     if [ -n "${OPENNOW_RUST_TARGET}" ]; then
         triple="$(echo "${OPENNOW_RUST_TARGET}" | tr '[:lower:]-' '[:upper:]_')"
         export "CARGO_TARGET_${triple}_LINKER=${TARGET_PREFIX}gcc"
@@ -301,7 +356,13 @@ do_compile:prepend() {
         # target-only, so the host (x86_64) toolchain is never touched.
         # Idempotent: a wrapper's first bytes are the sh shebang; a restored
         # real ELF driver is not, so a re-run or re-stage converges.
-        tcdir="${WORKDIR}/recipe-sysroot-native/usr/bin/${TARGET_PREFIX%?}"
+        # The aarch64 cross toolchain is staged under recipe-sysroot-native
+        # with prefix aarch64-ostl-linux (its default sysroot is dead,
+        # /not/exist), so every bare driver invocation needs --sysroot.
+        # NOTE: TARGET_PREFIX is not defined in the do_compile environment,
+        # so a ${TARGET_PREFIX%?}-derived path silently emptied out and the
+        # wrapper no-oped; use the literal toolchain prefix.
+        tcdir="${WORKDIR}/recipe-sysroot-native/usr/bin/aarch64-ostl-linux"
         for n in gcc g++ c++; do
             p="${tcdir}/aarch64-ostl-linux-${n}"
             [ -f "${p}" ] || continue
