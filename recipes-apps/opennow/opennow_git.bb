@@ -401,13 +401,20 @@ RDEPENDS:${PN} += " \
 # dependencies above.
 RDEPENDS:${PN}:append = " ${@bb.utils.contains('OPENNOW_CARGO_FEATURES', 'linux-vaapi', 'libva', '', d)}"
 
-# The `opennow` launcher only exports display-selection environment and then
-# execs the QML application. The video backend is not forced here on purpose:
-# the client probes what the machine offers and the user picks one in the UI.
+# The `opennow` launcher normalises the runtime environment (weston's user
+# session sets XDG_RUNTIME_DIR=/home/weston and LANG=C; the former makes
+# the Wayland socket path invalid and the app abort), exports GPU /
+# Vulkan selection (only when configured), and execs the QML application.
+# The video backend is not forced here on purpose: the client probes what
+# the machine offers and the user picks one in the UI.
 do_install:append() {
     install -d ${D}${bindir}
     cat > ${D}${bindir}/opennow <<EOF
 #!/bin/sh
+# Weston's user session sets XDG_RUNTIME_DIR=/home/weston and LANG=C.
+# Fix both for the app (weston.socket lives in /run/user/1000).
+export XDG_RUNTIME_DIR=/run/user/1000
+export LANG=C.UTF-8
 # GPU / Vulkan selection (exported only when configured).
 [ -n "${OPENNOW_VK_DRIVER_FILES}" ] && export VK_DRIVER_FILES="${OPENNOW_VK_DRIVER_FILES}"
 [ -n "${OPENNOW_VK_ICD_FILENAMES}" ] && export VK_ICD_FILENAMES="${OPENNOW_VK_ICD_FILENAMES}"
@@ -417,6 +424,26 @@ do_install:append() {
 exec ${bindir}/opennow-qt
 EOF
     chmod 0755 ${D}${bindir}/opennow
+
+    # Upstream CMake installs io.github.opencloudgaming.OpenNOW.desktop
+    # with Exec=opennow-qt %U, which bypasses the launcher and inherits
+    # weston's (broken) XDG_RUNTIME_DIR. Overwrite it with an entry
+    # that goes through the launcher.
+    install -d ${D}${datadir}/applications
+    cat > ${D}${datadir}/applications/io.github.opencloudgaming.OpenNOW.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=OpenNOW
+Comment=Controller-first GeForce NOW client
+Exec=opennow %U
+Icon=io.github.opencloudgaming.OpenNOW
+Terminal=false
+Categories=Game;Network;
+Keywords=GeForce;cloud;gaming;controller;
+StartupNotify=true
+StartupWMClass=OpenNOW
+MimeType=x-scheme-handler/opennow;
+EOF
 }
 
 FILES:${PN} += "${datadir}/doc/opennow ${datadir}/metainfo"

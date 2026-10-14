@@ -1,6 +1,6 @@
 SUMMARY = "YtGst - Qt6 YouTube client powered by GStreamer and yt-dlp"
 DESCRIPTION = "YtGst is a Qt 6 Quick YouTube client. It queries YouTube with \
-yt-dlp, streams the video through GStreamer (qml6glsink + v4l2h264dec hardware \
+yt-dlp, streams the video through GStreamer (qml6glsink + v4l2slh264dec hardware \
 decode offload) and supports downloads, subtitles and playback speed."
 HOMEPAGE = "https://github.com/DanielMartensson/YtGst"
 BUGTRACKER = "https://github.com/DanielMartensson/YtGst/issues"
@@ -22,9 +22,9 @@ DEPENDS = " \
     gstreamer1.0-plugins-base \
 "
 
-# Optional V4L2 stateless hardware decode via v4l2h264dec when the platform
+# Optional V4L2 stateless hardware decode via v4l2slh264dec when the platform
 # ships a codec plugin for it; override per machine otherwise.
-YTGST_VIDEO_DECODER ?= "v4l2h264dec"
+YTGST_VIDEO_DECODER ?= "v4l2slh264dec"
 
 EXTRA_OECMAKE:append = " -DYTGST_VIDEO_DECODER=${YTGST_VIDEO_DECODER}"
 
