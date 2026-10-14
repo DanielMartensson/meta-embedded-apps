@@ -13,6 +13,10 @@ SRCREV = "56ca99692b0be48799cadf014c54335dd30af2b2"
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
 
+# fe28e6a (init before QGuiApplication) is not on the remote yet; the user
+# will push it. Until then the build applies this patch on top of SRCREV.
+PATCHES += "files/nanobrowser_init_before_qguiapp.patch"
+
 # Need Qt 6.8 with WebEngine. QtWebEngine on aarch64 additionally requires the
 # Clang toolchain (meta-clang) to build the engine itself.
 DEPENDS = " \

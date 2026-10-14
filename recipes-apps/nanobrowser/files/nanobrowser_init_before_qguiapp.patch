@@ -1,0 +1,56 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 11be2d9..70e732e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -42,21 +42,19 @@ static QByteArray rendererFromEnv()
+     return qgetenv("NANOBROWSER_RENDERER").toLower();
+ }
+ 
+-static QString graphicsLogPath()
+-{
+-    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+-           + QStringLiteral("/graphics.log");
+-}
+-
+ static void appendGraphicsLog()
+ {
+-    const QString path = graphicsLogPath();
+-    // QDir::absolutePath() gives the directory part (leftOfLastPathSeparator
+-    // is not available in the target Qt build).
+-    const QString dir = QDir(path).absolutePath();
+-    if (!dir.isEmpty() && !QDir(dir).exists())
+-        QDir(dir).mkdir(dir);
+-
++    // The containing directory is the application data directory itself.
++    // (QDir::absolutePath() is unreliable in the target trimmed Qt 6.8:
++    // for a non-existing path it returns the full file path, which would
++    // mkdir a directory named graphics.log and then QFile::open would fail.)
++    const QString appDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
++    if (appDir.isEmpty())
++        return;
++    if (!QDir(appDir).exists())
++        QDir(appDir).mkdir(appDir);
++    const QString path = appDir + QStringLiteral("/graphics.log");
++    
+     const QString line = QString("%1 %2 %3\n").arg(
+                               QDateTime::currentDateTime().toString(Qt::ISODate),
+                               g_graphicsApi,
+@@ -238,13 +236,14 @@ int main(int argc, char *argv[])
+             ? extraFlags
+             : baseFlags + " " + extraFlags);
+ 
+-    QGuiApplication app(argc, argv);
+-
+-    pickGraphicsApi();
+-
+ #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
++    // QtWebEngineQuick must be initialized before QGuiApplication exists
++    // (Qt 6.8 otherwise warns that it is depreciated and the process may fail).
+     QtWebEngineQuick::initialize();
+ #endif
++    QGuiApplication app(argc, argv);
++
++    pickGraphicsApi();
+ 
+     QWebEngineProfile *profile = new QWebEngineProfile(QStringLiteral("nanobrowser"), &app);
+     profile->setPersistentStoragePath(
