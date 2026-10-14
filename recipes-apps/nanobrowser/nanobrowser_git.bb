@@ -8,7 +8,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/NanoBrowser.git;protocol=https;branch=main"
-SRCREV = "9e59762688b3a0dfa8d41e4caacfb290603e51fa"
+SRCREV = "033ecc89f1d995567e40402adc0ecc9dea814b8a"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -27,30 +27,15 @@ DEPENDS:append = " qtdeclarative-native"
 # The project has no install() rule; the QML module is compiled into the binary
 # via qt_add_qml_module, so a single executable is enough.
 #
-# NanoBrowser auto-detects a Vulkan RHI (vulkanHardwareAvailable()) and falls
-# back to OpenGL only when Vulkan is absent. The STM32MP257F VeriSilicon ICD
-# is wrongly reported as a suitable device, but the Vulkan loader rejects its
-# interface (v2 < v5) and cannot export VkImage file descriptors to weston,
-# so the Vulkan pipeline aborts. The upstream NANOBROWSER_RENDERER escape
-# hatch forces the OpenGL (GCNANO EGL) backend, which works on weston. The
-# wrapper only applies it when the user did not set their own renderer.
+# NanoBrowser picks its graphics API at startup (pickGraphicsApi()): Vulkan is
+# used only when a supported GPU is present and the Vulkan instance reports
+# version 1.2+ (required by QtWebEngine), otherwise it falls back to OpenGL
+# (GCNANO EGL) and shows a startup banner naming the graphics API and, for
+# a fallback, the reason. This keeps the broken GCNANO/VeriSilicon ICD path
+# out of QtWebEngine on the weston target.
 do_install() {
     install -d ${D}${bindir}
-    install -m 0755 ${B}/nanobrowser ${D}${bindir}/nanobrowser-qt
-    cat > ${D}${bindir}/nanobrowser <<EOF
-#!/bin/sh
-# Wrapper for nanobrowser-qt: force the OpenGL RHI backend by default.
-#
-# On this image the auto-detection picks Vulkan (GCNANO/VeriSilicon ICD), but
-# the Vulkan loader rejects the ICD's loader interface (v2 < v5) and it
-# cannot export VkImage file descriptors to weston, so the Vulkan pipeline
-# aborts. OpenGL (GCNANO EGL) is the working backend on the weston display.
-# NANOBROWSER_RENDERER is the upstream override; this only applies it when
-# the user has not already chosen a renderer.
-[ -z "\${NANOBROWSER_RENDERER}" ] && export NANOBROWSER_RENDERER=opengl
-exec ${bindir}/nanobrowser-qt "\$@"
-EOF
-    chmod 0755 ${D}${bindir}/nanobrowser
+    install -m 0755 ${B}/nanobrowser ${D}${bindir}/nanobrowser
 }
 
 RDEPENDS:${PN} += " \
