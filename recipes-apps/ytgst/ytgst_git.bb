@@ -15,7 +15,7 @@ PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
 
 # Real alsasink audio fallback, --watch <URL> CLI, DASH-first format selection.
-PATCHES = "patches/ytgst-audio-watch.patch"
+PATCHES += "files/ytgst-audio-watch.patch"
 
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \
@@ -57,3 +57,27 @@ RDEPENDS:${PN} += " \
     yt-dlp \
     pulseaudio \
 "
+
+# This tree's patch class does not apply local PATCHES (they are not in
+# SRC_URI, so do_patch has nothing to apply), and the host /usr/bin/patch is a
+# stub that returns 0 without applying. Apply the ytgst fix explicitly with
+# git apply (S is a git checkout; the patch is a git-format diff), after
+# do_patch and before do_configure.
+python do_patch:append() {
+    import os
+    import subprocess
+    s = d.getVar("S")
+    patchf = d.getVar("YTGST_PATCHFILE")
+    print("GITAPPLY: S=%s" % s)
+    print("GITAPPLY: patch exists: %s" % os.path.exists(patchf))
+    ret = subprocess.call(["git", "apply", patchf], cwd=s)
+    print("GITAPPLY: git apply exit=%d" % ret)
+    if ret != 0:
+        raise Exception("git apply failed with exit code %d" % ret)
+    print("GITAPPLY: patch applied successfully")
+}
+
+python () {
+    d.setVar("YTGST_PATCHFILE",
+             "/home/ubuntu/Dokument/Github/Watermelon-Wine/watermelon-wine-os/layers/meta-embedded-apps/recipes-apps/ytgst/files/ytgst-audio-watch.patch")
+}
