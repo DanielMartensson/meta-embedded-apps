@@ -14,6 +14,8 @@ SRCREV = "6cbd5957961d9682665801026ec9366c85e2776d"
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
 
+PATCHES = "patches/ytgst-audio-watch.patch" # real alsasink audio fallback, --watch <URL>, DASH-first format selection
+
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \
     qtbase \
@@ -40,7 +42,7 @@ do_install() {
 
 # GStreamer element usage (from YtGst source):
 #   qml6glsink  -> good, qml6 feature -> gstreamer1.0-plugins-good-qml6
-#   glupload / glcolorconvert / capsfilter / playbin / autoaudiosink
+#   glupload / glcolorconvert / capsfilter / playbin / alsasink
 #                -> base main plugin lib -> gstreamer1.0-plugins-base
 # (glupload/glcolorconvert were moved from -bad to -base in GStreamer 1.15+;
 #  -bad has no gl subpackage in 1.22.12)
