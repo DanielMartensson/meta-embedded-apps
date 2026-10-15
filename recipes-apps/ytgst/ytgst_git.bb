@@ -14,7 +14,8 @@ SRCREV = "6cbd5957961d9682665801026ec9366c85e2776d"
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
 
-PATCHES = "patches/ytgst-audio-watch.patch" # real alsasink audio fallback, --watch <URL>, DASH-first format selection
+# Real alsasink audio fallback, --watch <URL> CLI, DASH-first format selection.
+PATCHES = "patches/ytgst-audio-watch.patch"
 
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \
