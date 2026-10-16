@@ -58,7 +58,7 @@ index e9932a1..ebc5d52 100644
          playTitle = args.at(titleIndex + 1);
  
 diff --git a/src/player.cpp b/src/player.cpp
-index d0acc21..2c0a878 100644
+index d0acc21..afb38b3 100644
 --- a/src/player.cpp
 +++ b/src/player.cpp
 @@ -89,17 +89,20 @@ static bool parseVttTimestamp(const QString &value, qint64 *ms)
@@ -121,7 +121,7 @@ index d0acc21..2c0a878 100644
 +        GstElementFactory *factory = gst_element_factory_find(candidates[i]);
 +        if (factory) {
 +            gst_object_unref(factory);
-+            return QStringLiteral(candidates[i]);
++            return QString(candidates[i]);
 +        }
 +    }
 +    return QStringLiteral(
