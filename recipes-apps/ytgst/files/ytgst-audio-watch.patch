@@ -1,5 +1,5 @@
 diff --git a/src/main.cpp b/src/main.cpp
-index e9932a1..bb3e8cc 100644
+index e9932a1..54aa11a 100644
 --- a/src/main.cpp
 +++ b/src/main.cpp
 @@ -11,6 +11,7 @@
@@ -20,7 +20,7 @@ index e9932a1..bb3e8cc 100644
 +{
 +    if (text.isEmpty())
 +        return text;
-+    if (text.size() == 11 && QRegularExpression("^[A-Za-z0-9_-]{11}$").patternMatch(text))
++    if (text.size() == 11 && QRegularExpression::patternMatch("^[A-Za-z0-9_-]{11}$", text))
 +        return text;
 +    const QRegularExpression re(
 +        QStringLiteral("(?i)\\b(?:youtube\\.com/(?:v/|watch\\?v=|embed/|shorts/)"
