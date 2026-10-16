@@ -13,6 +13,10 @@ SRCREV = "6cbd5957961d9682665801026ec9366c85e2776d"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
+# PKGR: the PR-server counter (PRAUTO) resets to r0.0 whenever the recipe or
+# patch changes; pin it so the deb stays >= r0.2 for apt upgrades and >= r0.3
+# for the buildhistory version-going-backwards QA (last image build r0.3).
+PKGR = "r0.4"
 
 # Real alsasink audio fallback, --watch <URL> CLI, DASH-first format selection.
 PATCHES += "files/ytgst-audio-watch.patch"
