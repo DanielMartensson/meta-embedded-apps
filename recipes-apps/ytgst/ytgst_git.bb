@@ -16,7 +16,7 @@ S = "${WORKDIR}/git"
 # PKGR: the PR-server counter (PRAUTO) resets to r0.0 whenever the recipe or
 # patch changes; pin it so the deb stays >= r0.2 for apt upgrades and >= r0.3
 # for the buildhistory version-going-backwards QA (last image build r0.3).
-PKGR = "r0.4"
+PKGR = "r0.5"
 
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \

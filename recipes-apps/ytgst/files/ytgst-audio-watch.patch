@@ -79,17 +79,18 @@ index 7d32fac..d1a70e6 100644
              continue;
          const int h = format.value(QStringLiteral("height")).toInt();
          if (h > 0 && !heights.contains(h))
-@@ -998,6 +999,26 @@ void Player::handleFetchOutput()
+@@ -998,6 +999,27 @@ void Player::handleFetchOutput()
      buildPipeline();
  }
  
 +// Picks an audio sink description that works on this system.
-+// autaudiosink/pulsedsink are not present in the Watermelon Wine rootfs,
-+// so fall back to alsasink (HDMI playback) with 48 kHz/S16LE forced
-+// (the playback_hdmi device rejects the 44.1 kHz AAC of DASH mp4 streams).
++// PipeWire owns the HDMI device at 48 kHz on Watermelon Wine, so route the
++// audio through it (pulsesink): it resamples the 44.1 kHz AAC of DASH mp4
++// streams and shares the device instead of fighting for it. Without a sound
++// server, fall back to 48 kHz alsasink (the HDMI device is clocked for 48 kHz).
 +static QString audioSinkDescription()
 +{
-+    const char *candidates[] = {"autaudiosink", "pulsedsink", nullptr};
++    const char *candidates[] = {"pulsesink", "pipewiresink", "autoaudiosink", nullptr};
 +    for (int i = 0; candidates[i]; ++i) {
 +        GstElementFactory *factory = gst_element_factory_find(candidates[i]);
 +        if (factory) {
@@ -99,7 +100,7 @@ index 7d32fac..d1a70e6 100644
 +    }
 +    return QStringLiteral(
 +        "audioconvert ! audioresample ! "
-+        "capsfilter caps=\"audio/x-raw,rate=(uint)48000,channels=(uint)2,format=(string)S16LE\" "
++        "capsfilter caps=audio/x-raw,rate=48000,channels=2,format=S16LE "
 +        "! alsasink device=playback_hdmi");
 +}
 +
