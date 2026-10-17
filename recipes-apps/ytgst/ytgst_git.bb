@@ -9,7 +9,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/YtGst.git;protocol=https;branch=main"
-SRCREV = "6cbd5957961d9682665801026ec9366c85e2776d"
+SRCREV = "cbebab8fc01545f07013f6b9147a053fa7c096ea"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -17,9 +17,6 @@ S = "${WORKDIR}/git"
 # patch changes; pin it so the deb stays >= r0.2 for apt upgrades and >= r0.3
 # for the buildhistory version-going-backwards QA (last image build r0.3).
 PKGR = "r0.4"
-
-# Real alsasink audio fallback, --watch <URL> CLI, DASH-first format selection.
-PATCHES += "files/ytgst-audio-watch.patch"
 
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \
@@ -62,11 +59,15 @@ RDEPENDS:${PN} += " \
     pulseaudio \
 "
 
-# This tree's patch class does not apply local PATCHES (they are not in
-# SRC_URI, so do_patch has nothing to apply), and the host /usr/bin/patch is a
-# stub that returns 0 without applying. Apply the ytgst fix explicitly with
-# git apply (S is a git checkout; the patch is a git-format diff), after
-# do_patch and before do_configure.
+# Real alsasink audio fallback, --watch <URL> CLI, startup problems, DASH-first
+# format selection and pipeline tweaks.
+#
+# This tree's patch class does not apply local PATCHES (they are not in SRC_URI,
+# so do_patch has nothing to apply), and the host /usr/bin/patch is a stub that
+# returns 0 without applying. Apply the ytgst fix explicitly with git apply
+# (S is a git checkout; the patch is a git-format diff), after do_patch and
+# before do_configure. THISDIR keeps it independent of the build machine.
+YTGST_PATCHFILE = "${THISDIR}/files/ytgst-audio-watch.patch"
 python do_patch:append() {
     import os
     import subprocess
@@ -79,9 +80,4 @@ python do_patch:append() {
     if ret != 0:
         raise Exception("git apply failed with exit code %d" % ret)
     print("GITAPPLY: patch applied successfully")
-}
-
-python () {
-    d.setVar("YTGST_PATCHFILE",
-             "/home/ubuntu/Dokument/Github/Watermelon-Wine/watermelon-wine-os/layers/meta-embedded-apps/recipes-apps/ytgst/files/ytgst-audio-watch.patch")
 }

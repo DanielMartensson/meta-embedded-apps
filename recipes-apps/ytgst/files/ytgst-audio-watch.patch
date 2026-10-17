@@ -58,37 +58,10 @@ index e9932a1..ebc5d52 100644
          playTitle = args.at(titleIndex + 1);
  
 diff --git a/src/player.cpp b/src/player.cpp
-index d0acc21..afb38b3 100644
+index 7d32fac..d1a70e6 100644
 --- a/src/player.cpp
 +++ b/src/player.cpp
-@@ -89,17 +89,20 @@ static bool parseVttTimestamp(const QString &value, qint64 *ms)
-     return true;
- }
- 
--// Builds the yt-dlp format string. height <= 0 means the best available
--// (seekable) HLS stream. HLS is chosen first because GStreamer cannot seek
--// in YouTube's DASH/mp4 streams.
-+// Builds the yt-dlp format string. height <= 0 means the best available stream.
-+// DASH/mp4 is chosen first: seekable and plays through qtdemux on the target.
-+// HLS/m3u8 is kept as a fallback in case DASH is unavailable.
- static QString formatForHeight(int height)
- {
-     if (height > 0) {
--        return QStringLiteral("bestvideo[height<=%1][protocol^=m3u8]+bestaudio[protocol^=m3u8]"
--                              "/bestvideo[height<=%1]+bestaudio/best")
-+        return QStringLiteral("bestvideo[height<=%1][protocol^=mp4]+bestaudio[protocol^=mp4]"
-+                              "/bestvideo[height<=%1][protocol^=m3u8]+bestaudio[protocol^=m3u8]"
-+                              "/bestvideo+bestaudio/best")
-             .arg(height);
-     }
--    return QStringLiteral("bestvideo[protocol^=m3u8]+bestaudio[protocol^=m3u8]/bestvideo+bestaudio/best");
-+    return QStringLiteral("bestvideo[protocol^=mp4]+bestaudio[protocol^=mp4]"
-+                          "/bestvideo[protocol^=m3u8]+bestaudio[protocol^=m3u8]"
-+                          "/bestvideo+bestaudio/best");
- }
- 
- // Picks an installed browser to fetch YouTube cookies from.
-@@ -835,14 +838,15 @@ void Player::handleFetchOutput()
+@@ -866,14 +866,15 @@ void Player::handleFetchOutput()
      readCookiesFromFile();
      const QJsonObject obj = QJsonDocument::fromJson(output).object();
  
@@ -106,7 +79,7 @@ index d0acc21..afb38b3 100644
              continue;
          const int h = format.value(QStringLiteral("height")).toInt();
          if (h > 0 && !heights.contains(h))
-@@ -967,6 +971,26 @@ void Player::handleFetchOutput()
+@@ -998,6 +999,26 @@ void Player::handleFetchOutput()
      buildPipeline();
  }
  
@@ -133,7 +106,7 @@ index d0acc21..afb38b3 100644
  void Player::buildPipeline()
  {
      if (m_item == nullptr) {
-@@ -998,7 +1022,9 @@ void Player::buildPipeline()
+@@ -1029,7 +1050,9 @@ void Player::buildPipeline()
          // === AUDIO: separate playbin in the same pipeline (shared clock => sync) ===
          GstElement *aplay = gst_element_factory_make("playbin", "aplay");
          g_object_set(aplay, "uri", m_audioUrl.toUtf8().constData(),
