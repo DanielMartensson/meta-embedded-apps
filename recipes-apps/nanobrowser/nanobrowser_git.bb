@@ -8,7 +8,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/NanoBrowser.git;protocol=https;branch=main"
-SRCREV = "7df96cd6a11979e59ca7a457a99235ec3dab8df4"
+SRCREV = "fb28881261e0a61017bbbf251f05b4934de08ee7"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -38,9 +38,15 @@ do_install() {
     install -m 0755 ${B}/nanobrowser ${D}${bindir}/nanobrowser
 }
 
+# upower: Qt WebEngine's battery monitor asks the system D-Bus for UPower when a
+# page calls navigator.getBattery() (YouTube does). Without the service, Chromium
+# prints three "org.freedesktop.UPower was not provided by any .service files"
+# errors on the console. The board has no battery, but UPower answers "on line
+# power" and keeps that noise out of the terminal.
 RDEPENDS:${PN} += " \
     qtbase-plugins \
     qtdeclarative-qmlplugins \
     qtwebengine \
     qtwebengine-qmlplugins \
+    upower \
 "
