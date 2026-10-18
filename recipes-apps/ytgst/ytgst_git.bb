@@ -9,14 +9,14 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/YtGst.git;protocol=https;branch=main"
-SRCREV = "cbebab8fc01545f07013f6b9147a053fa7c096ea"
+SRCREV = "59d8a78fcef99966abcac5c835e8a41cb77efcc0"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
-# PKGR: the PR-server counter (PRAUTO) resets to r0.0 whenever the recipe or
-# patch changes; pin it so the deb stays >= r0.2 for apt upgrades and >= r0.3
-# for the buildhistory version-going-backwards QA (last image build r0.3).
-PKGR = "r0.9"
+# PKGR: the PR-server counter (PRAUTO) resets to r0.0 whenever the recipe
+# changes; pin it so the deb stays >= the version already installed on the
+# boards. r0.11 carries the source fixes that used to be applied as a patch.
+PKGR = "r0.11"
 
 # Qt 6.8 (Quick/Network/Widgets) and GStreamer core + GL library (gstgl).
 DEPENDS = " \
@@ -58,26 +58,3 @@ RDEPENDS:${PN} += " \
     yt-dlp \
     pulseaudio \
 "
-
-# Real alsasink audio fallback, --watch <URL> CLI, startup problems, DASH-first
-# format selection and pipeline tweaks.
-#
-# This tree's patch class does not apply local PATCHES (they are not in SRC_URI,
-# so do_patch has nothing to apply), and the host /usr/bin/patch is a stub that
-# returns 0 without applying. Apply the ytgst fix explicitly with git apply
-# (S is a git checkout; the patch is a git-format diff), after do_patch and
-# before do_configure. THISDIR keeps it independent of the build machine.
-YTGST_PATCHFILE = "${THISDIR}/files/ytgst-audio-watch.patch"
-python do_patch:append() {
-    import os
-    import subprocess
-    s = d.getVar("S")
-    patchf = d.getVar("YTGST_PATCHFILE")
-    print("GITAPPLY: S=%s" % s)
-    print("GITAPPLY: patch exists: %s" % os.path.exists(patchf))
-    ret = subprocess.call(["git", "apply", patchf], cwd=s)
-    print("GITAPPLY: git apply exit=%d" % ret)
-    if ret != 0:
-        raise Exception("git apply failed with exit code %d" % ret)
-    print("GITAPPLY: patch applied successfully")
-}
