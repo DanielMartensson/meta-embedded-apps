@@ -8,7 +8,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/NanoBrowser.git;protocol=https;branch=main"
-SRCREV = "db2279a902723fab75248aa94d0931b428e226db"
+SRCREV = "7df96cd6a11979e59ca7a457a99235ec3dab8df4"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
