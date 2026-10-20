@@ -9,7 +9,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/YtGst.git;protocol=https;branch=main"
-SRCREV = "5b3ee7d5017b1d738f0e5ea1d62474b0f3dee573"
+SRCREV = "9cb2a60806907c6ac91fa3924ea17f910f2172af"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
