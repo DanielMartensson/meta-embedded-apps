@@ -1,0 +1,45 @@
+diff --git a/native/opennow-core/src/cloudmatch.rs b/native/opennow-core/src/cloudmatch.rs
+index 50bfecb..9f77860 100644
+--- a/native/opennow-core/src/cloudmatch.rs
++++ b/native/opennow-core/src/cloudmatch.rs
+@@ -17,8 +17,14 @@ const LCARS_CLIENT_ID: &str = "ec7e38d4-03af-4b58-b131-cfb0495903ab";
+ const GFN_CLIENT_VERSION: &str = "2.0.87.131";
+ const DEFAULT_STREAMING_BASE: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
+ const DEFAULT_STUN_SERVER: &str = "stun:s1.stun.gamestream.nvidia.com:19308";
+-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+-const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
++// A region front end occasionally takes five seconds or more to answer a
++// cold /v2/session request, and the TLS handshake on the STM32MP257F adds to
++// that. The old three second budget marked the lookup incomplete and blocked
++// every launch with "session_discovery_failed" even when the game was not
++// running anywhere, so give each region room and let the overall deadline
++// absorb one slow answer.
++const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
++const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+ const NETWORK_TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+ const MAXIMUM_NETWORK_TEST_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+ const MAX_DISCOVERY_REGIONS: usize = 32;
+@@ -2573,9 +2579,11 @@ fn discover_sessions(
+     cancellation.check()?;
+     results.sort_by_key(|(index, _)| *index);
+     let mut sessions = Vec::new();
++    let mut answered = false;
+     for (_, result) in results {
+         match result {
+             Ok(found) => {
++                answered = true;
+                 for session in found {
+                     if !sessions
+                         .iter()
+@@ -2591,7 +2599,10 @@ fn discover_sessions(
+             Err(_) => incomplete = true,
+         }
+     }
+-    if sessions.is_empty() && (incomplete || bases.is_empty()) {
++    // Only fail when no region answered at all. One slow or unreachable
++    // region used to abort the whole lookup; an account can hold a session in
++    // a single region, and the service rejects a second launch anyway.
++    if sessions.is_empty() && !answered && incomplete {
+         return Err(discovery_failed());
+     }
+     Ok(sessions)

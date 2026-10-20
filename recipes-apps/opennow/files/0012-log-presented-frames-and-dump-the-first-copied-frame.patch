@@ -1,0 +1,69 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+index 522e0481..c0609abc 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+@@ -555,6 +555,15 @@ impl DmaBufFrame {
+                 rows,
+             });
+         }
++        if let Ok(path) = std::env::var("OPENNOW_DUMP_NV12") {
++            use std::sync::atomic::{AtomicBool, Ordering};
++            static DUMPED: AtomicBool = AtomicBool::new(false);
++            if !DUMPED.swap(true, Ordering::Relaxed) && planes.len() == 2 {
++                let _ = std::fs::write(format!("{path}.y"), planes[0].data.as_ref());
++                let _ = std::fs::write(format!("{path}.uv"), planes[1].data.as_ref());
++                eprintln!("opennow-diag: dumped NV12 {width}x{height} to {path}.y/.uv");
++            }
++        }
+         Ok(planes)
+     }
+ 
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 0d496731..2f311af2 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -740,6 +740,20 @@ impl LinuxFrameProducer {
+                         "DMA-BUF CPU copy requires NV12 SDR frames",
+                     ));
+                 }
++                {
++                    use std::sync::atomic::{AtomicBool, Ordering};
++                    static DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
++                    if !DIAGNOSTIC.swap(true, Ordering::Relaxed) {
++                        eprintln!(
++                            "opennow-diag: cpu-copy frame {}x{} range={:?} matrix={:?} chroma={:?}",
++                            frame.format.width,
++                            frame.format.height,
++                            frame.format.color_range,
++                            frame.format.color_matrix,
++                            frame.format.chroma_location
++                        );
++                    }
++                }
+                 let planes = frame
+                     .dmabuf
+                     .as_ref()
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index e1a6bad7..3cb16cd6 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -421,6 +421,19 @@ public:
+         } else if (now - start >= 1'000'000'000) {
+             m_outputFps.store(double(m_outputCount.exchange(0)) * 1.0e9 / double(now - start));
+             m_sampleStart.store(now);
++            if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT")) {
++                const auto snapshot = m_swapTimings.snapshot();
++                if (snapshot.available) {
++                    qInfo("opennow-present fps=%.1f swapped=%llu p50=%.2fms p95=%.2fms max=%.2fms",
++                          m_outputFps.load(), qulonglong(snapshot.swappedFramesTotal),
++                          double(snapshot.submitToSwap.p50Ns) / 1.0e6,
++                          double(snapshot.submitToSwap.p95Ns) / 1.0e6,
++                          double(snapshot.submitToSwap.maxNs) / 1.0e6);
++                } else {
++                    qInfo("opennow-present fps=%.1f swapped=%llu",
++                          m_outputFps.load(), qulonglong(snapshot.swappedFramesTotal));
++                }
++            }
+         }
+     }
+ 

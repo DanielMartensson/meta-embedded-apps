@@ -1,0 +1,41 @@
+diff --git a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+index 0095779..dad3df5 100644
+--- a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
++++ b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+@@ -108,14 +108,8 @@ FocusScope {
+             border.width: action.activeFocus ? 2 : action.primary || action.quiet ? 0 : 1
+             border.color: action.activeFocus ? DesktopTokens.focus : root.cardSeam
+             opacity: action.enabled ? 1 : 0.5
+-            layer.enabled: action.primary
+-            layer.effect: MultiEffect {
+-                shadowEnabled: true
+-                shadowColor: "#2E6EE7B7"
+-                shadowBlur: 0.6
+-                shadowVerticalOffset: DesktopTokens.px(8)
+-                shadowHorizontalOffset: 0
+-            }
++            // Drawn directly: the layered shadow below crashed the Vulkan
++            // driver on the STM32MP257F, see the sign-in card.
+         }
+     }
+ 
+@@ -248,14 +242,11 @@ FocusScope {
+                 color: Theme.lightMode ? Qt.rgba(Theme.shell.r, Theme.shell.g, Theme.shell.b, 0.92) : "#D10B0F1A"
+                 border.width: 1
+                 border.color: root.cardSeam
+-                layer.enabled: true
+-                layer.effect: MultiEffect {
+-                    shadowEnabled: true
+-                    shadowColor: "#8C000000"
+-                    shadowBlur: 1
+-                    shadowVerticalOffset: DesktopTokens.px(24)
+-                    shadowHorizontalOffset: 0
+-                }
++                // The card used to be a QML layer with a MultiEffect drop
++                // shadow. On the STM32MP257F the VeriSilicon Vulkan driver
++                // segfaults in QSGRhiLayer::grab() when the card re-renders
++                // while the QR panel appears, so it is drawn directly now. The
++                // button above lost its layer for the same reason.
+ 
+                 Column {
+                     id: cardColumn

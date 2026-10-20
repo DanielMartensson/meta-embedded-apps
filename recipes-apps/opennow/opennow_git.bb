@@ -20,6 +20,11 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0005-select-the-renderer-at-run-time.patch \
            file://0006-let-sigterm-stop-the-application.patch \
            file://0007-leave-the-process-when-the-event-loop-ends.patch \
+           file://0008-keep-the-sign-in-card-out-of-the-layer-path.patch \
+           file://0009-do-not-let-one-slow-region-block-a-launch.patch \
+           file://0010-print-the-native-error-message.patch \
+           file://0011-copy-decoded-dmabuf-frames-to-the-cpu-when-the-gpu-ca.patch \
+           file://0012-log-presented-frames-and-dump-the-first-copied-frame.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
@@ -34,7 +39,7 @@ PV = "1.0.4+git${SRCPV}"
 # The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
 # r0.12 leaves the process when the event loop ends instead of running Qt
 # teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.12"
+PKGR = "r0.18"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
@@ -556,6 +561,18 @@ if [ -z "\${WAYLAND_DISPLAY}" ]; then
             break
         fi
     done
+fi
+# The embedded streamer opens its audio output through PipeWire, and this
+# image's ALSA "default" is the PipeWire plugin as well. Both honour
+# PIPEWIRE_RUNTIME_DIR when it is set, but the session keeps
+# XDG_RUNTIME_DIR=/home/weston for Wayland while the user's PipeWire socket
+# lives in /run/user/<uid>. Without this the first stream dies with
+#   media-output-unavailable: the PipeWire socket was not found under
+#   XDG_RUNTIME_DIR; Alsa is unavailable: Host is down
+# Move only the audio clients; the Wayland socket above keeps the session's
+# directory.
+if [ -z "\${PIPEWIRE_RUNTIME_DIR}" ] && [ -S "/run/user/\$(id -u)/pipewire-0" ]; then
+    export PIPEWIRE_RUNTIME_DIR="/run/user/\$(id -u)"
 fi
 # weston's session starts with LANG unset, and a non-UTF-8 character type makes
 # Qt print

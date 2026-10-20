@@ -1,0 +1,21 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs b/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
+index 301393d..d0e02bd 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
+@@ -278,6 +278,16 @@ pub fn message_summary(value: &serde_json::Value) -> String {
+             }
+         }
+     }
++    if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
++        let clean: String = message
++            .chars()
++            .map(|c| if c.is_control() { ' ' } else { c })
++            .take(300)
++            .collect();
++        if !clean.trim().is_empty() {
++            fields.push(format!("message={}", clean.trim()));
++        }
++    }
+     fields.join(" ")
+ }
+ 

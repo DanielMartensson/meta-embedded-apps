@@ -1,0 +1,221 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+index 9971806e..522e0481 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+@@ -403,6 +403,75 @@ impl fmt::Debug for VulkanVideoFrame {
+     }
+ }
+ 
++/// Cache-synchronised CPU mapping of one DMA-BUF object.
++struct DmaBufMapping {
++    fd: i32,
++    pointer: *mut u8,
++    length: usize,
++}
++
++const DMA_BUF_SYNC_READ: u64 = 1;
++const DMA_BUF_SYNC_START: u64 = 0;
++const DMA_BUF_SYNC_END: u64 = 4;
++// _IOW('b', 2, struct dma_buf_sync) on 64-bit Linux.
++const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6202;
++
++impl DmaBufMapping {
++    fn new(fd: i32, length: usize) -> Result<Self> {
++        let pointer = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                length,
++                libc::PROT_READ,
++                libc::MAP_SHARED,
++                fd,
++                0,
++            )
++        };
++        if pointer == libc::MAP_FAILED {
++            return Err(Error::backend(
++                crate::Subsystem::V4l2,
++                format!(
++                    "failed to map DMA-BUF for the CPU copy: {}",
++                    std::io::Error::last_os_error()
++                ),
++            ));
++        }
++        Ok(Self {
++            fd,
++            pointer: pointer.cast(),
++            length,
++        })
++    }
++
++    fn begin_read(&self) {
++        self.sync(DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
++    }
++
++    fn end_read(&self) {
++        self.sync(DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
++    }
++
++    fn sync(&self, flags: u64) {
++        #[repr(C)]
++        struct DmaBufSync {
++            flags: u64,
++        }
++        let sync = DmaBufSync { flags };
++        unsafe {
++            libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC, &sync);
++        }
++    }
++}
++
++impl Drop for DmaBufMapping {
++    fn drop(&mut self) {
++        unsafe {
++            libc::munmap(self.pointer.cast(), self.length);
++        }
++    }
++}
++
+ impl DmaBufFrame {
+     pub fn new(
+         objects: Vec<DmaBufObject>,
+@@ -416,6 +485,79 @@ impl DmaBufFrame {
+         }
+     }
+ 
++    /// Copies a linear NV12 DMA-BUF into tightly packed CPU planes.
++    ///
++    /// The presenter uses this when the graphics device cannot import the
++    /// decoder's DMA-BUF, for example a Vulkan driver without external memory
++    /// support. Decoding still runs on the hardware decoder; only the
++    /// presentation buffer is copied.
++    pub fn copy_nv12_planes(&self, width: u32, height: u32) -> Result<Vec<FramePlane>> {
++        self.validate()?;
++        let layer = self
++            .layers
++            .first()
++            .ok_or_else(|| Error::InvalidFormat("DMA-BUF frame has no layer".to_owned()))?;
++        if width == 0 || height == 0 || height % 2 != 0 || layer.planes.len() < 2 {
++            return Err(Error::InvalidFormat(
++                "NV12 CPU copy requires a non-zero even height and two planes".to_owned(),
++            ));
++        }
++        let mut mappings: Vec<Option<DmaBufMapping>> =
++            (0..self.objects.len()).map(|_| None).collect();
++        let mut planes = Vec::with_capacity(2);
++        for (index, plane) in layer.planes.iter().take(2).enumerate() {
++            let object = &self.objects[plane.object_index];
++            let rows = (height >> index) as usize;
++            let row_bytes = width as usize;
++            if plane.pitch < row_bytes {
++                return Err(Error::InvalidFormat(
++                    "DMA-BUF plane pitch is smaller than the frame width".to_owned(),
++                ));
++            }
++            let end = plane
++                .offset
++                .checked_add(
++                    plane
++                        .pitch
++                        .checked_mul(rows.saturating_sub(1))
++                        .ok_or_else(|| {
++                            Error::InvalidFormat("DMA-BUF plane size overflow".to_owned())
++                        })?,
++                )
++                .and_then(|value| value.checked_add(row_bytes))
++                .ok_or_else(|| Error::InvalidFormat("DMA-BUF plane size overflow".to_owned()))?;
++            if end > object.size {
++                return Err(Error::InvalidFormat(
++                    "DMA-BUF plane exceeds the object size".to_owned(),
++                ));
++            }
++            if mappings[plane.object_index].is_none() {
++                mappings[plane.object_index] = Some(DmaBufMapping::new(object.fd, object.size)?);
++            }
++            let mapping = mappings[plane.object_index]
++                .as_ref()
++                .expect("DMA-BUF object is mapped");
++            mapping.begin_read();
++            let mut data = vec![0u8; row_bytes * rows];
++            for row in 0..rows {
++                unsafe {
++                    std::ptr::copy_nonoverlapping(
++                        mapping.pointer.add(plane.offset + row * plane.pitch),
++                        data.as_mut_ptr().add(row * row_bytes),
++                        row_bytes,
++                    );
++                }
++            }
++            mapping.end_read();
++            planes.push(FramePlane {
++                data: Arc::from(data),
++                stride: row_bytes,
++                rows,
++            });
++        }
++        Ok(planes)
++    }
++
+     pub fn validate(&self) -> Result<()> {
+         if self.objects.is_empty() || self.layers.is_empty() {
+             return Err(Error::InvalidFormat(
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 9e357049..0d496731 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -728,6 +728,35 @@ impl LinuxFrameProducer {
+             DmaBufImportRoute::Image => self
+                 .import_dmabuf(Arc::clone(&frame))
+                 .map(PreparedLinuxFrame::DmaBuf),
++            // The graphics device cannot import the decoder's DMA-BUF. Copy
++            // the decoded NV12 planes to the CPU and use the regular upload
++            // path; the hardware decoder still does all of the decoding.
++            DmaBufImportRoute::CpuCopy => {
++                if frame.format.pixel_format != PixelFormat::Nv12
++                    || frame.format.color_transfer != crate::ColorTransfer::Sdr
++                {
++                    return Err(Error::unavailable(
++                        Subsystem::Vulkan,
++                        "DMA-BUF CPU copy requires NV12 SDR frames",
++                    ));
++                }
++                let planes = frame
++                    .dmabuf
++                    .as_ref()
++                    .expect("DMA-BUF checked")
++                    .copy_nv12_planes(frame.format.width, frame.format.height)?;
++                if planes.len() != 2 {
++                    return Err(Error::unavailable(
++                        Subsystem::Vulkan,
++                        "DMA-BUF CPU copy did not return two NV12 planes",
++                    ));
++                }
++                Ok(PreparedLinuxFrame::Cpu(CpuNv12Frame {
++                    luma: planes[0].clone(),
++                    chroma: planes[1].clone(),
++                    source: frame,
++                }))
++            }
+             // CPU planes are accepted only from an explicitly CPU-backed decoder,
+             // never as an automatic substitute for failed native GPU interop.
+             DmaBufImportRoute::None
+@@ -2005,6 +2034,7 @@ enum DmaBufImportRoute {
+     None,
+     Image,
+     Sand,
++    CpuCopy,
+ }
+ 
+ fn dmabuf_import_route(
+@@ -2023,6 +2053,12 @@ fn dmabuf_import_route(
+         return Ok(DmaBufImportRoute::Sand);
+     }
+     if !render.dmabuf_import_enabled {
++        if dmabuf.layers.len() == 1
++            && dmabuf.layers[0].format == u32::from_le_bytes(*b"NV12")
++            && dmabuf.layers[0].planes.len() == 2
++        {
++            return Ok(DmaBufImportRoute::CpuCopy);
++        }
+         return Err(Error::ImportUnsupported(
+             "the decoder produced a DMA-BUF frame but Qt's Vulkan device did not enable the DMA-BUF image import contract; implicit CPU readback is disabled".to_owned(),
+         ));
