@@ -126,6 +126,28 @@ The right value is a property of the SoC, not of this layer, so set it in a
 Vulkan, Cuda, VaApi, V4l2 and Ffmpeg and reports what it found; the user picks
 one in the UI.
 
+#### Rendering backend
+
+Upstream forces the Vulkan RHI on Linux. That is right for streaming - the
+embedded streamer hands its textures to Qt's Vulkan device - but the Ui does not
+need it, and a machine whose OpenGL driver is better for Qt Quick can say so:
+patch `0005` adds `OPENNOW_RENDERER=opengl`. Empty means Vulkan, so nothing
+changes by default.
+
+Measured on the STM32MP25 (Weston 13, 1280x720 HDMI, three 90 s runs per
+backend, the window idle after start-up, package `r0.9`):
+
+| backend | first frame | CPU, GUI + core | stderr | exit on SIGTERM |
+| --- | --- | --- | --- | --- |
+| Vulkan | 4.37 s | 3 % + 1 % of a core | empty | 143 |
+| OpenGL | 4.26 s | 2 % + 1 % of a core | empty | 143 |
+
+Start-up is dominated by the QML scene and the Rust core, not by the RHI, so the
+two backends are within noise of each other here, and both draw the scene on the
+Vivante GPU. Patch `0006` keeps SDL3 from installing its own SIGINT/SIGTERM
+handlers, which used to swallow `kill` and `systemctl stop` and leave the
+process running forever.
+
 ### YtGst
 
 | Variable | Default | Purpose |

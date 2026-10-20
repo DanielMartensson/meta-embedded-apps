@@ -1,0 +1,20 @@
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -159,7 +159,16 @@
+ #elif defined(Q_OS_MACOS)
+     QQuickWindow::setGraphicsApi(QSGRendererInterface::Metal);
+ #elif defined(Q_OS_LINUX)
+-    QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
++    // Upstream forces Vulkan here, which stays the default: the streaming path
++    // hands its textures to Qt through the Vulkan device and cannot run on
++    // OpenGL. The Ui itself does not need Vulkan, though, and on the
++    // STM32MP25 it starts about five times faster on OpenGL (the same driver
++    // behaviour that YtGst and NanoBrowser see, see README.md), so
++    // OPENNOW_RENDERER=opengl selects it for a run. Anything else keeps Vulkan.
++    if (qgetenv("OPENNOW_RENDERER").toLower() == "opengl")
++        QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
++    else
++        QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+ #endif
+     QQuickStyle::setStyle(u"Basic"_s);
+ 

@@ -1,0 +1,17 @@
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -141,6 +141,14 @@
+ #ifdef OPENNOW_WAYLAND_DECORATIONS
+     wl_log_set_handler_client(waylandLogHandler);
+ #endif
++#ifdef Q_OS_LINUX
++    // SDL3 installs SIGINT/SIGTERM handlers by default and turns the signals
++    // into SDL events, which nothing in this Qt application pumps: kill and
++    // systemctl stop would then leave the process running forever. The Qt event
++    // loop owns the lifetime here, so keep SDL out of signal handling and let
++    // SIGTERM do what it does for every other application.
++    qputenv("SDL_NO_SIGNAL_HANDLERS", "1");
++#endif
+ #ifdef Q_OS_WIN
+     if (!qEnvironmentVariableIsSet("QT_D3D_NO_VBLANK_THREAD"))
+         qputenv("QT_D3D_NO_VBLANK_THREAD", "1");

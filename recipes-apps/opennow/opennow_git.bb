@@ -17,6 +17,8 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0002-anchor-the-launcher-badge-to-its-row.patch \
            file://0003-ask-only-for-the-decoders-and-surfaces-this-machine-has.patch \
            file://0004-drop-the-driver-s-orphaned-queue-report.patch \
+           file://0005-select-the-renderer-at-run-time.patch \
+           file://0006-let-sigterm-stop-the-application.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
