@@ -135,19 +135,38 @@ need it, and a machine whose OpenGL driver is better for Qt Quick can say so:
 patch `0005` adds `OPENNOW_RENDERER=opengl`. Empty means Vulkan, so nothing
 changes by default.
 
-Measured on the STM32MP25 (Weston 13, 1280x720 HDMI, three 90 s runs per
-backend, the window idle after start-up, package `r0.9`):
+Measured on the STM32MP257F (Weston 13, 1920x1080 HDMI, the default 1600x900
+window, package `r0.12`; start-up from `--measure-startup`, CPU and memory after
+the catalog finished loading):
 
-| backend | first frame | CPU, GUI + core | stderr | exit on SIGTERM |
+| backend | first frame | idle CPU, GUI + core | RSS, GUI + core | stderr |
 | --- | --- | --- | --- | --- |
-| Vulkan | 4.37 s | 3 % + 1 % of a core | empty | 143 |
-| OpenGL | 4.26 s | 2 % + 1 % of a core | empty | 143 |
+| Vulkan | 6.9 s | 2.7 % + 0 % of a core | 252 MB + 40 MB | empty |
+| OpenGL | 4.6 s | 2.3 % + 0 % of a core | 196 MB + 40 MB | empty |
 
-Start-up is dominated by the QML scene and the Rust core, not by the RHI, so the
-two backends are within noise of each other here, and both draw the scene on the
-Vivante GPU. Patch `0006` keeps SDL3 from installing its own SIGINT/SIGTERM
-handlers, which used to swallow `kill` and `systemctl stop` and leave the
-process running forever.
+The QML scene costs about 3.9 s on both backends. On Vulkan the first frame adds
+another 2.9 s because the driver compiles the Qt Quick shaders for every
+material on the fly; opening a surface that was not drawn before (the
+game-details sheet, for example) can stall for about a second the first time.
+No pipeline cache is saved: the VeriSilicon driver deadlocks inside
+`libvulkan_VSI` when Qt tears the window down, which is also why exit used to
+hang. There is no cache file to seed the next run with.
+
+`QWindowPrivate::destroy()` waits for the render thread, while the render thread
+waits for a Wayland roundtrip inside `libvulkan_VSI`; the embedded streamer's
+scene-graph shutdown can abort on a mutex at the same point. The old result was
+the ten-second teardown watchdog, or a core dump on `SIGABRT`. Patch `0007`
+stops the core client and leaves the process with `_Exit()` instead of running
+Qt's teardown when no restart is pending; the window, scene graph and streamer
+are per-process resources, so nothing is lost. Closing the window is immediate
+now and writes no core dump. Patch `0006` keeps SDL3 from installing its own
+SIGINT/SIGTERM handlers, which used to swallow `kill` and `systemctl stop` and
+leave the process running forever.
+
+The recipe tracks upstream's `dev` branch. That branch reports itself as `1.0.4`
+(the nightly line), while the newest stable release is `1.0.3` - the version the
+app's stable update channel offers. `PV` follows the source tree, so the package
+is `1.0.4+git...` even though the last stable release has a lower number.
 
 ### YtGst
 

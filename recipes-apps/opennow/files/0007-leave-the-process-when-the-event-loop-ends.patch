@@ -1,0 +1,28 @@
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 2dc5dd6..31bbbe7 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -440,6 +440,23 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     armTeardownDeadline(exitCode);
+     coreClient.stop();
+ #ifdef OPENNOW_EMBEDDED_STREAMER
++    // On the STM32MP25 VeriSilicon Vulkan driver this teardown does not finish.
++    // The GUI thread waits in QWindowPrivate::destroy() for the render thread,
++    // while the render thread sits in libvulkan_VSI waiting for a Wayland
++    // roundtrip that only the blocked GUI thread can dispatch. The embedded
++    // streamer's scene-graph shutdown can also abort on a mutex at the same
++    // point. Both were observed on the STM32MP257F, and either one ends in the
++    // ten-second watchdog above or in SIGABRT with a core dump.
++    //
++    // Nothing after the event loop is needed once the core client has stopped:
++    // the window, the scene graph and the streamer are per-process resources
++    // and go away with the process. Leave without running Qt's teardown, unless
++    // a restart was requested; the updater path needs runApplication to start
++    // the replacement executable.
++    if (restartExecutable.isEmpty()) {
++        std::fflush(nullptr);
++        std::_Exit(exitCode);
++    }
+     const auto roots = engine.rootObjects();
+     for (auto *root : roots) delete root;
+     StreamVideoItem::setNativeStreamRuntime(nullptr);

@@ -19,6 +19,7 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0004-drop-the-driver-s-orphaned-queue-report.patch \
            file://0005-select-the-renderer-at-run-time.patch \
            file://0006-let-sigterm-stop-the-application.patch \
+           file://0007-leave-the-process-when-the-event-loop-ends.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
@@ -29,7 +30,11 @@ SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
 # tarball instead and apply the v4l2-request patches to it.
 SRC_URI[ffmpeg.sha256sum] = "7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52"
 
-PV = "1.0.3+git${SRCPV}"
+PV = "1.0.4+git${SRCPV}"
+# The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
+# r0.12 leaves the process when the event loop ends instead of running Qt
+# teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
+PKGR = "r0.12"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
