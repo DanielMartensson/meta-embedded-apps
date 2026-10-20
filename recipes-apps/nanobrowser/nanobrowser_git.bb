@@ -9,7 +9,7 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/NanoBrowser.git;protocol=https;branch=main"
-SRCREV = "c60c0d45095364dec2d86dc132f717d0f5874b81"
+SRCREV = "e946266e3fd28ba1459f67b3d3c06af9d974bfc8"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -43,9 +43,15 @@ S = "${WORKDIR}/git"
 #   * Chromium runs with the switches measured on the board (see the README), and
 #     the unused second QWebEngineProfile in main.cpp is gone.
 #
+# r0.32 draws the only window frame there is: the window asks for client-side
+# decorations (Qt.FramelessWindowHint -> xdg-decoration client_side), because a
+# compositor that decorates toplevels by default otherwise wraps the window in a
+# second title bar on top of the one the browser draws - two sets of
+# minimize/maximize/close buttons.
+#
 # r0.20 and earlier carried the VPU handover (which moved a YouTube video to a
 # gst-launch pipeline); r0.19 added the reload button and the implicit sizes.
-PKGR = "r0.31"
+PKGR = "r0.32"
 
 # Need Qt 6.8 with WebEngine. QtWebEngine on aarch64 additionally requires the
 # Clang toolchain (meta-clang) to build the engine itself.
