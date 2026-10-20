@@ -1,0 +1,61 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+index f24d2499..3f1b0dff 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+@@ -230,6 +230,13 @@ impl FfmpegDecoder {
+         let device_path = vaapi_device
+             .as_ref()
+             .map_or(ptr::null(), |path| path.as_ptr());
++        if mode == FfmpegMode::Cuda && !cuda_device_present() {
++            return Err(Error::unavailable(
++                Subsystem::Ffmpeg,
++                "no NVIDIA device node (/dev/nvidiactl), so CUDA decoding cannot be offered"
++                    .to_owned(),
++            ));
++        }
+         if let Some(device_type) = mode.device_type() {
+             let pixel_format =
+                 hardware_pixel_format(decoder_definition, device_type).ok_or_else(|| {
+@@ -245,11 +252,26 @@ impl FfmpegDecoder {
+             let mut device = ptr::null_mut();
+             let mut options = ptr::null_mut();
+             if mode == FfmpegMode::Vulkan {
++                // FFmpeg reports every instance extension it was asked for and
++                // could not find ("instance extension VK_KHR_xlib_surface not
++                // found, excluding"). Ask only for the window-system extensions
++                // this session can have: a Wayland-only board has no X11
++                // surface.
++                let mut surfaces = String::from("VK_KHR_surface");
++                if std::env::var_os("WAYLAND_DISPLAY").is_some()
++                    || std::env::var_os("WAYLAND_SOCKET").is_some()
++                {
++                    surfaces.push_str("+VK_KHR_wayland_surface");
++                }
++                if std::env::var_os("DISPLAY").is_some() {
++                    surfaces.push_str("+VK_KHR_xlib_surface");
++                }
++                let surfaces = std::ffi::CString::new(surfaces).unwrap_or_default();
+                 unsafe {
+                     ffi::av_dict_set(
+                         &mut options,
+                         c"instance_extensions".as_ptr(),
+-                        c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_wayland_surface".as_ptr(),
++                        surfaces.as_ptr(),
+                         0,
+                     );
+                     ffi::av_dict_set(
+@@ -1225,6 +1247,14 @@ impl VideoDecoder for FfmpegDecoder {
+     }
+ }
+ 
++/// FFmpeg's CUDA device tries to load libcuda.so.1 and logs an error when it is
++/// not there, which is the normal case on every board without an NVIDIA GPU.
++/// Ask the kernel first, so a missing driver is a plain "not available" instead
++/// of an error on the console.
++fn cuda_device_present() -> bool {
++    std::path::Path::new("/dev/nvidiactl").exists()
++}
++
+ fn initialize_ffmpeg() -> Result<()> {
+     static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+     INITIALIZED

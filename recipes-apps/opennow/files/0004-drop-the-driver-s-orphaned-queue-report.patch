@@ -1,0 +1,74 @@
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 3e027031..611067fc 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -35,10 +35,18 @@
+ #include <QFileOpenEvent>
+ #include <QProcess>
+ 
++#include <algorithm>
+ #include <chrono>
++#include <cstdarg>
++#include <cstdio>
+ #include <cstdlib>
++#include <string_view>
+ #include <thread>
+ 
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++#include <wayland-client.h>
++#endif
++
+ #ifdef Q_OS_WIN
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -54,6 +62,40 @@ using namespace Qt::StringLiterals;
+ namespace {
+ constexpr auto TeardownDeadline = std::chrono::seconds(10);
+ 
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++// The VeriSilicon Vulkan driver opens its own connection to the compositor to
++// allocate buffers (wl_viv) and drops that connection when a swapchain goes
++// away, while its wl_compositor proxy is still attached. libwayland reports it
++// on every start and every exit:
++//
++//   warning: queue 0xffff... destroyed while proxies still attached:
++//     wl_compositor@35 still attached
++//
++// The queue belongs to a connection the driver made, so no client-side change
++// prevents it. Drop exactly that report and leave every other libwayland
++// diagnostic on stderr.
++bool g_suppressOrphanedQueueReport = false;
++
++void waylandLogHandler(const char *format, va_list arguments)
++{
++    char line[512];
++    const int length = std::vsnprintf(line, sizeof line, format, arguments);
++    if (length <= 0) return;
++    const auto text = std::string_view(line, std::min<size_t>(size_t(length), sizeof line - 1));
++    if (text.starts_with("warning: queue ")
++        && text.find("destroyed while proxies still attached") != std::string_view::npos) {
++        g_suppressOrphanedQueueReport = true;
++        return;
++    }
++    if (g_suppressOrphanedQueueReport && text.starts_with("  ")
++        && text.find("still attached") != std::string_view::npos) {
++        return;
++    }
++    g_suppressOrphanedQueueReport = false;
++    std::fwrite(line, 1, size_t(length), stderr);
++}
++#endif
++
+ void armTeardownDeadline(int exitCode)
+ {
+     std::thread([exitCode] {
+@@ -96,6 +138,9 @@ private:
+ 
+ static int runApplicationSession(int argc, char *argv[], QString &restartExecutable)
+ {
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++    wl_log_set_handler_client(waylandLogHandler);
++#endif
+ #ifdef Q_OS_WIN
+     if (!qEnvironmentVariableIsSet("QT_D3D_NO_VBLANK_THREAD"))
+         qputenv("QT_D3D_NO_VBLANK_THREAD", "1");

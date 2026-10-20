@@ -1,0 +1,173 @@
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 3e027031..e0806b72 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -185,6 +185,7 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     NativeStreamRuntime::initializeDiagnostics();
+     LinuxVulkanGraphics::Device vulkanDevice;
+     if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
++            && LinuxVulkanGraphics::hasVulkanVideoDecode()
+             && !vulkanDevice.initialize())
+         qWarning("Embedded Vulkan Video is unavailable: %s Qt will use its default graphics device.",
+                  qUtf8Printable(vulkanDevice.lastError()));
+diff --git a/opennow-qt/src/main.cpp b/opennow-qt/src/main.cpp
+index a3d0bc68..8b790a70 100644
+--- a/opennow-qt/src/main.cpp
++++ b/opennow-qt/src/main.cpp
+@@ -1,6 +1,36 @@
+ #include "app/ApplicationStartup.h"
+ 
++#include <clocale>
++#include <langinfo.h>
++#include <QDebug>
++
++// ---------------------------------------------------------------------------
++// A UTF-8 character type
++// ---------------------------------------------------------------------------
++//
++// Embedded sessions often start with LANG=C, and Qt then warns once per process
++// that it depends on a UTF-8 locale. Qt's text handling really does want UTF-8:
++// with an ASCII character type, paths and titles converted with
++// QString::fromLocal8Bit() come out mangled.
++//
++// Only LC_CTYPE is changed. Number, date and collation formats keep following
++// whatever the session asks for, and LANG is left alone, so the language used
++// for the interface and for search results does not change.
++static void preferUtf8CharacterType()
++{
++    if (setlocale(LC_CTYPE, "") == nullptr)
++        return;
++    const QByteArray codeset = nl_langinfo(CODESET);
++    if (codeset == "UTF-8")
++        return;
++    if (setlocale(LC_CTYPE, "en_US.UTF-8") == nullptr)
++        return;   // no UTF-8 locale in the image; nothing to switch to
++    qputenv("LC_CTYPE", "en_US.UTF-8");
++    qInfo("OpenNOW: character type was %s, using en_US.UTF-8", codeset.constData());
++}
++
+ int main(int argc, char *argv[])
+ {
++    preferUtf8CharacterType();
+     return runApplication(argc, argv);
+ }
+diff --git a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
+index 3e76d83c..c678f581 100644
+--- a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
++++ b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
+@@ -57,13 +57,74 @@ inline QByteArrayList deviceExtensions()
+             "VK_KHR_maintenance1", "VK_EXT_queue_family_foreign"};
+ }
+ 
++// This Qt build exposes the VkInstance and its function table but no device
++// list, so enumerate the physical devices through Vulkan directly.
++inline QList<VkPhysicalDevice> physicalDevicesOf(QVulkanInstance *instance)
++{
++    QList<VkPhysicalDevice> devices;
++    if (!instance || !instance->functions() || instance->vkInstance() == VK_NULL_HANDLE)
++        return devices;
++    uint32_t count = 0;
++    if (instance->functions()->vkEnumeratePhysicalDevices(instance->vkInstance(), &count, nullptr)
++            != VK_SUCCESS || count == 0)
++        return devices;
++    devices.resize(count);
++    if (instance->functions()->vkEnumeratePhysicalDevices(instance->vkInstance(), &count, devices.data())
++            != VK_SUCCESS)
++        devices.clear();
++    else
++        devices.resize(count);
++    return devices;
++}
++
++// Extensions Qt is asked to enable on its device. A requested extension the
++// driver does not offer only produces a warning from Qt and is dropped there, so
++// ask for the intersection with what the physical device actually exposes: on a
++// board without VK_EXT_image_drm_format_modifier the import contract below
++// reports the gap anyway, and the console stays clean.
++inline QByteArrayList availableDeviceExtensions(QVulkanInstance *instance)
++{
++    QByteArrayList available;
++    if (!instance || !instance->functions()) return available;
++    for (VkPhysicalDevice device : physicalDevicesOf(instance)) {
++        uint32_t count = 0;
++        if (instance->functions()->vkEnumerateDeviceExtensionProperties(
++                device, nullptr, &count, nullptr) != VK_SUCCESS
++                || count == 0)
++            continue;
++        QList<VkExtensionProperties> properties(count);
++        if (instance->functions()->vkEnumerateDeviceExtensionProperties(
++                device, nullptr, &count, properties.data()) != VK_SUCCESS)
++            continue;
++        properties.resize(count);
++        for (const auto &property : properties) {
++            const QByteArray name(property.extensionName);
++            if (!available.contains(name)) available.append(name);
++        }
++    }
++    return available;
++}
++
++// Qt leaves VkApplicationInfo::apiVersion at 0 when nothing was requested, and
++// the loader rejects that (VUID-VkApplicationInfo-apiVersion). Ask for the
++// version the loader reports; these probes only enumerate, so any version works.
++inline void setSupportedApiVersion(QVulkanInstance &instance)
++{
++    const QVersionNumber supported = instance.supportedApiVersion();
++    if (!supported.isNull())
++        instance.setApiVersion(supported);
++}
++
+ inline void requestDeviceExtensions()
+ {
+     QVulkanInstance probe;
+-    if (probe.supportedApiVersion() < QVersionNumber(1, 1)) return;
++    setSupportedApiVersion(probe);
++    if (!probe.create()) return;
++    const auto available = availableDeviceExtensions(&probe);
+     auto requested = qgetenv("QT_VULKAN_DEVICE_EXTENSIONS").split(';');
+     for (const auto &extension : deviceExtensions()) {
+-        if (!requested.contains(extension)) requested.append(extension);
++        if (available.contains(extension) && !requested.contains(extension))
++            requested.append(extension);
+     }
+     qputenv("QT_VULKAN_DEVICE_EXTENSIONS", requested.join(';'));
+     extensionRequestInstalled.store(true, std::memory_order_release);
+@@ -117,6 +178,38 @@ inline bool hasDmabufBufferImportContract(const QVersionNumber &instanceVersion,
+     return true;
+ }
+ 
++// True when a physical device exposes a Vulkan Video decode extension. The
++// embedded streamer's shared device exists to decode with Vulkan Video, so on a
++// board that decodes through V4L2 Request or VA-API the probe has nothing to
++// build and only reports that the expected feature is missing. Asking first
++// keeps a normal configuration from looking like a broken one.
++inline bool hasVulkanVideoDecode()
++{
++    QVulkanInstance instance;
++    setSupportedApiVersion(instance);
++    if (!instance.create()) return false;
++    auto *functions = instance.functions();
++    if (!functions) return false;
++    const QByteArrayList decodeExtensions = {
++        "VK_KHR_video_decode_h264", "VK_KHR_video_decode_h265", "VK_KHR_video_decode_av1"};
++    for (VkPhysicalDevice device : physicalDevicesOf(&instance)) {
++        uint32_t count = 0;
++        if (functions->vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr)
++                != VK_SUCCESS || count == 0)
++            continue;
++        QList<VkExtensionProperties> available(count);
++        if (functions->vkEnumerateDeviceExtensionProperties(device, nullptr, &count,
++                                                            available.data()) != VK_SUCCESS)
++            continue;
++        available.resize(count);
++        for (const auto &property : available) {
++            if (decodeExtensions.contains(QByteArray(property.extensionName)))
++                return true;
++        }
++    }
++    return false;
++}
++
+ struct ImportContract {
+     uint32_t capabilities = 0;
+     QString summary;

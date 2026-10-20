@@ -12,8 +12,20 @@ BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
-SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev"
-SRCREV = "2b87972c0bb210466552a0974b2dbe5aea935b8c"
+SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev \
+           file://0001-quiet-the-vulkan-and-locale-lines.patch \
+           file://0002-anchor-the-launcher-badge-to-its-row.patch \
+           file://0003-ask-only-for-the-decoders-and-surfaces-this-machine-has.patch \
+           file://0004-drop-the-driver-s-orphaned-queue-report.patch \
+           https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
+          "
+SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
+
+# Source for the bundled FFmpeg build (OPENNOW_CARGO_FEATURES = linux-ffmpeg-bundled).
+# The build script's default path clones github.com during configure, which a
+# package build must not depend on; OPENNOW_FFMPEG_ARCHIVE makes it extract this
+# tarball instead and apply the v4l2-request patches to it.
+SRC_URI[ffmpeg.sha256sum] = "7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52"
 
 PV = "1.0.3+git${SRCPV}"
 S = "${WORKDIR}/git"
@@ -31,6 +43,7 @@ S = "${WORKDIR}/git"
 #   - Vulkan  : mandatory on Linux (find_package(Vulkan REQUIRED))
 #   - libva   : build-time only, see the note below
 #   - libdrm/udev: build-time only, see the note below
+#   - nv-codec-headers: build-time headers for the bundled FFmpeg, see below
 #   - Rust>=1.89 / cargo: edition 2024 build (provided by meta-rust-bin)
 #   - wayland-native: wayland-scanner
 #
@@ -43,6 +56,22 @@ S = "${WORKDIR}/git"
 #     OPENNOW_RUST_TARGET is empty and the processor is aarch64.
 # Only the default (empty) aarch64 path matters for the common case, but both
 # are covered. RDEPENDS adds libva only when a VA-API backend is selected.
+#
+# nv-codec-headers is the same kind of build-time-only dependency, but it comes
+# from the bundled FFmpeg build rather than from the CMake project. With
+# "linux-ffmpeg-bundled" selected, ffmpeg-sys-next's build.rs turns on
+# --enable-ffnvcodec/--enable-cuda/--enable-cuvid/--enable-nvdec for linux.
+# FFmpeg's configure has "cuda_deps=ffnvcodec" and "enabled ffnvcodec && enable
+# cuda", and the whole build runs with --disable-autodetect, so it does not
+# fall back to skipping them: without the ffnvcodec headers configure dies with
+#
+#   ERROR: cuda requested, but not all dependencies are satisfied: ffnvcodec
+#
+# The headers are all it needs. NVENC/NVDEC are loaded from a driver at run
+# time ("ffnvcodec_deps_any=\"libdl\""), so there is no CUDA toolkit, no
+# libcuda link and no runtime dependency - the code is simply never reached on
+# a board without an NVIDIA GPU. That keeps upstream's bundled feature set
+# untouched instead of patching build-nvdec out of the vendored Cargo.toml.
 DEPENDS = " \
     qtbase \
     qtdeclarative \
@@ -58,6 +87,7 @@ DEPENDS = " \
     wayland-native \
     libdrm \
     udev \
+    nv-codec-headers \
     rust-1.89.0-host \
 "
 
@@ -86,13 +116,19 @@ OPENNOW_RUST_TARGET ?= ""
 #     common case, cannot bind to it. Check the machine before selecting it.
 #   - "linux-ffmpeg" enables the FFmpeg decode modes and needs an ffmpeg
 #     provided by the distribution. "linux-ffmpeg-bundled" additionally
-#     cross-compiles FFmpeg from source, and on aarch64 its build.rs selects
-#     the pinned ffmpeg-rpi fork rather than upstream FFmpeg, so it is rejected
-#     outright below.
+#     cross-compiles FFmpeg 9.0 from source.
+#
+#     On aarch64 the bundled build is what carries the V4L2 Request hwaccel
+#     patches (vendor/ffmpeg-sys-next/patches/v4l2-request). They teach FFmpeg
+#     the stateless V4L2 decoder API, which is the same hardware path the
+#     GStreamer element v4l2slh264dec uses, so this is the feature that makes
+#     the STM32MP25 VPU usable: the stateful M2M path does not exist on this
+#     board. A distribution FFmpeg (6.1 here) has no such hwaccel, so
+#     "linux-ffmpeg" cannot replace it.
 #
 # do_configure:prepend rewrites the list hardcoded in
 # opennow-qt/cmake/NativeRuntime.cmake to this value.
-OPENNOW_CARGO_FEATURES ?= ""
+OPENNOW_CARGO_FEATURES ?= "linux-ffmpeg-bundled"
 
 # Selectable runtime hardware-decode support. These flags control what is
 # packaged. The client probes Vulkan, Cuda, VaApi, V4l2 and Ffmpeg and reports
@@ -187,18 +223,15 @@ do_configure:prepend() {
     # clear message instead of much later inside cargo. The top-level
     # opennow-streamer crate defines exactly three features, so anything else
     # would make cargo abort with "none of the selected packages contains these
-    # features". linux-ffmpeg-bundled is rejected because no Yocto recipe should
-    # cross-compile a third-party FFmpeg fork by default; the other two are
-    # legitimate machine choices and are left to the caller.
+    # features". All three are legitimate machine choices; the default above
+    # picks the bundled build because that is the only one with the V4L2 Request
+    # hwaccel on aarch64.
     for feature in $(echo "${OPENNOW_CARGO_FEATURES}" | tr ',' ' '); do
         case "${feature}" in
-            linux-ffmpeg-bundled)
-                bbfatal "opennow: OPENNOW_CARGO_FEATURES requests 'linux-ffmpeg-bundled', which this recipe refuses to enable. It cross-compiles FFmpeg from source, and on aarch64 pulls the pinned ffmpeg-rpi fork rather than upstream FFmpeg. Use 'linux-ffmpeg' with a distribution-provided ffmpeg instead, or set OPENNOW_CARGO_FEATURES to empty."
-                ;;
-            linux-vaapi|linux-ffmpeg)
+            linux-vaapi|linux-ffmpeg|linux-ffmpeg-bundled)
                 ;;
             *)
-                bbfatal "opennow: OPENNOW_CARGO_FEATURES requests unknown feature '${feature}'. The top-level opennow-streamer crate only defines linux-vaapi, linux-ffmpeg and linux-ffmpeg-bundled; cargo would reject anything else. The intended default is empty, which builds on any machine."
+                bbfatal "opennow: OPENNOW_CARGO_FEATURES requests unknown feature '${feature}'. The top-level opennow-streamer crate only defines linux-vaapi, linux-ffmpeg and linux-ffmpeg-bundled; cargo would reject anything else."
                 ;;
         esac
     done
@@ -231,9 +264,6 @@ do_configure:prepend() {
     code_lines() {
         grep -vE '^[[:space:]]*#' "$1"
     }
-    if code_lines "${features_cmake}" | grep -q -- "linux-ffmpeg-bundled"; then
-        bbfatal "opennow: 'linux-ffmpeg-bundled' is still present in executable CMake in ${features_cmake} after rewriting the feature list; refusing to build. It cross-compiles FFmpeg from source, and on aarch64 pulls the pinned ffmpeg-rpi fork rather than upstream FFmpeg. Upstream most likely reformatted the list(APPEND ...) block; re-check do_configure:prepend before building."
-    fi
     if [ -z "${OPENNOW_CARGO_FEATURES}" ] \
         && code_lines "${features_cmake}" | grep -qiE -- '-{1,2}features.*OPENNOW_STREAMER_CARGO_FEATURES'; then
         bbfatal "opennow: ${features_cmake} still passes a cargo --features argument derived from OPENNOW_STREAMER_CARGO_FEATURES after OPENNOW_CARGO_FEATURES was emptied. Cargo rejects an empty feature list, so this would fail the build at do_compile. Upstream most likely reformatted the list(APPEND ...) block; re-check do_configure:prepend before building."
@@ -291,6 +321,85 @@ do_compile:prepend() {
     # aborting the whole task. Harmless when the cache is already primed.
     export CARGO_NET_RETRY=8
     export CARGO_NET_TIMEOUT=30
+    # FFmpeg's configure, run by the vendored ffmpeg-sys-next build script,
+    # applies the cross prefix to the pkg-config name too:
+    #   configure:5051  pkg_config_default="${cross_prefix}${pkg_config_default}"
+    # With --cross-prefix=aarch64-ostl-linux- it therefore looks for
+    # "aarch64-ostl-linux-pkg-config". This distro does not create that name:
+    # the pkgconfig class exports PKG_CONFIG_LIBDIR / PKG_CONFIG_PATH /
+    # PKG_CONFIG_SYSROOT_DIR at the task sysroot (confirmed in
+    # temp/run.do_compile) and expects plain "pkg-config", so
+    # aarch64-ostl-linux-pkg-config does not exist anywhere in PATH. FFmpeg then
+    # takes the configure:5093 branch
+    #   if ! $pkg_config --version; then warn "... not found, library
+    #   detection may fail."; pkg_config=false
+    # and sets pkg_config to the command `false`. Every check_pkg_config from
+    # then on fails without a message, so with --disable-autodetect every
+    # pkg-config-detected component stays disabled and the explicit
+    # --enable-ffnvcodec/--enable-cuda request dies late with the confusing
+    #
+    #   ERROR: cuda requested, but not all dependencies are satisfied: ffnvcodec
+    #
+    # (a *sample* failure: vulkan/vaapi/libdrm were being dropped the same way).
+    # The wrapper is a plain passthrough - the real pkg-config already honours
+    # the exported PKG_CONFIG_* - and it lives in recipe-sysroot-native/usr/bin
+    # so the base PATH finds it, next to the toolchain wrappers above.
+    pkgcw="${WORKDIR}/recipe-sysroot-native/usr/bin/aarch64-ostl-linux-pkg-config"
+    printf '#!/bin/sh\n# opennow-pkgconfig-wrap\nexec pkg-config "$@"\n' > "${pkgcw}"
+    chmod +x "${pkgcw}"
+    # Bundled FFmpeg: take the release tarball from SRC_URI instead of letting
+    # build.rs clone github.com, and hand it the target sysroot so its configure
+    # does not fall back to the host one.
+    export OPENNOW_FFMPEG_ARCHIVE="${WORKDIR}/ffmpeg-9.0.tar.xz"
+    export SYSROOT="${RECIPE_SYSROOT}"
+    # FFmpeg's configure takes its install destinations from the environment,
+    # and oe-core exports them to every task (see temp/run.do_compile:
+    # libdir=/usr/lib, datadir=/usr/share, includedir, bindir, ...). Because the
+    # environment wins over configure's own defaults, the bundled FFmpeg wrote
+    #
+    #   prefix=<...>/out/dist-<patchset>
+    #   LIBDIR=$(DESTDIR)/usr/lib
+    #   DATADIR=$(DESTDIR)/usr/share
+    #
+    # into ffbuild/config.mak - the --prefix build.rs passes does not reach the
+    # other directories - and then `make install` tried to install into the
+    # *host*, as an unprivileged user, after compiling everything:
+    #
+    #   mkdir: cannot create directory '/usr/share/examples': Permission denied
+    #   make: *** [doc/examples/Makefile:48: install-examples] Error 1
+    #   install: cannot create regular file '/usr/lib/libavformat.a': Permission denied
+    #   make: *** [ffbuild/library.mak:152: install-libavformat-static] Error 1
+    #   ... thread 'main' panicked ... "make install failed"
+    #
+    # Dropping them for this task lets configure derive every destination from
+    # that --prefix, which is where ffmpeg-sys-next then looks for the static
+    # libraries and headers. prefix itself is left alone: it reaches configure
+    # only through build.rs's explicit --prefix=..., and CMake (which also runs
+    # in this task) must not see the install prefix move.
+    unset libdir shlibdir datadir includedir bindir sbindir libexecdir \
+        mandir docdir infodir sysconfdir localstatedir sharedstatedir \
+        exec_prefix
+    # The vendored ffmpeg-sys-next generates its Rust bindings from the FFmpeg
+    # headers it just built, with bindgen, which drives libclang. libclang does
+    # not know the cross toolchain. build.rs does pass --sysroot=..., which
+    # finds glibc's headers, but glibc's <limits.h> is a #include_next shim that
+    # expects the *compiler's* builtin header next on the search path, and GCC's
+    # own include directory is not inside the sysroot. libclang stops there with
+    #
+    #   .../recipe-sysroot/usr/include/limits.h:124:16: fatal error:
+    #   'limits.h' file not found
+    #   ... panicked at vendor/ffmpeg-sys-next/build.rs:2069:10:
+    #   Unable to generate bindings
+    #
+    # BINDGEN_EXTRA_CLANG_ARGS is bindgen's documented hook for clang arguments
+    # that are appended regardless of what the crate's build script passes, and
+    # nothing in this distro sets it (its cargo.bbclass does not, and this
+    # recipe builds Rust through CMake rather than that class). Ask the cross
+    # compiler where its headers are rather than pinning the gcc version, and
+    # keep the sysroot at the task's own. The driver here is the real one: this
+    # runs before the wrappers further down replace it.
+    gccinc="$("${WORKDIR}/recipe-sysroot-native/usr/bin/aarch64-ostl-linux/aarch64-ostl-linux-gcc" -print-file-name=include)"
+    export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=${RECIPE_SYSROOT} -I${gccinc}"
     # cc-rs (used by host-side Rust build scripts, e.g. the `ring` crate for
     # the opennow-license-report notices generator) resolves its compiler by
     # checking, in order: CC_<triple> / CC_<triple_underscore> /
@@ -377,7 +486,7 @@ do_compile:prepend() {
 
 # Upstream install(TARGETS opennow-qt ...) plus the Rust artifacts copied next
 # to the executable, so the default cmake do_install covers everything.
-inherit qt6-cmake pkgconfig
+inherit qt6-cmake pkgconfig mime-xdg
 DEPENDS:append = " qtdeclarative-native"
 
 # Reorder PACKAGES so the base package is processed first in the normal
@@ -401,34 +510,96 @@ RDEPENDS:${PN} += " \
 # dependencies above.
 RDEPENDS:${PN}:append = " ${@bb.utils.contains('OPENNOW_CARGO_FEATURES', 'linux-vaapi', 'libva', '', d)}"
 
-# The `opennow` launcher normalises the runtime environment (weston's user
-# session sets XDG_RUNTIME_DIR=/home/weston and LANG=C; the former makes
-# the Wayland socket path invalid and the app abort), exports GPU /
-# Vulkan selection (only when configured), and execs the QML application.
+# The `opennow` launcher normalises the runtime environment: this image's
+# weston runs with XDG_RUNTIME_DIR=/home/weston, which is where its Wayland
+# socket lives, so that value has to be preserved rather than replaced, and
+# weston's session has LANG=C, which Qt warns about. It exports GPU / Vulkan
+# selection (only when configured), and execs the QML application.
 # The video backend is not forced here on purpose: the client probes what
 # the machine offers and the user picks one in the UI.
 do_install:append() {
     install -d ${D}${bindir}
     cat > ${D}${bindir}/opennow <<EOF
 #!/bin/sh
-# Weston's user session sets XDG_RUNTIME_DIR=/home/weston and LANG=C.
-# Fix both for the app (weston.socket lives in /run/user/1000).
-export XDG_RUNTIME_DIR=/run/user/1000
-export LANG=C.UTF-8
+# The escapes below are deliberate: this file is generated by a shell heredoc in
+# the recipe, so an unescaped \$VARIABLE would be expanded by the *build* shell
+# and frozen into the script.
+# This image's weston runs with XDG_RUNTIME_DIR=/home/weston and its socket is
+# /home/weston/wayland-1 (see /proc/\$(pgrep -x weston)/environ). The systemd
+# user runtime dir /run/user/1000 has no wayland-1 socket, so a launcher that
+# exported it unconditionally - as this one used to - made the Qt wayland-egl
+# plugin abort before the app ever started:
+#   Failed to create wl_display (No such file or directory)
+#   This application failed to start because no Qt platform plugin could be
+#   initialized.
+# Keep whatever runtime dir the session provides (a shell started from weston
+# has the right one) and only fall back to the user runtime dir when unset.
+if [ -z "\${XDG_RUNTIME_DIR}" ] && [ -d /run/user/1000 ]; then
+    export XDG_RUNTIME_DIR=/run/user/1000
+fi
+# Qt's wayland-egl plugin otherwise defaults to wayland-0, but this image's
+# weston listens on wayland-1 (wayland-0 in the runtime dir is a stale socket
+# from something else). Take the first socket that is actually there rather than
+# hard-coding one, so the same launcher works on an image where wayland-0 is
+# the real one.
+if [ -z "\${WAYLAND_DISPLAY}" ]; then
+    for _socket in wayland-1 wayland-0; do
+        if [ -S "\${XDG_RUNTIME_DIR}/\${_socket}" ]; then
+            export WAYLAND_DISPLAY="\${_socket}"
+            break
+        fi
+    done
+fi
+# weston's session starts with LANG unset, and a non-UTF-8 character type makes
+# Qt print
+#   Detected locale "C" with character encoding "ANSI_X3.4-1968", which is not UTF-8.
+#   Qt depends on a UTF-8 locale, but has failed to switch to one.
+# C.UTF-8 is not in this image's locale-archive at all (the `locale` tool is not
+# even installed), en_US.UTF-8 is, so that is what a UTF-8 session gets here.
+case "\${LC_ALL:-\${LANG:-}}" in
+    *UTF-8*|*utf8*|*UTF8*) ;;
+    *) export LANG=en_US.UTF-8 ;;
+esac
+# SDL is only here for gamepads, but even SDL_INIT_GAMEPAD opens SDL's video
+# driver, which connects to Wayland on its own and then destroys that connection
+# while wl_compositor is still attached - libwayland reports it, twice, at every
+# start. A dummy video driver changes nothing for a gamepad and keeps the console
+# quiet. Both spellings: SDL3 renamed the variable, SDL2's name still works.
+export SDL_VIDEODRIVER=dummy
+export SDL_VIDEO_DRIVER=dummy
+# The UI's click sounds go through QtMultimedia and PulseAudio. Without a
+# PULSE_SERVER the client looks in \$XDG_RUNTIME_DIR/pulse/native, but this
+# image's pipewire-pulse listens in /run/user/1000, so the first sound effect
+# logs
+#   warning: PulseAudioService: pa_context_connect() failed
+#   critical qt.multimedia.soundeffect: Failed to update audio output.
+# Point the client at the socket that is actually there.
+if [ -z "\${PULSE_SERVER}" ]; then
+    for _pulse in "\${XDG_RUNTIME_DIR}/pulse/native" "/run/user/\$(id -u)/pulse/native"; do
+        if [ -S "\${_pulse}" ]; then
+            export PULSE_SERVER="unix:\${_pulse}"
+            break
+        fi
+    done
+fi
+# Qt's default wayland plugin cannot create a Vulkan instance, and OpenNOW
+# forces the Vulkan RHI backend on Linux; the wayland-egl plugin can, and it is
+# the same one NanoBrowser uses on this board.
+export QT_QPA_PLATFORM=wayland-egl
 # GPU / Vulkan selection (exported only when configured).
 [ -n "${OPENNOW_VK_DRIVER_FILES}" ] && export VK_DRIVER_FILES="${OPENNOW_VK_DRIVER_FILES}"
 [ -n "${OPENNOW_VK_ICD_FILENAMES}" ] && export VK_ICD_FILENAMES="${OPENNOW_VK_ICD_FILENAMES}"
 [ -n "${OPENNOW_VK_DEVICE_INDEX}" ] && export VK_DEVICE_INDEX="${OPENNOW_VK_DEVICE_INDEX}"
 # Qt rendering backend (exported only when configured).
 [ -n "${OPENNOW_QT_RHI_BACKEND}" ] && export QT_QUICK_BACKEND="${OPENNOW_QT_RHI_BACKEND}"
-exec ${bindir}/opennow-qt
+exec ${bindir}/opennow-qt "\$@"
 EOF
     chmod 0755 ${D}${bindir}/opennow
 
     # Upstream CMake installs io.github.opencloudgaming.OpenNOW.desktop
-    # with Exec=opennow-qt %U, which bypasses the launcher and inherits
-    # weston's (broken) XDG_RUNTIME_DIR. Overwrite it with an entry
-    # that goes through the launcher.
+    # with Exec=opennow-qt %U, which bypasses the launcher and so loses the
+    # LANG / QT_QPA_PLATFORM / GPU selection it sets up. Overwrite it with an
+    # entry that goes through the launcher.
     install -d ${D}${datadir}/applications
     cat > ${D}${datadir}/applications/io.github.opencloudgaming.OpenNOW.desktop <<EOF
 [Desktop Entry]
@@ -463,6 +634,13 @@ INSANE_SKIP:${PN} += "already-stripped"
 # fail it even though the build is correct. Skip exactly this one check for
 # the base package (all fatal GNU_HASH messages land in ${PN}).
 INSANE_SKIP:${PN} += "ldflags"
+
+# The Rust binaries keep their build directory in the debug info: rustc has no
+# -ffile-prefix-map equivalent to the one the C++ part gets from CFLAGS, so
+# opennow-core (and the debug file of the acceptance binary) still name TMPDIR.
+# The paths are build trivia, not something a debugger needs on the target.
+INSANE_SKIP:${PN} += "buildpaths"
+INSANE_SKIP:${PN}-dbg += "buildpaths"
 
 # Upstream cmake also installs the OpenNOW desktop icons under
 # ${datadir}/icons (hicolor PNGs + OpenNOW.svg). They are runtime data and
