@@ -9,13 +9,16 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=19b5c44dd600b05d43b5bb78ad0bd491"
 
 SRC_URI = "git://github.com/DanielMartensson/YtGst.git;protocol=https;branch=main"
-SRCREV = "a5343791f5ef3517c4ad3e6f11efb4402f049ba2"
+SRCREV = "5b3ee7d5017b1d738f0e5ea1d62474b0f3dee573"
 
 PV = "0.1+git${SRCPV}"
 S = "${WORKDIR}/git"
 # PKGR: the PR-server counter (PRAUTO) resets to r0.0 whenever the recipe
 # changes; pin it so the deb stays >= the version already installed on the
-# boards. r0.47 builds from upstream main alone: every change that used to
+# boards. r0.48 adds a build-time renderer choice (YTGST_DEFAULT_RENDERER) and
+# lets YTGST_RENDERER=vulkan force Vulkan explicitly; the board build now picks
+# OpenGL, measured at 0.79 s to the panel's first frame against 4.05 s on
+# Vulkan, with 39.1 % of a core instead of 46.6 % (see the README). r0.47 builds from upstream main alone: every change that used to
 # arrive as 0001-0004 is part of the YtGst repository now, so the recipe has no
 # patches and no local source. r0.46 fits the control panel and the picture
 # window to the output they land on (the panel scale is clamped to the screen
@@ -87,7 +90,7 @@ S = "${WORKDIR}/git"
 # the Vulkan RHI adaptation. r0.17 carries the fix that starts the pipeline on a
 # worker thread so the player-window compositor keeps running. r0.11 carries the
 # source fixes that used to be applied as a patch.
-PKGR = "r0.47"
+PKGR = "r0.48"
 
 # Qt 6.8 (Quick/Network/Widgets/WaylandCompositor) and GStreamer core + GL
 # library (gstgl); the compositor module is what shows the waylandsink picture
@@ -111,7 +114,12 @@ DEPENDS = " \
 # ships a codec plugin for it; override per machine otherwise.
 YTGST_VIDEO_DECODER ?= "v4l2slh264dec"
 
+# OpenGL is the measured winner for the panel on this SoC: first frame 0.79 s
+# against 4.05 s on Vulkan, and 7 points less CPU for the same panel. The
+# picture is drawn by waylandsink either way. YTGST_RENDERER=vulkan overrides it
+# for a run.
 EXTRA_OECMAKE:append = " -DYTGST_VIDEO_DECODER=${YTGST_VIDEO_DECODER}"
+EXTRA_OECMAKE:append = " -DYTGST_DEFAULT_RENDERER=opengl"
 
 inherit qt6-cmake pkgconfig
 # qtwayland-native: Qt6WaylandScannerTools, which the Qt6WaylandCompositor
