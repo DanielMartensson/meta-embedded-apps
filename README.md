@@ -106,7 +106,8 @@ belongs in a `*.bbappend`, not in this layer's recipes.
 | `OPENNOW_VK_DRIVER_FILES` | empty | Vulkan ICDs to load (`VK_DRIVER_FILES`) |
 | `OPENNOW_VK_ICD_FILENAMES` | empty | Legacy Vulkan ICD list (`VK_ICD_FILENAMES`) |
 | `OPENNOW_VK_DEVICE_INDEX` | empty | Physical GPU to use (`VK_DEVICE_INDEX`) |
-| `OPENNOW_QT_RHI_BACKEND` | empty | Qt rendering backend (`vulkan`, `opengl`, …) |
+| `OPENNOW_QT_RHI_BACKEND` | empty | Qt Quick adaptation (`QT_QUICK_BACKEND`), not the RHI backend |
+| `OPENNOW_RENDERER` | empty | RHI backend passed to the application: empty is Vulkan, `opengl` picks OpenGL |
 
 #### Choosing a hardware decoder
 
