@@ -27,6 +27,8 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0012-log-presented-frames-and-dump-the-first-copied-frame.patch \
            file://0013-import-linear-nv12-dmabuf-frames-as-vulkan-buffers.patch \
            file://0014-cache-imported-dmabuf-buffers-and-log-the-render-rate.patch \
+           file://0015-count-the-frame-notifications-and-allow-a-forced-repaint.patch \
+           file://0016-run-the-stream-window-opaque-and-sample-the-video-1-1.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
@@ -41,7 +43,7 @@ PV = "1.0.4+git${SRCPV}"
 # The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
 # r0.12 leaves the process when the event loop ends instead of running Qt
 # teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.20"
+PKGR = "r0.22"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust

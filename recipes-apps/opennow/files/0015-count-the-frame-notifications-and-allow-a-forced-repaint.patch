@@ -1,0 +1,91 @@
+diff --git a/opennow-qt/src/streaming/NativeStreamRuntime.cpp b/opennow-qt/src/streaming/NativeStreamRuntime.cpp
+index b2f06217..0dd784d4 100644
+--- a/opennow-qt/src/streaming/NativeStreamRuntime.cpp
++++ b/opennow-qt/src/streaming/NativeStreamRuntime.cpp
+@@ -1031,9 +1031,45 @@ void NativeStreamRuntime::enqueueCallback(CallbackState *state, const std::uint8
+     if (shouldSchedule) scheduleDrain(sharedState);
+ }
+ 
++namespace {
++// Temporary instrumentation (OPENNOW_LOG_FRAME_RATES): per second counts of the
++// native "a decoded frame is ready" notifications and of the drains that deliver
++// them to the GUI thread. Locates the presentation bottleneck between the
++// decoder and the window swap.
++const bool g_frameRates = qEnvironmentVariableIsSet("OPENNOW_LOG_FRAME_RATES");
++std::atomic<quint64> g_frameNotified{0};
++std::atomic<quint64> g_frameDelivered{0};
++
++void reportFrameRates()
++{
++    if (!g_frameRates) return;
++    static qint64 lastReport = 0;
++    static quint64 lastNotified = 0;
++    static quint64 lastDelivered = 0;
++    const qint64 now = QDateTime::currentMSecsSinceEpoch();
++    if (lastReport == 0) {
++        lastReport = now;
++        lastNotified = g_frameNotified.load();
++        lastDelivered = g_frameDelivered.load();
++        return;
++    }
++    const qint64 elapsed = now - lastReport;
++    if (elapsed < 1000) return;
++    const quint64 notified = g_frameNotified.load();
++    const quint64 delivered = g_frameDelivered.load();
++    const double seconds = double(elapsed) / 1000.0;
++    qInfo("opennow-frame-rate native=%.1f/s delivered=%.1f/s",
++          double(notified - lastNotified) / seconds, double(delivered - lastDelivered) / seconds);
++    lastReport = now;
++    lastNotified = notified;
++    lastDelivered = delivered;
++}
++} // namespace
++
+ void NativeStreamRuntime::enqueueFrameAvailable(CallbackState *state)
+ {
+     if (!state) return;
++    if (g_frameRates) g_frameNotified.fetch_add(1, std::memory_order_relaxed);
+     const auto sharedState = state->shared_from_this();
+     bool shouldSchedule = false;
+     {
+@@ -1107,6 +1143,8 @@ void NativeStreamRuntime::drainCallbacks(const std::shared_ptr<CallbackState> &s
+             d->firstNotification = true;
+         }
+         emit frameAvailable();
++        if (g_frameRates) g_frameDelivered.fetch_add(1, std::memory_order_relaxed);
++        reportFrameRates();
+         if (!current()) return;
+     }
+     while (!messages.isEmpty()) {
+diff --git a/opennow-qt/src/streaming/StreamVideoItem.cpp b/opennow-qt/src/streaming/StreamVideoItem.cpp
+index d7bd38fc..6ff2b568 100644
+--- a/opennow-qt/src/streaming/StreamVideoItem.cpp
++++ b/opennow-qt/src/streaming/StreamVideoItem.cpp
+@@ -11,6 +11,7 @@
+ #include <QQmlEngine>
+ #include <QQuickWindow>
+ #include <QThread>
++#include <QTimer>
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -126,6 +127,19 @@ StreamVideoItem::StreamVideoItem(std::unique_ptr<MacPointerCapture> pointerCaptu
+     };
+     connect(this, &QQuickItem::windowChanged, this, attachWindow);
+     attachWindow(window());
++
++    // Temporary instrumentation: drive the repaint at a fixed rate so the
++    // presentation path can be measured independently of the native frame
++    // notification rate (for example OPENNOW_FORCE_REPAINT_HZ=60).
++    if (const QByteArray forced = qgetenv("OPENNOW_FORCE_REPAINT_HZ"); !forced.isEmpty()) {
++        const int target = qBound(1, forced.toInt(), 240);
++        auto *timer = new QTimer(this);
++        timer->setTimerType(Qt::PreciseTimer);
++        timer->setInterval(qMax(1, 1000 / target));
++        connect(timer, &QTimer::timeout, this, &StreamVideoItem::requestFrame);
++        timer->start();
++        qInfo("opennow-frame-rate force-repaint=%d Hz interval=%d ms", target, timer->interval());
++    }
+ }
+ 
+ StreamVideoItem::~StreamVideoItem()

@@ -1,0 +1,53 @@
+Subject: [PATCH 0016] Run the stream window opaque and sample the video 1:1
+
+The full-screen video window carried an alpha channel, so the Wayland
+surface stayed translucent and the compositor blended the complete 1080p
+buffer every frame on the Vivante GCNANO. The window is opaque now, which
+lets the DRM backend scan the buffer out on a plane, and the video sampler
+can fetch one texel per pixel instead of four. Both changes stay behind
+OPENNOW_OPAQUE_WINDOW=1 and OPENNOW_VIDEO_NEAREST=1 so the old behaviour can
+be measured against them.
+
+Upstream-Status: Inappropriate [STM32MP25 performance workaround]
+
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 31bbbe72..06930fe9 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -160,7 +160,15 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     QGuiApplication::setOrganizationName(u"OpenCloudGaming"_s);
+     QGuiApplication::setOrganizationDomain(u"opennow.app"_s);
+     QGuiApplication::setApplicationVersion(QString::fromLatin1(OPENNOW_VERSION));
+-    QQuickWindow::setDefaultAlphaBuffer(true);
++    // A window with an alpha channel makes the Wayland surface translucent, so
++    // the compositor has to blend the whole full-screen video buffer every
++    // frame. On the STM32MP25 the Vivante GCNANO is already the bottleneck of
++    // the streaming path, so the distro can run the window opaque and let the
++    // DRM backend hand the buffer to a plane instead. OPENNOW_OPAQUE_WINDOW=1
++    // enables that; the default keeps the upstream alpha window.
++    const bool opaqueWindow =
++        qEnvironmentVariable("OPENNOW_OPAQUE_WINDOW") == u"1"_s;
++    QQuickWindow::setDefaultAlphaBuffer(!opaqueWindow);
+     QQuickWindow::setTextRenderType(QQuickWindow::QtTextRendering);
+ #if defined(Q_OS_WIN)
+     QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11);
+diff --git a/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h b/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
+index 7a0d0562..caecb4ad 100644
+--- a/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
++++ b/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
+@@ -77,7 +77,14 @@ public:
+             if (!m_uniforms->create()) { m_uniforms.reset(); return false; }
+         }
+         if (!m_sampler) {
+-            m_sampler.reset(m_rhi->newSampler(QRhiSampler::Linear, QRhiSampler::Linear,
++            // The stream is sampled 1:1 at its native size whenever the window
++            // matches it, so a nearest sampler keeps the picture and needs one
++            // fetch per texel instead of four blended ones. OPENNOW_VIDEO_NEAREST=1
++            // selects it for testing on the bandwidth-bound STM32MP25 GPU.
++            const auto videoFilter = qEnvironmentVariableIsSet("OPENNOW_VIDEO_NEAREST")
++                                         ? QRhiSampler::Nearest
++                                         : QRhiSampler::Linear;
++            m_sampler.reset(m_rhi->newSampler(videoFilter, videoFilter,
+                                              QRhiSampler::None, QRhiSampler::ClampToEdge,
+                                              QRhiSampler::ClampToEdge));
+             if (!m_sampler->create()) { m_sampler.reset(); return false; }
