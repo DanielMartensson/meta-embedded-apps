@@ -1,0 +1,62 @@
+Subject: [PATCH 0017] Let the video pass be switched while streaming
+
+The stream spends nearly all of its GPU time in the passes that draw the
+decoded frame, but nothing separated the cost of fetching the frame from the
+cost of the shader arithmetic. OPENNOW_VIDEO_MODE_FILE names a small file that
+the composition path re-reads every frame: "nofetch" collapses the video rect
+so the fragment shader never samples the frame, "nodither" keeps the fetch and
+drops the ordered dither, and anything else leaves the pass untouched.
+Switching the file content while the game runs attributes the cost in a single
+session instead of one guess per build. The knob is inert unless the variable
+is set.
+
+Upstream-Status: Inappropriate [STM32MP25 performance investigation]
+
+diff --git a/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h b/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
+index 7a0d0562..580a91e0 100644
+--- a/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
++++ b/opennow-qt/src/streaming/rendering/StreamVideoTextureRenderer.h
+@@ -2,6 +2,7 @@
+ 
+ #include "streaming/rendering/StreamFsrUpscaler.h"
+ 
++#include <QDebug>
+ #include <QFile>
+ #include <QMatrix4x4>
+ #include <QRectF>
+@@ -68,6 +69,35 @@ public:
+         put(16, bounds);
+         put(20, video);
+         m_composition[24] = opacity;
++        applyDebugVideoMode();
++    }
++
++    // Diagnostics only: OPENNOW_VIDEO_MODE_FILE names a small file that selects
++    // what the video pass has to do, so the cost of the texture fetch and of the
++    // ordered dither can be attributed while a stream is running, without a
++    // rebuild or a restart. "nofetch" collapses the video rect, which makes the
++    // shader skip the fetch entirely, "nodither" keeps the fetch and drops the
++    // dither, and anything else is the normal pass.
++    void applyDebugVideoMode()
++    {
++        static const QByteArray path = qgetenv("OPENNOW_VIDEO_MODE_FILE");
++        static QByteArray lastMode;
++        if (path.isEmpty()) return;
++        QFile file(QString::fromLocal8Bit(path));
++        if (!file.open(QIODevice::ReadOnly)) return;
++        const QByteArray mode = file.readAll().trimmed();
++        if (mode != lastMode) {
++            lastMode = mode;
++            qInfo("video debug mode: %s", mode.constData());
++        }
++        if (mode == QByteArrayLiteral("nofetch")) {
++            m_composition[20] = 0.0f;
++            m_composition[21] = 0.0f;
++            m_composition[22] = 0.0f;
++            m_composition[23] = 0.0f;
++        } else if (mode == QByteArrayLiteral("nodither")) {
++            m_composition[25] = 0.0f;
++        }
+     }
+ 
+     bool prepare(QRhiCommandBuffer *cb)
