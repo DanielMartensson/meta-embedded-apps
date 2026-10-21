@@ -168,6 +168,110 @@ The recipe tracks upstream's `dev` branch. That branch reports itself as `1.0.4`
 app's stable update channel offers. `PV` follows the source tree, so the package
 is `1.0.4+git...` even though the last stable release has a lower number.
 
+#### Patches on top of upstream
+
+`0001`-`0014` in `recipes-apps/opennow/files/` are the only changes to the
+upstream tree.
+
+| Patch | What it does |
+| --- | --- |
+| `0001` | Ask the Vulkan driver whether it really exposes `VK_KHR_video_decode_h264`/`_h265`/`_av1` before offering hardware decode, and keep the driver's Vulkan chatter off `stderr`. |
+| `0002` | Anchor the launcher badge to `launcherRow` instead of `parent`. The delegate is briefly parentless while the model is rebuilt, and `parent.verticalCenter` then logged a `TypeError` for every row, on every rebuild. |
+| `0003` | Ask FFmpeg only for the window-system extensions this session can have. A Wayland-only board has no X11 surface, and FFmpeg reported every missing extension it had been asked for. CUDA is not offered without `/dev/nvidiactl`. |
+| `0004` | Drop the VeriSilicon driver's orphaned `wl_compositor` queue report, and leave every other `libwayland` diagnostic on `stderr`. |
+| `0005` | `OPENNOW_RENDERER=opengl` selects the OpenGL RHI at run time. Empty keeps upstream's Vulkan. |
+| `0006` | Keep SDL3 from installing its own `SIGINT`/`SIGTERM` handlers, which swallowed `kill` and `systemctl stop`. |
+| `0007` | Leave the process with `_Exit()` instead of running Qt's teardown when no restart is pending. |
+| `0008` | Draw the sign-in card and its primary button directly instead of as QML layers. See below. |
+| `0009` | Do not let one slow region block a launch. |
+| `0010` | Print the native error message instead of a generic one. |
+| `0011` | Copy decoded dma-buf frames on the CPU when the GPU cannot import them. |
+| `0012` | Log presented frames and dump the first copied frame. |
+| `0013` | Import the decoder's linear NV12 dma-buf frames as Vulkan buffers, without a copy. |
+| `0014` | Cache imported dma-buf buffers and log the render rate. |
+
+#### Why the Ui looks right on the STM32MP257F
+
+The board did not only render slowly, it rendered wrong. Patch `0008` is the
+fix that matters for how the application looks: the sign-in card and its primary
+button were QML layers (`layer.enabled: true`) with a `MultiEffect` drop shadow,
+and the VeriSilicon Vulkan driver segfaults in `QSGRhiLayer::grab()` when the
+card re-renders while the QR panel appears. Both are drawn directly now, so the
+card no longer renders itself into an offscreen buffer on every repaint. Patch
+`0004` takes the driver's own `libwayland` error off the console, where it read
+like the application failing.
+
+Patch `0005` matters for how the Ui *feels*: on Vulkan the driver compiles the
+Qt Quick shader for every material on the fly, so any surface that has not been
+drawn before stalls for about a second the first time it appears. OpenGL avoids
+that. The streaming path still hands its textures to Qt through the Vulkan
+device, so `OPENNOW_RENDERER` only moves the Ui, never the video.
+
+#### Measured stream throughput
+
+The present path logs itself. With `OPENNOW_LOG_PRESENT=1` the Qt render
+callback prints about once every 1.5 s:
+
+```
+opennow-present fps=6.9 render=7.9 swapped=2629 p50=1.10ms p95=216.00ms max=221.00ms
+```
+
+`fps` is frames the compositor took during the sample window, `render` is how
+often Qt rendered the video node, `swapped` is the running total, and
+`p50`/`p95`/`max` are the submit-to-swap times. Measured in a live session
+(Ontario zone, 1280x720 stream, fullscreen on the 1920x1080 output, Vulkan
+import, package `r0.20`):
+
+| Reading | Value | Source |
+| --- | --- | --- |
+| Frames the server sent | ~60 /s | `NVST rx-stats ... frames=` |
+| Frames acknowledged | ~60 /s | `NVST control-stats ... frameAck=` |
+| Frames presented | 6-8 /s | `opennow-present fps=` |
+| Submit-to-swap | p50 1.2 ms, p95 220 ms | `opennow-present` |
+| CPU, whole application | ~35 % of one core (2 x A35 @1.2 GHz) | `/proc/<pid>/task/*/stat` |
+| CMA free | ~10 MB of 128 MB | `/proc/meminfo`, `dmesg` |
+| Decoder in use | `/dev/video4`, `st,stm32mp25-vdec-dec` | `/proc/<pid>/fd` |
+
+The wire delivers 60 fps and the compositor takes a frame in 1.2 ms, but the
+application hands over only 6-8 a second, so the loss is between "frame
+decoded" and "frame drawn" - not on the network and not in the compositor.
+`render` tracks `fps`, so Qt is not holding frames back either: the rate at
+which `NativeStreamRuntime::frameAvailable` reaches
+`StreamVideoItem::requestFrame` is the same 6-8 per second. Audio is on a
+separate path and is unaffected.
+
+With CMA down to 10 MB of 128 MB the decoder can only keep a couple of capture
+buffers queued, and `dmesg` shows allocations failing outright:
+
+```
+cma: cma_alloc: linux,cma: alloc failed, req-size: 394 pages, ret: -12
+```
+
+So the image should reserve 256 MB of CMA on the kernel command line
+(`UBOOT_EXTLINUX_KERNEL_ARGS:append = " cma=256M"`, as
+`meta-watermelon-wine` does). If the decoder still cannot keep up after that,
+the next step is to take the Qt scene graph out of the video path entirely and
+give the decoder's dma-bufs to a Wayland subsurface, which is what
+`waylandsink` already does for YtGst on this board.
+
+For comparison, the shell's own profiler (`--performance-report`) on an idle
+home screen has a cost that is linear in the *window area*, about 25 ms fixed
+plus 25 ms per megapixel: p50 74.7 ms at 1920x1080, 62.6 ms at 1600x900,
+31.4 ms at 1280x720 and 26.5 ms at 960x540 on Vulkan (71.7 ms and 31.1 ms at
+the two ends on OpenGL). `weston.ini`'s stock `repaint-window=100` is
+responsible for the 1080p tail: with `repaint-window=1` the 1920x1080 p95 falls
+from 1233 ms to 117 ms, while the 720p and 540p medians do not move. That
+belongs to the image's Weston configuration, not to this layer, and is not
+shipped as a workaround.
+
+Throughput per application, same board and session conditions:
+
+| Application | Video path | Stream | Presented fps | Measured with |
+| --- | --- | --- | --- | --- |
+| OpenNOW | Vulkan dma-buf import into the Qt scene graph | 1280x720, fullscreen | 6-8 | `OPENNOW_LOG_PRESENT=1` |
+| YtGst | GStreamer `waylandsink`, own subsurface | 1920x1080 | not measured yet | GStreamer `fpsdisplaysink` |
+| NanoBrowser | QtWebEngine | - | not measured yet | compositor frame count |
+
 ### YtGst
 
 | Variable | Default | Purpose |
