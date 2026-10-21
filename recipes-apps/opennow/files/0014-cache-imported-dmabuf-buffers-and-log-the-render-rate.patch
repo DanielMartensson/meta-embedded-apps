@@ -1,0 +1,209 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 5bd82293..3f3e774a 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -482,6 +482,7 @@ pub struct LinuxFrameProducer {
+     device: ash::Device,
+     render: VulkanRenderDevice,
+     imported: HashMap<DmaBufKey, Weak<ImportedNv12Frame>>,
++    buffer_imports: sand::BufferImports,
+     renderers: HashMap<GpuTextureFormat, RendererResources>,
+     slots: Vec<Option<FrameSlotResources>>,
+     generation: u64,
+@@ -585,6 +586,7 @@ impl LinuxFrameProducer {
+             device,
+             render,
+             imported: HashMap::new(),
++            buffer_imports: sand::BufferImports::default(),
+             renderers: HashMap::new(),
+             slots: (0..slot_count).map(|_| None).collect(),
+             generation: 0,
+@@ -730,6 +732,7 @@ impl LinuxFrameProducer {
+                 self.physical_device,
+                 &self.device,
+                 Arc::clone(&frame),
++                &mut self.buffer_imports,
+             ) {
+                 Ok(imported) => Ok(PreparedLinuxFrame::Sand(imported)),
+                 Err(error) => {
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
+index 13569550..be176807 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashMap;
+ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+ use std::time::Instant;
+ 
+@@ -302,11 +303,60 @@ impl Drop for ImportedBuffer {
+ }
+ 
+ pub struct ImportedSandFrame {
+-    buffers: Vec<ImportedBuffer>,
++    buffers: Vec<Arc<ImportedBuffer>>,
+     planes: [PlaneCopy; 2],
+     pub(super) source: Arc<DecodedVideoFrame>,
+ }
+ 
++/// One imported `TRANSFER_SRC` buffer, kept alive by the frames that still use
++/// it and by the cache between frames. The decoder pool reuses the same
++/// DMA-BUFs, so importing each one once avoids a driver allocation per frame.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++struct BufferKey {
++    device: u64,
++    inode: u64,
++    size: u64,
++}
++
++const BUFFER_CACHE_LIMIT: usize = 64;
++
++#[derive(Default)]
++pub(super) struct BufferImports {
++    entries: HashMap<BufferKey, (Arc<ImportedBuffer>, u64)>,
++    age: u64,
++}
++
++impl BufferImports {
++    fn get(
++        &mut self,
++        key: BufferKey,
++        instance: &ash::Instance,
++        physical: vk::PhysicalDevice,
++        device: &ash::Device,
++        object: &crate::DmaBufObject,
++    ) -> Result<Arc<ImportedBuffer>> {
++        self.age = self.age.wrapping_add(1);
++        if let Some((buffer, stamp)) = self.entries.get_mut(&key) {
++            *stamp = self.age;
++            return Ok(Arc::clone(buffer));
++        }
++        if self.entries.len() >= BUFFER_CACHE_LIMIT {
++            let oldest = self
++                .entries
++                .iter()
++                .filter(|(_, (buffer, _))| Arc::strong_count(buffer) == 1)
++                .min_by_key(|(_, (_, stamp))| *stamp)
++                .map(|(key, _)| *key);
++            if let Some(oldest) = oldest {
++                self.entries.remove(&oldest);
++            }
++        }
++        let buffer = Arc::new(import_buffer(instance, physical, device, object, key.size)?);
++        self.entries.insert(key, (Arc::clone(&buffer), self.age));
++        Ok(buffer)
++    }
++}
++
+ impl std::fmt::Debug for ImportedSandFrame {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         formatter
+@@ -344,18 +394,48 @@ pub(super) fn import_linear(
+     physical: vk::PhysicalDevice,
+     device: &ash::Device,
+     source: Arc<DecodedVideoFrame>,
++    cache: &mut BufferImports,
+ ) -> Result<ImportedSandFrame> {
+     let frame = source.dmabuf.as_ref().expect("DMA-BUF checked");
+     let layout = LinearLayout::new(frame, source.format)?;
+-    import_with(
+-        instance,
+-        physical,
+-        device,
++    let mut properties = vk::ExternalBufferProperties::default();
++    unsafe {
++        instance.get_physical_device_external_buffer_properties(
++            physical,
++            &vk::PhysicalDeviceExternalBufferInfo::default()
++                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
++                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
++            &mut properties,
++        );
++    }
++    if !properties
++        .external_memory_properties
++        .external_memory_features
++        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
++    {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        static REPORTED: AtomicBool = AtomicBool::new(false);
++        if !REPORTED.swap(true, Ordering::Relaxed) {
++            eprintln!(
++                "opennow-diag: Vulkan reports no IMPORTABLE feature for DMA-BUF buffers; attempting the import anyway"
++            );
++        }
++    }
++    let mut buffers = Vec::with_capacity(frame.objects.len());
++    for (object, &size) in frame.objects.iter().zip(&layout.buffer_sizes) {
++        let (device_id, inode) = fd_identity(object.fd)?;
++        let key = BufferKey {
++            device: device_id,
++            inode,
++            size,
++        };
++        buffers.push(cache.get(key, instance, physical, device, object)?);
++    }
++    Ok(ImportedSandFrame {
++        buffers,
++        planes: layout.planes,
+         source,
+-        layout.planes,
+-        layout.buffer_sizes,
+-        false,
+-    )
++    })
+ }
+ 
+ fn import_with(
+@@ -404,7 +484,7 @@ fn import_with(
+         .objects
+         .iter()
+         .zip(&buffer_sizes)
+-        .map(|(object, &size)| import_buffer(instance, physical, device, object, size))
++        .map(|(object, &size)| import_buffer(instance, physical, device, object, size).map(Arc::new))
+         .collect::<Result<Vec<_>>>()?;
+     Ok(ImportedSandFrame {
+         buffers,
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 3cb16cd6..5829d2c5 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -420,18 +420,19 @@ public:
+             m_outputCount.store(0);
+         } else if (now - start >= 1'000'000'000) {
+             m_outputFps.store(double(m_outputCount.exchange(0)) * 1.0e9 / double(now - start));
++            const double renderFps = double(m_renderCount.exchange(0)) * 1.0e9 / double(now - start);
+             m_sampleStart.store(now);
+             if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT")) {
+                 const auto snapshot = m_swapTimings.snapshot();
+                 if (snapshot.available) {
+-                    qInfo("opennow-present fps=%.1f swapped=%llu p50=%.2fms p95=%.2fms max=%.2fms",
+-                          m_outputFps.load(), qulonglong(snapshot.swappedFramesTotal),
++                    qInfo("opennow-present fps=%.1f render=%.1f swapped=%llu p50=%.2fms p95=%.2fms max=%.2fms",
++                          m_outputFps.load(), renderFps, qulonglong(snapshot.swappedFramesTotal),
+                           double(snapshot.submitToSwap.p50Ns) / 1.0e6,
+                           double(snapshot.submitToSwap.p95Ns) / 1.0e6,
+                           double(snapshot.submitToSwap.maxNs) / 1.0e6);
+                 } else {
+-                    qInfo("opennow-present fps=%.1f swapped=%llu",
+-                          m_outputFps.load(), qulonglong(snapshot.swappedFramesTotal));
++                    qInfo("opennow-present fps=%.1f render=%.1f swapped=%llu",
++                          m_outputFps.load(), renderFps, qulonglong(snapshot.swappedFramesTotal));
+                 }
+             }
+         }
+@@ -474,6 +475,7 @@ public:
+ 
+     void recordFrame(QRhiCommandBuffer *commandBuffer, const QRect &) override
+     {
++        ++m_renderCount;
+         if (!m_runtime || !m_runtime->presentationAllowed()
+                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
+         m_textures.render(commandBuffer, m_stencil, m_stencilReference);
+@@ -578,6 +580,7 @@ private:
+     std::atomic_int m_submittedKind = 0;
+     std::atomic<FrameGenerationState> m_frameGenerationStatus = FrameGenerationState::Off;
+     std::atomic_uint64_t m_outputCount = 0;
++    std::atomic_uint64_t m_renderCount = 0;
+     std::atomic_int64_t m_sampleStart = 0;
+     std::atomic<double> m_outputFps = 0;
+     std::atomic<StreamFramePacer::TimingSource> m_timingSource = StreamFramePacer::TimingSource::None;

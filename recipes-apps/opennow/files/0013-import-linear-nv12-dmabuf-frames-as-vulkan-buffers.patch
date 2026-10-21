@@ -1,0 +1,377 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 2f311af2..5bd82293 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -725,52 +725,31 @@ impl LinuxFrameProducer {
+                 sand::import(&self.instance, self.physical_device, &self.device, frame)
+                     .map(PreparedLinuxFrame::Sand)
+             }
++            DmaBufImportRoute::Linear => match sand::import_linear(
++                &self.instance,
++                self.physical_device,
++                &self.device,
++                Arc::clone(&frame),
++            ) {
++                Ok(imported) => Ok(PreparedLinuxFrame::Sand(imported)),
++                Err(error) => {
++                    use std::sync::atomic::{AtomicBool, Ordering};
++                    static REPORTED: AtomicBool = AtomicBool::new(false);
++                    if !REPORTED.swap(true, Ordering::Relaxed) {
++                        eprintln!(
++                            "opennow-diag: linear DMA-BUF buffer import failed: {error}; falling back to the CPU copy"
++                        );
++                    }
++                    self.prepare_cpu_copy(frame)
++                }
++            },
+             DmaBufImportRoute::Image => self
+                 .import_dmabuf(Arc::clone(&frame))
+                 .map(PreparedLinuxFrame::DmaBuf),
+             // The graphics device cannot import the decoder's DMA-BUF. Copy
+             // the decoded NV12 planes to the CPU and use the regular upload
+             // path; the hardware decoder still does all of the decoding.
+-            DmaBufImportRoute::CpuCopy => {
+-                if frame.format.pixel_format != PixelFormat::Nv12
+-                    || frame.format.color_transfer != crate::ColorTransfer::Sdr
+-                {
+-                    return Err(Error::unavailable(
+-                        Subsystem::Vulkan,
+-                        "DMA-BUF CPU copy requires NV12 SDR frames",
+-                    ));
+-                }
+-                {
+-                    use std::sync::atomic::{AtomicBool, Ordering};
+-                    static DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
+-                    if !DIAGNOSTIC.swap(true, Ordering::Relaxed) {
+-                        eprintln!(
+-                            "opennow-diag: cpu-copy frame {}x{} range={:?} matrix={:?} chroma={:?}",
+-                            frame.format.width,
+-                            frame.format.height,
+-                            frame.format.color_range,
+-                            frame.format.color_matrix,
+-                            frame.format.chroma_location
+-                        );
+-                    }
+-                }
+-                let planes = frame
+-                    .dmabuf
+-                    .as_ref()
+-                    .expect("DMA-BUF checked")
+-                    .copy_nv12_planes(frame.format.width, frame.format.height)?;
+-                if planes.len() != 2 {
+-                    return Err(Error::unavailable(
+-                        Subsystem::Vulkan,
+-                        "DMA-BUF CPU copy did not return two NV12 planes",
+-                    ));
+-                }
+-                Ok(PreparedLinuxFrame::Cpu(CpuNv12Frame {
+-                    luma: planes[0].clone(),
+-                    chroma: planes[1].clone(),
+-                    source: frame,
+-                }))
+-            }
++            DmaBufImportRoute::CpuCopy => self.prepare_cpu_copy(frame),
+             // CPU planes are accepted only from an explicitly CPU-backed decoder,
+             // never as an automatic substitute for failed native GPU interop.
+             DmaBufImportRoute::None
+@@ -791,6 +770,47 @@ impl LinuxFrameProducer {
+         }
+     }
+ 
++    fn prepare_cpu_copy(&self, frame: Arc<DecodedVideoFrame>) -> Result<PreparedLinuxFrame> {
++        if frame.format.pixel_format != PixelFormat::Nv12
++            || frame.format.color_transfer != crate::ColorTransfer::Sdr
++        {
++            return Err(Error::unavailable(
++                Subsystem::Vulkan,
++                "DMA-BUF CPU copy requires NV12 SDR frames",
++            ));
++        }
++        {
++            use std::sync::atomic::{AtomicBool, Ordering};
++            static DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
++            if !DIAGNOSTIC.swap(true, Ordering::Relaxed) {
++                eprintln!(
++                    "opennow-diag: cpu-copy frame {}x{} range={:?} matrix={:?} chroma={:?}",
++                    frame.format.width,
++                    frame.format.height,
++                    frame.format.color_range,
++                    frame.format.color_matrix,
++                    frame.format.chroma_location
++                );
++            }
++        }
++        let planes = frame
++            .dmabuf
++            .as_ref()
++            .expect("DMA-BUF checked")
++            .copy_nv12_planes(frame.format.width, frame.format.height)?;
++        if planes.len() != 2 {
++            return Err(Error::unavailable(
++                Subsystem::Vulkan,
++                "DMA-BUF CPU copy did not return two NV12 planes",
++            ));
++        }
++        Ok(PreparedLinuxFrame::Cpu(CpuNv12Frame {
++            luma: planes[0].clone(),
++            chroma: planes[1].clone(),
++            source: frame,
++        }))
++    }
++
+     fn wait_for_decode(&mut self, frame: &VulkanVideoFrame) -> Result<()> {
+         let (semaphores, values): (Vec<_>, Vec<_>) = timeline_waits(frame)?
+             .into_iter()
+@@ -2048,6 +2068,7 @@ enum DmaBufImportRoute {
+     None,
+     Image,
+     Sand,
++    Linear,
+     CpuCopy,
+ }
+ 
+@@ -2067,6 +2088,12 @@ fn dmabuf_import_route(
+         return Ok(DmaBufImportRoute::Sand);
+     }
+     if !render.dmabuf_import_enabled {
++        // Linear NV12 can still stay on the GPU: import the DMA-BUF as a
++        // VkBuffer and copy it into the NV12 textures, exactly like the
++        // Broadcom tiled path does.
++        if sand::is_linear(dmabuf) && render.dmabuf_buffer_import_enabled {
++            return Ok(DmaBufImportRoute::Linear);
++        }
+         if dmabuf.layers.len() == 1
+             && dmabuf.layers[0].format == u32::from_le_bytes(*b"NV12")
+             && dmabuf.layers[0].planes.len() == 2
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
+index 521619c7..13569550 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
+@@ -15,6 +15,19 @@ pub(super) fn is_sand(frame: &DmaBufFrame) -> bool {
+         || frame.layers.iter().any(|layer| layer.format == P030)
+ }
+ 
++/// A linear (unmodified) NV12 frame. The VeriSilicon driver cannot import
++/// DMA-BUF images, but it exposes the external buffer import extensions, so
++/// these frames can take the same VkBuffer path as the Broadcom tiled ones.
++pub(super) fn is_linear(frame: &DmaBufFrame) -> bool {
++    frame.layers.len() == 1
++        && frame.layers[0].format == DRM_FORMAT_NV12
++        && frame.layers[0].planes.len() == 2
++        && frame
++            .objects
++            .iter()
++            .all(|object| object.format_modifier == 0)
++}
++
+ fn invalid(message: &str) -> Error {
+     Error::InvalidFormat(format!("SAND128 DMA-BUF: {message}"))
+ }
+@@ -157,6 +170,83 @@ impl SandLayout {
+     }
+ }
+ 
++#[derive(Debug)]
++struct LinearLayout {
++    planes: [PlaneCopy; 2],
++    buffer_sizes: Vec<u64>,
++}
++
++impl LinearLayout {
++    fn new(frame: &DmaBufFrame, format: crate::StreamFormat) -> Result<Self> {
++        frame.validate()?;
++        format.validate()?;
++        if format.pixel_format != PixelFormat::Nv12
++            || format.color_transfer != crate::ColorTransfer::Sdr
++        {
++            return Err(invalid("only 8-bit SDR NV12 is supported"));
++        }
++        let [layer] = frame.layers.as_slice() else {
++            return Err(invalid("expected one NV12 layer"));
++        };
++        let [luma, chroma] = layer.planes.as_slice() else {
++            return Err(invalid("expected exactly two planes"));
++        };
++        let mut copies = Vec::with_capacity(2);
++        let mut buffer_sizes = vec![0u64; frame.objects.len()];
++        for (index, plane) in [luma, chroma].into_iter().enumerate() {
++            let object = &frame.objects[plane.object_index];
++            let rows = u64::from(format.height >> index);
++            let width = u64::from(format.width >> index);
++            let row_bytes = if index == 0 { width } else { width * 2 };
++            let pitch = u64::try_from(plane.pitch)
++                .map_err(|_| invalid("plane pitch overflow"))?;
++            if pitch < row_bytes {
++                return Err(invalid("plane pitch is smaller than the visible width"));
++            }
++            if index == 1 && pitch % 2 != 0 {
++                return Err(invalid("chroma pitch must be even"));
++            }
++            let start = u64::try_from(plane.offset)
++                .map_err(|_| invalid("plane offset overflow"))?;
++            let end = start
++                .checked_add(
++                    (rows - 1)
++                        .checked_mul(pitch)
++                        .ok_or_else(|| invalid("plane size overflow"))?,
++                )
++                .and_then(|size| size.checked_add(row_bytes))
++                .ok_or_else(|| invalid("plane size overflow"))?;
++            if end > object.size as u64 {
++                return Err(invalid("plane exceeds the DMA-BUF object size"));
++            }
++            buffer_sizes[plane.object_index] = buffer_sizes[plane.object_index].max(end);
++            copies.push(PlaneCopy {
++                object: plane.object_index,
++                regions: vec![
++                    vk::BufferImageCopy::default()
++                        .buffer_offset(start)
++                        .buffer_row_length((pitch >> index) as u32)
++                        .image_subresource(
++                            vk::ImageSubresourceLayers::default()
++                                .aspect_mask(vk::ImageAspectFlags::COLOR)
++                                .layer_count(1),
++                        )
++                        .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
++                        .image_extent(vk::Extent3D {
++                            width: width as u32,
++                            height: rows as u32,
++                            depth: 1,
++                        }),
++                ],
++            });
++        }
++        Ok(Self {
++            planes: copies.try_into().expect("two planes"),
++            buffer_sizes,
++        })
++    }
++}
++
+ pub(super) fn wait_ready(frame: &DmaBufFrame, timeout: Duration) -> Result<()> {
+     let deadline = Instant::now() + timeout;
+     for object in &frame.objects {
+@@ -213,7 +303,7 @@ impl Drop for ImportedBuffer {
+ 
+ pub struct ImportedSandFrame {
+     buffers: Vec<ImportedBuffer>,
+-    layout: SandLayout,
++    planes: [PlaneCopy; 2],
+     pub(super) source: Arc<DecodedVideoFrame>,
+ }
+ 
+@@ -221,7 +311,7 @@ impl std::fmt::Debug for ImportedSandFrame {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         formatter
+             .debug_struct("ImportedSandFrame")
+-            .field("layout", &self.layout)
++            .field("planes", &self.planes)
+             .finish_non_exhaustive()
+     }
+ }
+@@ -235,6 +325,49 @@ pub(super) fn import(
+     let frame = source.dmabuf.as_ref().expect("DMA-BUF checked");
+     let layout = SandLayout::new(frame, source.format)?;
+     wait_ready(frame, Duration::ZERO)?;
++    import_with(
++        instance,
++        physical,
++        device,
++        source,
++        layout.planes,
++        layout.buffer_sizes,
++        true,
++    )
++}
++
++/// Import a linear NV12 frame as DMA-BUF backed `TRANSFER_SRC` buffers. V4L2
++/// finishes writing the buffer before it hands the frame over, so there is no
++/// producer fence to poll here.
++pub(super) fn import_linear(
++    instance: &ash::Instance,
++    physical: vk::PhysicalDevice,
++    device: &ash::Device,
++    source: Arc<DecodedVideoFrame>,
++) -> Result<ImportedSandFrame> {
++    let frame = source.dmabuf.as_ref().expect("DMA-BUF checked");
++    let layout = LinearLayout::new(frame, source.format)?;
++    import_with(
++        instance,
++        physical,
++        device,
++        source,
++        layout.planes,
++        layout.buffer_sizes,
++        false,
++    )
++}
++
++fn import_with(
++    instance: &ash::Instance,
++    physical: vk::PhysicalDevice,
++    device: &ash::Device,
++    source: Arc<DecodedVideoFrame>,
++    planes: [PlaneCopy; 2],
++    buffer_sizes: Vec<u64>,
++    require_importable: bool,
++) -> Result<ImportedSandFrame> {
++    let frame = source.dmabuf.as_ref().expect("DMA-BUF checked");
+     let mut properties = vk::ExternalBufferProperties::default();
+     unsafe {
+         instance.get_physical_device_external_buffer_properties(
+@@ -245,25 +378,37 @@ pub(super) fn import(
+             &mut properties,
+         );
+     }
+-    if !properties
++    let importable = properties
+         .external_memory_properties
+         .external_memory_features
+-        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+-    {
+-        return Err(Error::unavailable(
+-            Subsystem::Vulkan,
+-            "Vulkan device cannot import SAND DMA-BUF as TRANSFER_SRC buffers",
+-        ));
++        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
++    if !importable {
++        if require_importable {
++            return Err(Error::unavailable(
++                Subsystem::Vulkan,
++                "Vulkan device cannot import SAND DMA-BUF as TRANSFER_SRC buffers",
++            ));
++        }
++        // The VeriSilicon driver advertises the external buffer import
++        // extensions but reports no external memory features. Try the import
++        // anyway; prepare_frame falls back to the CPU copy when it fails.
++        use std::sync::atomic::{AtomicBool, Ordering};
++        static REPORTED: AtomicBool = AtomicBool::new(false);
++        if !REPORTED.swap(true, Ordering::Relaxed) {
++            eprintln!(
++                "opennow-diag: Vulkan reports no IMPORTABLE feature for DMA-BUF buffers; attempting the import anyway"
++            );
++        }
+     }
+     let buffers = frame
+         .objects
+         .iter()
+-        .zip(&layout.buffer_sizes)
++        .zip(&buffer_sizes)
+         .map(|(object, &size)| import_buffer(instance, physical, device, object, size))
+         .collect::<Result<Vec<_>>>()?;
+     Ok(ImportedSandFrame {
+         buffers,
+-        layout,
++        planes,
+         source,
+     })
+ }
+@@ -537,7 +682,7 @@ impl SandImages {
+                 &[],
+                 &images,
+             );
+-            for (image, plane) in self.planes.iter().zip(&frame.layout.planes) {
++            for (image, plane) in self.planes.iter().zip(&frame.planes) {
+                 device.cmd_copy_buffer_to_image(
+                     command,
+                     frame.buffers[plane.object].buffer,
