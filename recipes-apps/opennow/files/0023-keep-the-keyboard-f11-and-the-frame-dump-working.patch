@@ -1,0 +1,405 @@
+Subject: [PATCH 0023] Keep the keyboard, F11 and the frame dump working
+
+Three faults found while exercising the stream window on the board:
+
+- F11 was switched off while a stream ran, so the new window switching code
+  could never be reached and the stream window could not be made windowed or
+  fullscreen by the keyboard at all. The shortcut now stays enabled while the
+  stream window exists.
+
+- The stream window is a toplevel of its own, and the compositor focuses it when
+  it maps. That quietly took the keyboard away from the interface window, which
+  is the only place game input is forwarded to the host from, so WASD would have
+  gone nowhere. The window asks for the focus back once it is mapped and each
+  time it is focused again, and it handles F11 itself and asks the interface to
+  switch the mode. Its keyboard object had only the key callback installed,
+  which is not allowed: libwayland stops demarshalling the event stream at the
+  first NULL callback, so the very first modifiers event desynchronised the
+  connection and killed the application. All callbacks are installed now.
+
+- The development frame dump wrote nothing and said nothing. Two reasons: a
+  DMA-BUF object whose reported size is zero (ask the descriptor instead) and a
+  chroma plane measured with the luma height, which made every NV12 frame look
+  as if it did not fit in its object. Both fixed; anything else that goes wrong
+  is reported once on stderr, and a failed write is no longer swallowed.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 1a412a38..4bbfc3e6 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -490,6 +490,13 @@ fn export_dmabuf(frame: &DecodedVideoFrame) -> Option<DmabufExport> {
+ /// once a second. This is a development aid for boards where the compositor
+ /// refuses screen capture: the video can be inspected without a display
+ /// server round trip, and the cost when the variable is unset is one branch.
++/// Says once why a frame could not be written, so a development aid that stops
++/// working does not stay a mystery.
++fn dump_problem(reason: &str) {
++    static REPORTED: std::sync::Once = std::sync::Once::new();
++    REPORTED.call_once(|| eprintln!("opennow-dump: {reason}"));
++}
++
+ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+     static ENABLED: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+     static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+@@ -514,12 +521,15 @@ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+         return;
+     }
+     let Some(dmabuf) = frame.dmabuf.as_ref() else {
++        dump_problem("the decoder produced no DMA-BUF frame");
+         return;
+     };
+     let Some(layer) = dmabuf.layers.first() else {
++        dump_problem("the DMA-BUF frame has no layer");
+         return;
+     };
+     if layer.planes.len() < 2 {
++        dump_problem("the DMA-BUF frame is not NV12 (fewer than two planes)");
+         return;
+     }
+     let visible_width = frame.format.width as usize;
+@@ -537,10 +547,30 @@ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+     // once and hand the plane slices to the converter.
+     let mut mappings: Vec<(usize, *mut u8, usize)> = Vec::new();
+     let mut plane_slices: Vec<&[u8]> = Vec::new();
+-    for plane in layer.planes.iter().take(2) {
++    for (index, plane) in layer.planes.iter().take(2).enumerate() {
++        // Chroma is half the height of luma; measuring it with the luma height
++        // made every NV12 frame look as if it did not fit in its object.
++        let plane_height = if index == 0 { coded_height } else { (coded_height + 1) / 2 };
+         let Some(object) = dmabuf.objects.get(plane.object_index) else {
++            dump_problem("the plane refers to an unknown DMA-BUF object");
+             return;
+         };
++        // Several drivers report no size for a DMA-BUF object; the descriptor
++        // knows it, and mmap needs it.
++        let object_size = if object.size > 0 {
++            object.size
++        } else {
++            let size = unsafe { libc::lseek(object.fd, 0, libc::SEEK_END) };
++            if size <= 0 {
++                dump_problem("the DMA-BUF object has no size and the descriptor will not say");
++                return;
++            }
++            usize::try_from(size).unwrap_or(0)
++        };
++        if object_size == 0 {
++            dump_problem("the DMA-BUF object has no usable size");
++            return;
++        }
+         let mapping = match mappings
+             .iter()
+             .find(|(index, _, _)| *index == plane.object_index)
+@@ -550,7 +580,7 @@ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+                 let pointer = unsafe {
+                     libc::mmap(
+                         std::ptr::null_mut(),
+-                        object.size,
++                        object_size,
+                         libc::PROT_READ,
+                         libc::MAP_SHARED,
+                         object.fd,
+@@ -558,24 +588,26 @@ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+                     )
+                 };
+                 if pointer == libc::MAP_FAILED {
++                    dump_problem("the decoder's DMA-BUF cannot be mapped for reading");
+                     for (_, pointer, size) in &mappings {
+                         unsafe { libc::munmap((*pointer).cast(), *size) };
+                     }
+                     return;
+                 }
+-                mappings.push((plane.object_index, pointer.cast(), object.size));
+-                (pointer.cast(), object.size)
++                mappings.push((plane.object_index, pointer.cast(), object_size));
++                (pointer.cast(), object_size)
+             }
+         };
+         let (pointer, size) = mapping;
+-        if plane.offset + plane.pitch.saturating_mul(coded_height) > size {
++        if plane.offset + plane.pitch.saturating_mul(plane_height) > size {
++            dump_problem("the plane does not fit in the DMA-BUF object");
+             for (_, pointer, size) in &mappings {
+                 unsafe { libc::munmap((*pointer).cast(), *size) };
+             }
+             return;
+         }
+         plane_slices.push(unsafe {
+-            std::slice::from_raw_parts(pointer.add(plane.offset), plane.pitch * coded_height)
++            std::slice::from_raw_parts(pointer.add(plane.offset), plane.pitch * plane_height)
+         });
+     }
+     if plane_slices.len() < 2 {
+@@ -613,8 +645,10 @@ fn dump_decoded_frame(frame: &DecodedVideoFrame) {
+     let mut file = Vec::with_capacity(header.len() + pixels.len());
+     file.extend_from_slice(header.as_bytes());
+     file.extend_from_slice(&pixels);
+-    if std::fs::write(&temporary, &file).is_ok() {
+-        let _ = std::fs::rename(&temporary, &path);
++    if let Err(error) = std::fs::write(&temporary, &file) {
++        dump_problem(&format!("cannot write {}: {error}", temporary.display()));
++    } else if let Err(error) = std::fs::rename(&temporary, &path) {
++        dump_problem(&format!("cannot rename {}: {error}", path.display()));
+     }
+ }
+ 
+@@ -855,15 +889,6 @@ impl LinuxFrameProducer {
+         command_buffer: usize,
+         slot: u32,
+     ) -> Result<RecordedGpuFrame> {
+-        if command_buffer == 0 {
+-            return Err(Error::InvalidFormat(
+-                "Qt supplied a null Vulkan command buffer".to_owned(),
+-            ));
+-        }
+-        let slot_index = usize::try_from(slot)
+-            .ok()
+-            .filter(|index| *index < self.slots.len())
+-            .ok_or_else(|| Error::InvalidFormat(format!("invalid QRhi frame slot {slot}")))?;
+         let width = frame.format.width;
+         let height = frame.format.height;
+         let timestamp_us = frame.timestamp_us;
+@@ -876,7 +901,10 @@ impl LinuxFrameProducer {
+         if wayland_video_requested() {
+             // A compositor that can take the decoder's DMA-BUF straight to a
+             // plane needs neither the conversion pass nor a GPU image, so hand
+-            // the frame over untouched instead of converting it first.
++            // the frame over untouched instead of converting it first. Nothing
++            // is recorded, so a command buffer and a frame slot are not needed
++            // either: this path also runs when the interface renders with a
++            // backend that has no Vulkan device to borrow.
+             if let Some(dmabuf) = export_dmabuf(&frame) {
+                 return Ok(RecordedGpuFrame {
+                     slot,
+@@ -892,6 +920,15 @@ impl LinuxFrameProducer {
+                 });
+             }
+         }
++        if command_buffer == 0 {
++            return Err(Error::InvalidFormat(
++                "Qt supplied a null Vulkan command buffer".to_owned(),
++            ));
++        }
++        let slot_index = usize::try_from(slot)
++            .ok()
++            .filter(|index| *index < self.slots.len())
++            .ok_or_else(|| Error::InvalidFormat(format!("invalid QRhi frame slot {slot}")))?;
+         let prepared = self.prepare(frame)?;
+         self.ensure_renderer(texture_format)?;
+         self.ensure_slot(slot_index, width, height, texture_format)?;
+diff --git a/opennow-qt/qml/Main.qml b/opennow-qt/qml/Main.qml
+index c9b02ba1..0ebbd830 100644
+--- a/opennow-qt/qml/Main.qml
++++ b/opennow-qt/qml/Main.qml
+@@ -239,13 +239,20 @@ ApplicationWindow {
+             // surface left to be shown on, so nothing should keep running.
+             ShellStore.stopStreamingSession()
+         }
++        function onToggleRequested() {
++            // The stream window holds the keyboard while it has the focus, so
++            // it hands F11 back here instead of swallowing it.
++            window.toggleFullscreen()
++        }
+     }
+ 
+     Shortcut {
+         objectName: "shellFullscreenShortcut"
+         sequence: "F11"
+         context: Qt.ApplicationShortcut
+-        enabled: window.activeRoute !== "stream"
++        // With a stream window of its own, F11 keeps working: it switches that
++        // window between windowed and fullscreen instead of the interface.
++        enabled: window.activeRoute !== "stream" || NativeVideoWindow.mapped
+         onActivated: window.toggleFullscreen()
+     }
+ 
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index bcf1f1e7..7a9020e6 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -3,6 +3,9 @@
+ #include <QDebug>
+ #include <QGuiApplication>
+ #include <QMetaObject>
++#include <QPointer>
++#include <QTimer>
++#include <QWindow>
+ #include <QtGui/qguiapplication_platform.h>
+ 
+ #include <algorithm>
+@@ -90,6 +93,9 @@ void WaylandVideoSurface::handleGlobal(void *data, wl_registry *registry, quint3
+     } else if (std::strcmp(interface, wp_viewporter_interface.name) == 0) {
+         self->m_viewporter = static_cast<wp_viewporter *>(
+             wl_registry_bind(registry, name, &wp_viewporter_interface, std::min(version, 1u)));
++    } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
++        self->m_seat = static_cast<wl_seat *>(
++            wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 5u)));
+     } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+         self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
+             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+@@ -131,6 +137,63 @@ void WaylandVideoSurface::handleToplevelClose(void *data, xdg_toplevel *)
+     }, Qt::QueuedConnection);
+ }
+ 
++void WaylandVideoSurface::handleKeyboardKeymap(void *, wl_keyboard *, quint32, int fd,
++                                               quint32)
++{
++    // The keymap is only needed to turn key codes into characters; the single
++    // shortcut handled here is a key code already.
++    if (fd >= 0) close(fd);
++}
++
++void WaylandVideoSurface::handleKeyboardEnter(void *data, wl_keyboard *, quint32,
++                                              wl_surface *, wl_array *)
++{
++    // Any focus that lands here is a detour: the interface needs the keyboard
++    // for game input, so ask for it back.
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->focusInterfaceWindow();
++}
++
++void WaylandVideoSurface::handleKeyboardLeave(void *, wl_keyboard *, quint32, wl_surface *)
++{
++}
++
++void WaylandVideoSurface::handleKeyboardModifiers(void *, wl_keyboard *, quint32, quint32,
++                                                  quint32, quint32, quint32)
++{
++}
++
++void WaylandVideoSurface::handleKeyboardRepeatInfo(void *, wl_keyboard *, qint32, qint32)
++{
++}
++
++void WaylandVideoSurface::handleKeyboardKey(void *data, wl_keyboard *, quint32, quint32,
++                                            quint32 key, quint32 state)
++{
++    // In windowed mode the user clicks the stream window, the compositor gives
++    // it the keyboard and the interface would stop receiving F11. Hand that one
++    // shortcut over; everything else has no use here because the interface
++    // window is the one that forwards game input.
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self || key != 87 /* KEY_F11 */
++            || state != WL_KEYBOARD_KEY_STATE_PRESSED) {
++        return;
++    }
++    QMetaObject::invokeMethod(self, [self] { emit self->toggleRequested(); },
++                              Qt::QueuedConnection);
++}
++
++void WaylandVideoSurface::focusInterfaceWindow()
++{
++    QPointer<QWindow> window = m_appWindow;
++    if (!window) return;
++    // The compositor focuses a fresh toplevel while it maps it, so ask for the
++    // keyboard back once that has settled: without it the game would get no
++    // input at all.
++    QTimer::singleShot(150, window, [window] {
++        if (window) window->requestActivate();
++    });
++}
++
+ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+ {
+     Q_UNUSED(data);
+@@ -162,6 +225,10 @@ bool WaylandVideoSurface::ensureSurface()
+         return false;
+     }
+ 
++    // Every key belongs to the interface window, which forwards game input to
++    // the host; remember which window that is before the compositor moves the
++    // focus to the new toplevel.
++    if (!m_appWindow) m_appWindow = QGuiApplication::focusWindow();
+     m_surface = wl_compositor_create_surface(m_compositor);
+     m_xdgSurface = xdg_wm_base_get_xdg_surface(m_shell, m_surface);
+     static const xdg_surface_listener surfaceListener = [] {
+@@ -198,6 +265,24 @@ bool WaylandVideoSurface::ensureSurface()
+         destroySurface();
+         return false;
+     }
++    if (m_seat && !m_keyboard) {
++        m_keyboard = wl_seat_get_keyboard(m_seat);
++        // Every callback has to be present: libwayland stops demarshalling the
++        // event stream at a NULL one, and the connection then desynchronises
++        // and takes the application with it.
++        static const wl_keyboard_listener keyboardListener = [] {
++            wl_keyboard_listener listener{};
++            listener.keymap = handleKeyboardKeymap;
++            listener.enter = handleKeyboardEnter;
++            listener.leave = handleKeyboardLeave;
++            listener.key = handleKeyboardKey;
++            listener.modifiers = handleKeyboardModifiers;
++            listener.repeat_info = handleKeyboardRepeatInfo;
++            return listener;
++        }();
++        wl_keyboard_add_listener(m_keyboard, &keyboardListener, this);
++    }
++    focusInterfaceWindow();
+     qInfo("wayland-video: stream window created");
+     return true;
+ }
+@@ -208,6 +293,10 @@ void WaylandVideoSurface::destroySurface()
+         wl_buffer_destroy(m_pendingBuffer);
+         m_pendingBuffer = nullptr;
+     }
++    if (m_keyboard) {
++        wl_keyboard_release(m_keyboard);
++        m_keyboard = nullptr;
++    }
+     if (m_viewport) wp_viewport_destroy(m_viewport);
+     if (m_toplevel) xdg_toplevel_destroy(m_toplevel);
+     if (m_xdgSurface) xdg_surface_destroy(m_xdgSurface);
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 955cc8a3..e63783c5 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -6,6 +6,9 @@
+ 
+ struct wl_array;
+ struct wl_buffer;
++struct wl_keyboard;
++struct wl_seat;
++class QWindow;
+ struct wl_compositor;
+ struct wl_display;
+ struct wl_registry;
+@@ -64,6 +67,9 @@ signals:
+     // The compositor asked the stream window to close: the stream has no
+     // surface left, so the application has to stop it.
+     void closeRequested();
++    // F11 reached the stream window instead of the interface: the interface
++    // still owns the shortcut, so it is asked to switch the window mode.
++    void toggleRequested();
+     void mappedChanged();
+     void windowedChanged();
+ 
+@@ -86,12 +92,29 @@ private:
+                                        qint32 width, qint32 height, wl_array *states);
+     static void handleToplevelClose(void *data, xdg_toplevel *toplevel);
+     static void handleBufferRelease(void *data, wl_buffer *buffer);
++    static void handleKeyboardKeymap(void *data, wl_keyboard *keyboard, quint32 format,
++                                     int fd, quint32 size);
++    static void handleKeyboardEnter(void *data, wl_keyboard *keyboard, quint32 serial,
++                                    wl_surface *surface, wl_array *keys);
++    static void handleKeyboardLeave(void *data, wl_keyboard *keyboard, quint32 serial,
++                                    wl_surface *surface);
++    static void handleKeyboardKey(void *data, wl_keyboard *keyboard, quint32 serial,
++                                  quint32 time, quint32 key, quint32 state);
++    static void handleKeyboardModifiers(void *data, wl_keyboard *keyboard, quint32 serial,
++                                        quint32 depressed, quint32 latched, quint32 locked,
++                                        quint32 group);
++    static void handleKeyboardRepeatInfo(void *data, wl_keyboard *keyboard, qint32 rate,
++                                         qint32 delay);
++    void focusInterfaceWindow();
+ 
+     wl_display *m_display = nullptr;
+     wl_registry *m_registry = nullptr;
+     wl_compositor *m_compositor = nullptr;
+     xdg_wm_base *m_shell = nullptr;
+     zwp_linux_dmabuf_v1 *m_dmabuf = nullptr;
++    wl_seat *m_seat = nullptr;
++    wl_keyboard *m_keyboard = nullptr;
++    QWindow *m_appWindow = nullptr;
+ 
+     wl_surface *m_surface = nullptr;
+     xdg_surface *m_xdgSurface = nullptr;

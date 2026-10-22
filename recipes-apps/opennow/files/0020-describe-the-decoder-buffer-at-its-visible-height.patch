@@ -1,0 +1,40 @@
+Subject: [PATCH 0020] Describe the decoder buffer at its visible height
+
+The decoder hands out 1920x1088 buffers for 1080p, and the stream window
+described that padded height to the compositor. Weston then refused the buffer
+as larger than the configured fullscreen state and raised a protocol error,
+which kills the whole Wayland connection: the first frame took the application
+down with it.
+
+The plane offsets already describe where the chroma rows live, so the padding
+never has to be mentioned. Describe the buffer at the visible height and the
+surface matches the fullscreen configuration exactly.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index d609650e..1a412a38 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -466,16 +466,16 @@ fn export_dmabuf(frame: &DecodedVideoFrame) -> Option<DmabufExport> {
+     if fd < 0 {
+         return None;
+     }
+-    let height = match layer.planes.len() {
+-        2 => crate::format::nv12_coded_height(&layer.planes[0], &layer.planes[1], frame.format.height),
+-        _ => frame.format.height,
+-    };
++    // The buffer is described at the visible height even when the decoder pads
++    // the picture (1088 rows for 1080p): the planes carry their own offsets, so
++    // the extra rows never reach the compositor, and a surface matching the
++    // fullscreen size is the only kind the compositor accepts.
+     let mut export = DmabufExport {
+         fd,
+         format: layer.format,
+         modifier: object.format_modifier,
+         width: frame.format.width,
+-        height,
++        height: frame.format.height,
+         plane_count: layer.planes.len() as u32,
+         ..DmabufExport::default()
+     };

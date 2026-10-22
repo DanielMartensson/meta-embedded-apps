@@ -1,0 +1,252 @@
+Subject: [PATCH 0019] Add opt-in frame and interface capture for development
+
+The reference board cannot be screenshotted: Weston 13 refuses the capture
+protocol to every client, and the DRM scanout buffer cannot be exported or
+mapped by another process. That leaves no way to see what the application is
+showing, which makes the streaming work unverifiable on the only hardware that
+matters for it.
+
+Two development aids, both inert unless asked for:
+
+- OPENNOW_FRAME_DUMP=<dir> writes the newest decoded frame to <dir>/frame.ppm,
+  at most once a second, converted from NV12 on the CPU. It reads the same
+  DMA-BUF the presentation path uses, so it shows exactly what the decoder
+  produced rather than what the renderer believes it produced.
+- Creating /tmp/opennow-grab writes the interface window to
+  /tmp/opennow-grab.png. With the stream on its own Wayland surface the
+  interface is behind an opaque window, so this is the only way to read the
+  menus.
+
+Neither path allocates when inactive and both are pure diagnostics, so they are
+safe to keep in a development build.
+
+Upstream-Status: Inappropriate [development aid for STM32MP25 work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index e38ae941..d609650e 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -486,6 +486,161 @@ fn export_dmabuf(frame: &DecodedVideoFrame) -> Option<DmabufExport> {
+     Some(export)
+ }
+ 
++/// Writes the newest decoded frame to `OPENNOW_FRAME_DUMP` as a PPM, at most
++/// once a second. This is a development aid for boards where the compositor
++/// refuses screen capture: the video can be inspected without a display
++/// server round trip, and the cost when the variable is unset is one branch.
++fn dump_decoded_frame(frame: &DecodedVideoFrame) {
++    static ENABLED: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
++    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
++    let Some(directory) = ENABLED
++        .get_or_init(|| std::env::var_os("OPENNOW_FRAME_DUMP").map(std::path::PathBuf::from))
++        .as_ref()
++    else {
++        return;
++    };
++    if LAST
++        .lock()
++        .map(|mut last| match *last {
++            Some(instant) if instant.elapsed() < Duration::from_secs(1) => false,
++            _ => {
++                *last = Some(std::time::Instant::now());
++                true
++            }
++        })
++        .unwrap_or(false)
++        == false
++    {
++        return;
++    }
++    let Some(dmabuf) = frame.dmabuf.as_ref() else {
++        return;
++    };
++    let Some(layer) = dmabuf.layers.first() else {
++        return;
++    };
++    if layer.planes.len() < 2 {
++        return;
++    }
++    let visible_width = frame.format.width as usize;
++    let visible_height = frame.format.height as usize;
++    if visible_width == 0 || visible_height == 0 {
++        return;
++    }
++    let coded_height = crate::format::nv12_coded_height(
++        &layer.planes[0],
++        &layer.planes[1],
++        frame.format.height,
++    ) as usize;
++
++    // Every plane of an NV12 layer usually lives in one object; map each object
++    // once and hand the plane slices to the converter.
++    let mut mappings: Vec<(usize, *mut u8, usize)> = Vec::new();
++    let mut plane_slices: Vec<&[u8]> = Vec::new();
++    for plane in layer.planes.iter().take(2) {
++        let Some(object) = dmabuf.objects.get(plane.object_index) else {
++            return;
++        };
++        let mapping = match mappings
++            .iter()
++            .find(|(index, _, _)| *index == plane.object_index)
++        {
++            Some(entry) => (entry.1, entry.2),
++            None => {
++                let pointer = unsafe {
++                    libc::mmap(
++                        std::ptr::null_mut(),
++                        object.size,
++                        libc::PROT_READ,
++                        libc::MAP_SHARED,
++                        object.fd,
++                        0,
++                    )
++                };
++                if pointer == libc::MAP_FAILED {
++                    for (_, pointer, size) in &mappings {
++                        unsafe { libc::munmap((*pointer).cast(), *size) };
++                    }
++                    return;
++                }
++                mappings.push((plane.object_index, pointer.cast(), object.size));
++                (pointer.cast(), object.size)
++            }
++        };
++        let (pointer, size) = mapping;
++        if plane.offset + plane.pitch.saturating_mul(coded_height) > size {
++            for (_, pointer, size) in &mappings {
++                unsafe { libc::munmap((*pointer).cast(), *size) };
++            }
++            return;
++        }
++        plane_slices.push(unsafe {
++            std::slice::from_raw_parts(pointer.add(plane.offset), plane.pitch * coded_height)
++        });
++    }
++    if plane_slices.len() < 2 {
++        for (_, pointer, size) in &mappings {
++            unsafe { libc::munmap((*pointer).cast(), *size) };
++        }
++        return;
++    }
++    let (luma, chroma) = (plane_slices[0], plane_slices[1]);
++    let luma_stride = layer.planes[0].pitch;
++    let chroma_stride = layer.planes[1].pitch;
++    let full_range = matches!(frame.format.color_range, crate::format::ColorRange::Full);
++
++    let mut pixels = Vec::with_capacity(visible_width * visible_height * 3);
++    for row in 0..visible_height {
++        let luma_row = &luma[row * luma_stride..];
++        let chroma_row = &chroma[(row / 2) * chroma_stride..];
++        for column in 0..visible_width {
++            let y = luma_row[column];
++            let uv = (column / 2) * 2;
++            let (u, v) = (chroma_row[uv], chroma_row[uv + 1]);
++            let (red, green, blue) = nv12_to_rgb(y, u, v, full_range);
++            pixels.push(red);
++            pixels.push(green);
++            pixels.push(blue);
++        }
++    }
++    for (_, pointer, size) in &mappings {
++        unsafe { libc::munmap((*pointer).cast(), *size) };
++    }
++
++    let path = directory.join("frame.ppm");
++    let temporary = directory.join("frame.ppm.tmp");
++    let header = format!("P6\n{visible_width} {visible_height}\n255\n");
++    let mut file = Vec::with_capacity(header.len() + pixels.len());
++    file.extend_from_slice(header.as_bytes());
++    file.extend_from_slice(&pixels);
++    if std::fs::write(&temporary, &file).is_ok() {
++        let _ = std::fs::rename(&temporary, &path);
++    }
++}
++
++/// BT.709 NV12 to RGB, matching the stream's SDR colour description.
++fn nv12_to_rgb(luma: u8, u: u8, v: u8, full_range: bool) -> (u8, u8, u8) {
++    let scale = |value: f32| value.clamp(0.0, 255.0) as u8;
++    let (y, u, v) = if full_range {
++        (
++            luma as f32,
++            u as f32 - 128.0,
++            v as f32 - 128.0,
++        )
++    } else {
++        (
++            (luma as f32 - 16.0) * (255.0 / 219.0),
++            (u as f32 - 128.0) * (255.0 / 224.0),
++            (v as f32 - 128.0) * (255.0 / 224.0),
++        )
++    };
++    (
++        scale(y + 1.5748 * v),
++        scale(y - 0.1873 * u - 0.4681 * v),
++        scale(y + 1.8556 * u),
++    )
++}
++
+ impl PreparedLinuxFrame {
+     pub fn timestamp_us(&self) -> u64 {
+         self.source().timestamp_us
+@@ -717,6 +872,7 @@ impl LinuxFrameProducer {
+         let chroma_location = frame.format.chroma_location;
+         let color_space = LinuxTextureColorSpace::from_format(frame.format)?;
+         let texture_format = GpuTextureFormat::for_stream_format(frame.format)?;
++        dump_decoded_frame(&frame);
+         if wayland_video_requested() {
+             // A compositor that can take the decoder's DMA-BUF straight to a
+             // plane needs neither the conversion pass nor a GPU image, so hand
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 699ec9f4..9f0a17ca 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -22,8 +22,12 @@
+ #include "streaming/StreamVideoItem.h"
+ #include "media/ThumbnailGenerator.h"
+ 
++#include <QFile>
+ #include <QGuiApplication>
+ #include <QIcon>
++#include <QImage>
++#include <QQuickWindow>
++#include <QWindow>
+ #include <QElapsedTimer>
+ #include <QTimer>
+ #include <QFont>
+@@ -222,6 +226,36 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+         if (acquisition == SingleInstance::Acquisition::Failed) return EXIT_FAILURE;
+     }
+     AppController controller;
++#if defined(Q_OS_LINUX)
++    // Development aid: creating /tmp/opennow-grab writes the interface window
++    // to /tmp/opennow-grab.png. The compositor on the reference board refuses
++    // screen capture, and the interface is invisible underneath the stream
++    // window, so this is the only way to see what the application is showing.
++    auto *grabTimer = new QTimer(&application);
++    grabTimer->setInterval(400);
++    QObject::connect(grabTimer, &QTimer::timeout, &application, [] {
++        const QString trigger = QStringLiteral("/tmp/opennow-grab");
++        if (!QFile::exists(trigger)) return;
++        QFile::remove(trigger);
++        QWindow *target = nullptr;
++        for (QWindow *window : QGuiApplication::topLevelWindows()) {
++            if (window->isVisible() && window->type() == Qt::Window) target = window;
++        }
++        if (!target) return;
++        auto *quickWindow = qobject_cast<QQuickWindow *>(target);
++        if (!quickWindow) return;
++        const QImage image = quickWindow->grabWindow();
++        if (image.isNull()) {
++            qWarning("window grab produced no image");
++            return;
++        }
++        const QString path = QStringLiteral("/tmp/opennow-grab.png");
++        qInfo("window grab saved: %s (%dx%d)", qUtf8Printable(path), image.width(),
++              image.height());
++        image.save(path);
++    });
++    grabTimer->start();
++#endif
+     QObject::connect(&controller, &AppController::restartRequested, &application, [&] {
+         restartExecutable = QCoreApplication::applicationFilePath();
+ #ifdef Q_OS_LINUX

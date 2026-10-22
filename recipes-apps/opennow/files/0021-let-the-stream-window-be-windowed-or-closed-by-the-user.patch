@@ -1,0 +1,270 @@
+Subject: [PATCH 0021] Let the stream window be windowed or closed by the user
+
+The stream window is now the thing the user looks at, so it has to behave like
+one. F11 switches between the two modes that matter:
+
+- Fullscreen is click-through. The interface window underneath keeps the input
+  focus, so the game keeps receiving the clicks and keys that already travel
+  through it, and the keyboard shortcut that toggles the mode still arrives.
+- Windowed is a normal 1280x720 toplevel with a viewport scaling the decoder
+  buffer. The compositor decorates it, so it can be moved, and its close button
+  is reachable. Clicks now land on the window instead of the interface, which
+  is exactly right while the game is not being played.
+
+Closing the window ends the stream instead of leaving an invisible player
+running: the surface reports the compositor's close request to the interface,
+which stops the session the same way the in-stream menu does.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/cmake/PlatformVideo.cmake b/opennow-qt/cmake/PlatformVideo.cmake
+index f3fcfd2b..22f56bd2 100644
+--- a/opennow-qt/cmake/PlatformVideo.cmake
++++ b/opennow-qt/cmake/PlatformVideo.cmake
+@@ -19,7 +19,8 @@ file(MAKE_DIRECTORY "${OPENNOW_VIDEO_PROTOCOL_DIR}")
+ 
+ set(OPENNOW_VIDEO_PROTOCOLS
+     "xdg-shell|stable/xdg-shell/xdg-shell.xml"
+-    "linux-dmabuf-unstable-v1|unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml")
++    "linux-dmabuf-unstable-v1|unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
++    "viewporter|stable/viewporter/viewporter.xml")
+ foreach(entry IN LISTS OPENNOW_VIDEO_PROTOCOLS)
+     string(REPLACE "|" ";" parts "${entry}")
+     list(GET parts 0 protocol_name)
+diff --git a/opennow-qt/qml/Main.qml b/opennow-qt/qml/Main.qml
+index 440771b9..c9b02ba1 100644
+--- a/opennow-qt/qml/Main.qml
++++ b/opennow-qt/qml/Main.qml
+@@ -232,6 +232,15 @@ ApplicationWindow {
+         }
+     }
+ 
++    Connections {
++        target: NativeVideoWindow
++        function onCloseRequested() {
++            // Closing the stream window ends the stream: the video has no
++            // surface left to be shown on, so nothing should keep running.
++            ShellStore.stopStreamingSession()
++        }
++    }
++
+     Shortcut {
+         objectName: "shellFullscreenShortcut"
+         sequence: "F11"
+@@ -446,6 +455,16 @@ ApplicationWindow {
+     }
+ 
+     function toggleFullscreen() {
++        // While the stream has a window of its own, F11 belongs to that window:
++        // windowed it shows the interface around the stream and gives the
++        // compositor a close button, fullscreen it is click-through again.
++        if (NativeVideoWindow.mapped) {
++            NativeVideoWindow.toggleWindowed()
++            ShellStore.streamControlMessage = NativeVideoWindow.windowed
++                ? qsTr("Stream window") : qsTr("Stream fullscreen")
++            ShellStore.accessibilityMessage = ShellStore.streamControlMessage
++            return
++        }
+         const enteringFullscreen = window.visibility !== ApplicationWindow.FullScreen
+         if (enteringFullscreen) {
+             window.visibilityBeforeFullscreen = window.visibility
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 9f0a17ca..6acead99 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -197,10 +197,13 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     LinuxVulkanGraphics::requestDeviceExtensions();
+ #endif
+ #if defined(Q_OS_LINUX)
+-    // The stream window talks Wayland directly, so it must be created here on
+-    // the GUI thread with the connection quiet; the render thread only posts
+-    // frames to it later.
+-    if (WaylandVideoSurface::environmentEnabled()) WaylandVideoSurface::instance();
++    // The stream window talks Wayland directly, so it is created here on the
++    // GUI thread with the connection quiet; the render thread only posts frames
++    // to it later. The interface sees it as a singleton: it needs to know when
++    // the stream has a window of its own, and to stop the stream when the user
++    // closes that window.
++    qmlRegisterSingletonInstance("OpenNOW", 1, 0, "NativeVideoWindow",
++                                 WaylandVideoSurface::instance());
+ #endif
+     registerStreamVideoItemQmlType();
+     qSetMessagePattern(u"%{time yyyy-MM-ddTHH:mm:ss.zzz} %{type} %{category}: %{message}"_s);
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 758cfd11..bcf1f1e7 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -12,10 +12,14 @@
+ #include <wayland-client.h>
+ 
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
++#include "viewporter-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ 
+ namespace {
+ 
++constexpr int kWindowWidth = 1280;
++constexpr int kWindowHeight = 720;
++
+ wl_display *qtWaylandDisplay()
+ {
+     auto *native = qGuiApp
+@@ -83,6 +87,9 @@ void WaylandVideoSurface::handleGlobal(void *data, wl_registry *registry, quint3
+             return listener;
+         }();
+         xdg_wm_base_add_listener(self->m_shell, &shellListener, self);
++    } else if (std::strcmp(interface, wp_viewporter_interface.name) == 0) {
++        self->m_viewporter = static_cast<wp_viewporter *>(
++            wl_registry_bind(registry, name, &wp_viewporter_interface, std::min(version, 1u)));
+     } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+         self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
+             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+@@ -118,7 +125,10 @@ void WaylandVideoSurface::handleToplevelClose(void *data, xdg_toplevel *)
+     // cannot be destroyed inside its own event dispatch, so defer it.
+     auto *self = static_cast<WaylandVideoSurface *>(data);
+     if (!self) return;
+-    QMetaObject::invokeMethod(self, [self] { self->dismiss(); }, Qt::QueuedConnection);
++    QMetaObject::invokeMethod(self, [self] {
++        emit self->closeRequested();
++        self->dismiss();
++    }, Qt::QueuedConnection);
+ }
+ 
+ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+@@ -172,6 +182,8 @@ bool WaylandVideoSurface::ensureSurface()
+     xdg_toplevel_set_title(m_toplevel, "OpenNOW stream");
+     xdg_toplevel_set_fullscreen(m_toplevel, nullptr);
+ 
++    if (m_viewporter) m_viewport = wp_viewporter_get_viewport(m_viewporter, m_surface);
++
+     // The Qt window underneath keeps the input focus: game input travels the
+     // path that already forwards it to the host, and this surface never eats a
+     // click meant for the interface.
+@@ -196,14 +208,20 @@ void WaylandVideoSurface::destroySurface()
+         wl_buffer_destroy(m_pendingBuffer);
+         m_pendingBuffer = nullptr;
+     }
++    if (m_viewport) wp_viewport_destroy(m_viewport);
+     if (m_toplevel) xdg_toplevel_destroy(m_toplevel);
+     if (m_xdgSurface) xdg_surface_destroy(m_xdgSurface);
+     if (m_surface) wl_surface_destroy(m_surface);
++    m_viewport = nullptr;
+     m_toplevel = nullptr;
+     m_xdgSurface = nullptr;
+     m_surface = nullptr;
+     m_configured = false;
+-    m_mapped = false;
++    m_windowed = false;
++    if (m_mapped) {
++        m_mapped = false;
++        emit mappedChanged();
++    }
+ }
+ 
+ bool WaylandVideoSurface::ensureDmabuf()
+@@ -282,11 +300,44 @@ void WaylandVideoSurface::attachFrame(const Frame &frame)
+         wl_surface_damage(m_surface, 0, 0, frame.size.width(), frame.size.height());
+     wl_surface_commit(m_surface);
+     flushDisplay();
+-    m_mapped = true;
++    if (!m_mapped) {
++        m_mapped = true;
++        emit mappedChanged();
++    }
+     ++m_committed;
+     ++m_sampleCount;
+ }
+ 
++void WaylandVideoSurface::toggleWindowed()
++{
++    setWindowed(!m_windowed);
++}
++
++void WaylandVideoSurface::setWindowed(bool windowed)
++{
++    if (!m_surface || !m_toplevel || m_windowed == windowed) return;
++    m_windowed = windowed;
++    if (windowed) {
++        // A decorated window the user can move and close: the close button is
++        // the compositor's, and closing it ends the stream.
++        xdg_toplevel_unset_fullscreen(m_toplevel);
++        if (m_viewport)
++            wp_viewport_set_destination(m_viewport, kWindowWidth, kWindowHeight);
++        wl_surface_set_input_region(m_surface, nullptr);
++    } else {
++        xdg_toplevel_set_fullscreen(m_toplevel, nullptr);
++        if (m_viewport) wp_viewport_set_destination(m_viewport, -1, -1);
++        if (wl_region *region = wl_compositor_create_region(m_compositor)) {
++            wl_surface_set_input_region(m_surface, region);
++            wl_region_destroy(region);
++        }
++    }
++    wl_surface_commit(m_surface);
++    flushDisplay();
++    qInfo("wayland-video: stream window %s", windowed ? "windowed" : "fullscreen");
++    emit windowedChanged();
++}
++
+ void WaylandVideoSurface::dismiss()
+ {
+     if (!m_surface) return;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 3472b7d6..955cc8a3 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -13,6 +13,8 @@ struct wl_surface;
+ struct xdg_surface;
+ struct xdg_toplevel;
+ struct xdg_wm_base;
++struct wp_viewport;
++struct wp_viewporter;
+ struct zwp_linux_dmabuf_v1;
+ 
+ // Presents decoded frames on a Wayland surface of its own instead of handing
+@@ -24,6 +26,8 @@ struct zwp_linux_dmabuf_v1;
+ class WaylandVideoSurface final : public QObject
+ {
+     Q_OBJECT
++    Q_PROPERTY(bool mapped READ isMapped NOTIFY mappedChanged)
++    Q_PROPERTY(bool windowed READ isWindowed NOTIFY windowedChanged)
+ public:
+     struct Frame {
+         int fd = -1;
+@@ -44,10 +48,25 @@ public:
+     void present(Frame frame);
+     void dismiss();
+ 
++    // Windowed mode is the interactive one: the compositor decorates the
++    // window, its close button works, and clicking it does not reach the game.
++    // Fullscreen mode is click-through so game input keeps reaching the
++    // interface window that forwards it.
++    Q_INVOKABLE void toggleWindowed();
++    void setWindowed(bool windowed);
++
+     [[nodiscard]] bool isMapped() const { return m_mapped; }
++    [[nodiscard]] bool isWindowed() const { return m_windowed; }
+     [[nodiscard]] quint64 committed() const { return m_committed; }
+     [[nodiscard]] quint64 dropped() const { return m_dropped; }
+ 
++signals:
++    // The compositor asked the stream window to close: the stream has no
++    // surface left, so the application has to stop it.
++    void closeRequested();
++    void mappedChanged();
++    void windowedChanged();
++
+ private:
+     explicit WaylandVideoSurface(QObject *parent = nullptr);
+     ~WaylandVideoSurface() override;
+@@ -78,8 +97,11 @@ private:
+     xdg_surface *m_xdgSurface = nullptr;
+     xdg_toplevel *m_toplevel = nullptr;
+     wl_buffer *m_pendingBuffer = nullptr;
++    wp_viewporter *m_viewporter = nullptr;
++    wp_viewport *m_viewport = nullptr;
+     bool m_configured = false;
+     bool m_mapped = false;
++    bool m_windowed = false;
+     quint64 m_committed = 0;
+     quint64 m_dropped = 0;
+     quint64 m_sampleStart = 0;

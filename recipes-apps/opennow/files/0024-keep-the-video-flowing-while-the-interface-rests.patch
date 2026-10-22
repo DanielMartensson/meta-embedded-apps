@@ -1,0 +1,100 @@
+Subject: [PATCH 0024] Repaint the interface on a slow clock and add a close trigger
+
+A frame is pulled during an interface repaint, so the interface decides how
+often the video advances. That is invisible on the home screen, where something
+is always animating, but a live session showed the real limit: with the stream
+window covering the interface, nothing inside it changes any more, Qt has
+nothing to redraw, and the video stalls whenever the interface stops painting.
+
+The interface window is asked to repaint on a clock of its own while the stream
+window exists. While the video still shares the interface's frame clock, that
+keeps it flowing; afterwards it keeps the interface drawn and set up, which is
+where the decoder receives its device.
+
+The compositor's close button cannot be aimed at without a display surface the
+stream window does not cover, so a development trigger does the same thing:
+creating /tmp/opennow-close closes the stream window, which must end the stream
+exactly like a click on the close button does.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/qml/Main.qml b/opennow-qt/qml/Main.qml
+index 0ebbd830..cb1f839f 100644
+--- a/opennow-qt/qml/Main.qml
++++ b/opennow-qt/qml/Main.qml
+@@ -246,6 +246,18 @@ ApplicationWindow {
+         }
+     }
+ 
++    // Each frame of the stream is pulled during an interface repaint, so the
++    // window has to keep repainting even when everything in it is static: with
++    // the stream window on top the interface underneath shows nothing but its
++    // backdrop, and Qt would otherwise stop rendering and freeze the video.
++    Timer {
++        objectName: "streamWindowRepaintTimer"
++        interval: 8
++        repeat: true
++        running: NativeVideoWindow.mapped
++        onTriggered: window.update()
++    }
++
+     Shortcut {
+         objectName: "shellFullscreenShortcut"
+         sequence: "F11"
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 6acead99..2a295bd6 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -257,6 +257,19 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+               image.height());
+         image.save(path);
+     });
++    // Development aid: creating /tmp/opennow-close does what the compositor's
++    // close button does to the stream window.
++    auto *closeTimer = new QTimer(&application);
++    closeTimer->setInterval(400);
++    QObject::connect(closeTimer, &QTimer::timeout, &application, [] {
++        const QString trigger = QStringLiteral("/tmp/opennow-close");
++        if (!QFile::exists(trigger)) return;
++        QFile::remove(trigger);
++#if defined(Q_OS_LINUX)
++        WaylandVideoSurface::instance()->simulateCloseForDevelopment();
++#endif
++    });
++    closeTimer->start();
+     grabTimer->start();
+ #endif
+     QObject::connect(&controller, &AppController::restartRequested, &application, [&] {
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 7a9020e6..e42016a5 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -427,6 +427,13 @@ void WaylandVideoSurface::setWindowed(bool windowed)
+     emit windowedChanged();
+ }
+ 
++void WaylandVideoSurface::simulateCloseForDevelopment()
++{
++    if (!m_mapped) return;
++    emit closeRequested();
++    dismiss();
++}
++
+ void WaylandVideoSurface::dismiss()
+ {
+     if (!m_surface) return;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index e63783c5..abbd096a 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -58,6 +58,10 @@ public:
+     Q_INVOKABLE void toggleWindowed();
+     void setWindowed(bool windowed);
+ 
++    // Development aid: behaves like the compositor's close button, so the
++    // stop-the-stream path can be exercised without aiming at a decoration.
++    void simulateCloseForDevelopment();
++
+     [[nodiscard]] bool isMapped() const { return m_mapped; }
+     [[nodiscard]] bool isWindowed() const { return m_windowed; }
+     [[nodiscard]] quint64 committed() const { return m_committed; }

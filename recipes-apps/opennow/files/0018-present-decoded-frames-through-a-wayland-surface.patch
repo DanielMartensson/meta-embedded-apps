@@ -1,0 +1,1001 @@
+Subject: [PATCH 0018] Present decoded frames through a Wayland surface
+
+The stream spends almost all of its GPU time turning the decoder's NV12 frame
+into RGBA and then sampling that copy into the scene graph. NV12 is exactly the
+format the display controller's overlay plane accepts, and the compositor can
+import a DMA-BUF without the GPU touching a pixel, which is how a hardware
+decoding sink reaches 1080p60 on this board.
+
+record_frame now hands the decoder's DMA-BUF to the client instead of converting
+it when OPENNOW_WAYLAND_VIDEO is set: it duplicates the descriptor, reports the
+two planes, and returns no GPU image. A new WaylandVideoSurface, built from
+Qt's own compositor connection with xdg-shell and linux-dmabuf, creates a
+fullscreen window for the stream and attaches one buffer per frame. The window
+ignores input so game input keeps travelling the path that already forwards it,
+and it is destroyed when the presentation tears down.
+
+This is the foundation for the stream window owning its own presentation; the
+controls and the close-to-stop handling follow in the next patch.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h b/native/opennow-streamer/crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h
+index 48342773..c86b6281 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h
++++ b/native/opennow-streamer/crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h
+@@ -205,6 +205,17 @@ typedef struct OpenNowStreamerRecordedFrame {
+     uint32_t frame_slot;
+     uint64_t generation;
+     uint64_t presentation_time_ns;
++    /* Set when the frame is presented by a compositor instead of sampled as a
++     * GPU texture: a duplicated decoder DMA-BUF (-1 when unused) that the
++     * receiver owns and closes, plus the two planes that describe it. */
++    int32_t dmabuf_fd;
++    uint32_t dmabuf_format;
++    uint64_t dmabuf_modifier;
++    uint32_t dmabuf_width;
++    uint32_t dmabuf_height;
++    uint32_t dmabuf_plane_count;
++    uint32_t dmabuf_plane_offset[2];
++    uint32_t dmabuf_plane_stride[2];
+ } OpenNowStreamerRecordedFrame;
+ 
+ #define OPENNOW_STREAMER_SDL_MAX_SOURCES 4u
+diff --git a/native/opennow-streamer/crates/opennow-streamer-ffi/src/lib.rs b/native/opennow-streamer/crates/opennow-streamer-ffi/src/lib.rs
+index 5eff4414..49e33c0d 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-ffi/src/lib.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-ffi/src/lib.rs
+@@ -381,6 +381,16 @@ pub struct OpenNowStreamerRecordedFrame {
+     pub frame_slot: u32,
+     pub generation: u64,
+     pub presentation_time_ns: u64,
++    /// Duplicated decoder DMA-BUF for compositor-side presentation, or -1.
++    /// The receiver owns and closes it.
++    pub dmabuf_fd: i32,
++    pub dmabuf_format: u32,
++    pub dmabuf_modifier: u64,
++    pub dmabuf_width: u32,
++    pub dmabuf_height: u32,
++    pub dmabuf_plane_count: u32,
++    pub dmabuf_plane_offset: [u32; 2],
++    pub dmabuf_plane_stride: [u32; 2],
+ }
+ 
+ pub struct OpenNowStreamerFrame {
+@@ -783,7 +793,12 @@ fn recorded_frame(
+     api: GraphicsApi,
+     frame: GraphicsRecordedFrame,
+ ) -> Result<OpenNowStreamerRecordedFrame, OpenNowStreamerStatus> {
+-    if frame.resource == 0 || frame.width == 0 || frame.height == 0 {
++    if (frame.resource == 0 && !frame.dmabuf.is_exported())
++        || frame.width == 0
++        || frame.height == 0
++    {
++        // A compositor-bound frame carries a DMA-BUF instead of a GPU texture,
++        // so it has no resource handles but is still presentable.
+         return Err(OpenNowStreamerStatus::RenderFailed);
+     }
+     if frame.color_space != opennow_streamer_platform::GraphicsColorSpace::Sdr709
+@@ -820,6 +835,14 @@ fn recorded_frame(
+         frame_slot: frame.frame_slot,
+         generation: frame.generation,
+         presentation_time_ns: frame.presentation_time_ns,
++        dmabuf_fd: frame.dmabuf.fd,
++        dmabuf_format: frame.dmabuf.format,
++        dmabuf_modifier: frame.dmabuf.modifier,
++        dmabuf_width: frame.dmabuf.width,
++        dmabuf_height: frame.dmabuf.height,
++        dmabuf_plane_count: frame.dmabuf.plane_count,
++        dmabuf_plane_offset: frame.dmabuf.plane_offset,
++        dmabuf_plane_stride: frame.dmabuf.plane_stride,
+     })
+ }
+ 
+@@ -2027,6 +2050,7 @@ mod tests {
+                         frame_slot: 0,
+                         generation: 7,
+                         presentation_time_ns: 123456789,
++                        dmabuf: Default::default(),
+                     },
+                 );
+                 if color_space != GraphicsColorSpace::Sdr709
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 3f3e774a..e38ae941 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -59,6 +59,44 @@ impl LinuxTextureColorSpace {
+     }
+ }
+ 
++/// A decoded frame handed to a compositor instead of converted on the GPU.
++///
++/// `fd` is a duplicate the receiver owns and closes; the remaining fields
++/// describe the DMA-BUF planes exactly as the kernel exported them, so a
++/// Wayland client can build a buffer without touching the pixels.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct DmabufExport {
++    pub fd: i32,
++    pub format: u32,
++    pub modifier: u64,
++    pub width: u32,
++    pub height: u32,
++    pub plane_count: u32,
++    pub plane_offset: [u32; 2],
++    pub plane_stride: [u32; 2],
++}
++
++impl Default for DmabufExport {
++    fn default() -> Self {
++        Self {
++            fd: -1,
++            format: 0,
++            modifier: 0,
++            width: 0,
++            height: 0,
++            plane_count: 0,
++            plane_offset: [0; 2],
++            plane_stride: [0; 2],
++        }
++    }
++}
++
++impl DmabufExport {
++    pub fn is_exported(&self) -> bool {
++        self.fd >= 0 && self.plane_count > 0
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct RecordedGpuFrame {
+     pub slot: u32,
+@@ -70,6 +108,7 @@ pub struct RecordedGpuFrame {
+     pub height: u32,
+     pub timestamp_us: u64,
+     pub color_space: LinuxTextureColorSpace,
++    pub dmabuf: DmabufExport,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -397,6 +436,56 @@ pub enum PreparedLinuxFrame {
+     Cpu(CpuNv12Frame),
+ }
+ 
++/// True when the client asked for frames to go to a Wayland surface instead of
++/// being converted on the GPU.
++fn wayland_video_requested() -> bool {
++    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *REQUESTED.get_or_init(|| std::env::var_os("OPENNOW_WAYLAND_VIDEO").is_some())
++}
++
++/// Duplicates the decoder's DMA-BUF into a [`DmabufExport`]. The receiver owns
++/// the returned descriptor. Frames whose planes do not share one object, or
++/// that are not DMA-BUFs at all, are left to the GPU path.
++fn export_dmabuf(frame: &DecodedVideoFrame) -> Option<DmabufExport> {
++    let dmabuf = frame.dmabuf.as_ref()?;
++    let layer = dmabuf.layers.first()?;
++    if layer.planes.is_empty() || layer.planes.len() > 2 {
++        return None;
++    }
++    let first = layer.planes[0];
++    if first.object_index >= dmabuf.objects.len()
++        || layer
++            .planes
++            .iter()
++            .any(|plane| plane.object_index != first.object_index)
++    {
++        return None;
++    }
++    let object = dmabuf.objects[first.object_index];
++    let fd = unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) };
++    if fd < 0 {
++        return None;
++    }
++    let height = match layer.planes.len() {
++        2 => crate::format::nv12_coded_height(&layer.planes[0], &layer.planes[1], frame.format.height),
++        _ => frame.format.height,
++    };
++    let mut export = DmabufExport {
++        fd,
++        format: layer.format,
++        modifier: object.format_modifier,
++        width: frame.format.width,
++        height,
++        plane_count: layer.planes.len() as u32,
++        ..DmabufExport::default()
++    };
++    for (index, plane) in layer.planes.iter().enumerate() {
++        export.plane_offset[index] = u32::try_from(plane.offset).ok()?;
++        export.plane_stride[index] = u32::try_from(plane.pitch).ok()?;
++    }
++    Some(export)
++}
++
+ impl PreparedLinuxFrame {
+     pub fn timestamp_us(&self) -> u64 {
+         self.source().timestamp_us
+@@ -628,6 +717,25 @@ impl LinuxFrameProducer {
+         let chroma_location = frame.format.chroma_location;
+         let color_space = LinuxTextureColorSpace::from_format(frame.format)?;
+         let texture_format = GpuTextureFormat::for_stream_format(frame.format)?;
++        if wayland_video_requested() {
++            // A compositor that can take the decoder's DMA-BUF straight to a
++            // plane needs neither the conversion pass nor a GPU image, so hand
++            // the frame over untouched instead of converting it first.
++            if let Some(dmabuf) = export_dmabuf(&frame) {
++                return Ok(RecordedGpuFrame {
++                    slot,
++                    generation: self.generation,
++                    image: 0,
++                    image_view: 0,
++                    texture_format,
++                    width: dmabuf.width,
++                    height: dmabuf.height,
++                    timestamp_us,
++                    color_space,
++                    dmabuf,
++                });
++            }
++        }
+         let prepared = self.prepare(frame)?;
+         self.ensure_renderer(texture_format)?;
+         self.ensure_slot(slot_index, width, height, texture_format)?;
+@@ -678,6 +786,7 @@ impl LinuxFrameProducer {
+             height,
+             timestamp_us,
+             color_space,
++            dmabuf: DmabufExport::default(),
+         })
+     }
+ 
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs
+index 2b0e7273..d5e6b03d 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs
+@@ -56,7 +56,8 @@ pub use format::{
+ };
+ #[cfg(all(target_os = "linux", feature = "vulkan"))]
+ pub use frame_producer::{
+-    CpuNv12Frame, GpuTextureFormat, ImportedNv12Frame, LinuxFrameProducer, LinuxGpuFrame,
++    CpuNv12Frame, DmabufExport, GpuTextureFormat, ImportedNv12Frame, LinuxFrameProducer,
++    LinuxGpuFrame,
+     LinuxGpuFrameProducer, LinuxGpuRenderResources, LinuxTextureColorSpace, PreparedLinuxFrame,
+     PreparedVulkanFrame, PreparedVulkanImage, RecordedGpuFrame, VulkanRenderDevice,
+ };
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform/src/graphics.rs b/native/opennow-streamer/crates/opennow-streamer-platform/src/graphics.rs
+index 1704458e..526fd0cf 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/graphics.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/graphics.rs
+@@ -87,6 +87,42 @@ impl GraphicsRecordCommand {
+     }
+ }
+ 
++/// The decoder's DMA-BUF, as exported on Linux so a compositor can import it
++/// directly instead of sampling a converted copy. Other platforms leave every
++/// field at its default.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct DmabufExport {
++    pub fd: i32,
++    pub format: u32,
++    pub modifier: u64,
++    pub width: u32,
++    pub height: u32,
++    pub plane_count: u32,
++    pub plane_offset: [u32; 2],
++    pub plane_stride: [u32; 2],
++}
++
++impl Default for DmabufExport {
++    fn default() -> Self {
++        Self {
++            fd: -1,
++            format: 0,
++            modifier: 0,
++            width: 0,
++            height: 0,
++            plane_count: 0,
++            plane_offset: [0; 2],
++            plane_stride: [0; 2],
++        }
++    }
++}
++
++impl DmabufExport {
++    pub fn is_exported(&self) -> bool {
++        self.fd >= 0 && self.plane_count > 0
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct GraphicsRecordedFrame {
+     pub resource: u64,
+@@ -98,6 +134,7 @@ pub struct GraphicsRecordedFrame {
+     pub frame_slot: u32,
+     pub generation: u64,
+     pub presentation_time_ns: u64,
++    pub dmabuf: DmabufExport,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -199,6 +236,16 @@ impl GraphicsFrame for opennow_streamer_platform_linux::LinuxGpuFrame {
+         })?;
+         Ok(GraphicsRecordedFrame {
+             resource: frame.image,
++            dmabuf: DmabufExport {
++                fd: frame.dmabuf.fd,
++                format: frame.dmabuf.format,
++                modifier: frame.dmabuf.modifier,
++                width: frame.dmabuf.width,
++                height: frame.dmabuf.height,
++                plane_count: frame.dmabuf.plane_count,
++                plane_offset: frame.dmabuf.plane_offset,
++                plane_stride: frame.dmabuf.plane_stride,
++            },
+             resource_view: frame.image_view,
+             texture_format: match frame.texture_format {
+                 opennow_streamer_platform_linux::GpuTextureFormat::Rgba8 => {
+@@ -271,6 +318,7 @@ impl GraphicsFrame for opennow_streamer_platform_macos::MetalFrame {
+         let color_space = macos_frame_color_space(frame.color_space, frame.transfer, frame.format)?;
+         Ok(GraphicsRecordedFrame {
+             resource: frame.texture as usize as u64,
++            dmabuf: DmabufExport::default(),
+             resource_view: 0,
+             color_space,
+             texture_format: match frame.format {
+@@ -842,6 +890,7 @@ mod tests {
+                 .push((context, command));
+             Ok(GraphicsRecordedFrame {
+                 resource: 10,
++                dmabuf: DmabufExport::default(),
+                 resource_view: 11,
+                 texture_format: GraphicsTextureFormat::Rgba8,
+                 color_space: GraphicsColorSpace::Sdr709,
+@@ -955,6 +1004,7 @@ mod tests {
+             ) -> Result<GraphicsRecordedFrame, GraphicsFrameError> {
+                 Ok(GraphicsRecordedFrame {
+                     resource: 10,
++                    dmabuf: DmabufExport::default(),
+                     resource_view: 11,
+                     texture_format: GraphicsTextureFormat::Rgba8,
+                     color_space: GraphicsColorSpace::Sdr709,
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs b/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs
+index 9273f87f..6658ee05 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs
+@@ -2284,6 +2284,7 @@ impl EmbeddedD3d11State {
+         Ok((
+             crate::GraphicsRecordedFrame {
+                 resource: recorded.texture as usize as u64,
++                dmabuf: crate::DmabufExport::default(),
+                 resource_view: 0,
+                 color_space: recorded.color_space.into(),
+                 texture_format: match recorded.texture_format {
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform/src/windows_graphics.rs b/native/opennow-streamer/crates/opennow-streamer-platform/src/windows_graphics.rs
+index fb0a2774..f5c1d546 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/windows_graphics.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/windows_graphics.rs
+@@ -54,6 +54,7 @@ impl GraphicsFrame for D3d11Frame {
+         .map_err(|error| error.to_string())?;
+         Ok(GraphicsRecordedFrame {
+             resource: frame.texture as usize as u64,
++            dmabuf: crate::DmabufExport::default(),
+             resource_view: 0,
+             color_space: frame.color_space.into(),
+             texture_format: match frame.texture_format {
+diff --git a/opennow-qt/CMakeLists.txt b/opennow-qt/CMakeLists.txt
+index 0115533e..9dc2e247 100644
+--- a/opennow-qt/CMakeLists.txt
++++ b/opennow-qt/CMakeLists.txt
+@@ -96,7 +96,9 @@ target_link_libraries(opennow-qt PRIVATE
+     SDL3::SDL3
+ )
+ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+-    target_link_libraries(opennow-qt PRIVATE Vulkan::Vulkan PkgConfig::WAYLAND_CLIENT)
++    include(cmake/PlatformVideo.cmake)
++    target_link_libraries(opennow-qt PRIVATE Vulkan::Vulkan PkgConfig::WAYLAND_CLIENT
++        opennow-platform-video)
+     target_compile_definitions(opennow-qt PRIVATE OPENNOW_WAYLAND_DECORATIONS)
+ elseif(APPLE)
+     target_link_libraries(opennow-qt PRIVATE Qt6::Svg)
+diff --git a/opennow-qt/cmake/PlatformVideo.cmake b/opennow-qt/cmake/PlatformVideo.cmake
+new file mode 100644
+index 00000000..f3fcfd2b
+--- /dev/null
++++ b/opennow-qt/cmake/PlatformVideo.cmake
+@@ -0,0 +1,39 @@
++add_library(opennow-platform-video STATIC
++    "${CMAKE_CURRENT_LIST_DIR}/../src/streaming/rendering/WaylandVideoSurface.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/../src/streaming/rendering/WaylandVideoSurface.h")
++target_link_libraries(opennow-platform-video PUBLIC Qt6::Gui PRIVATE Qt6::GuiPrivate)
++target_include_directories(opennow-platform-video PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../src")
++
++# The stream window needs a plain Wayland connection to the compositor Qt is
++# already using, plus the two protocols that turn the decoder's DMA-BUFs into
++# buffers: xdg-shell for the window and linux-dmabuf for the frame memory.
++enable_language(C)
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(VIDEO_WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
++pkg_check_modules(VIDEO_WAYLAND_PROTOCOLS REQUIRED wayland-protocols)
++pkg_get_variable(VIDEO_WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
++find_program(VIDEO_WAYLAND_SCANNER wayland-scanner REQUIRED)
++
++set(OPENNOW_VIDEO_PROTOCOL_DIR "${CMAKE_CURRENT_BINARY_DIR}/video-protocols")
++file(MAKE_DIRECTORY "${OPENNOW_VIDEO_PROTOCOL_DIR}")
++
++set(OPENNOW_VIDEO_PROTOCOLS
++    "xdg-shell|stable/xdg-shell/xdg-shell.xml"
++    "linux-dmabuf-unstable-v1|unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml")
++foreach(entry IN LISTS OPENNOW_VIDEO_PROTOCOLS)
++    string(REPLACE "|" ";" parts "${entry}")
++    list(GET parts 0 protocol_name)
++    list(GET parts 1 protocol_relative)
++    set(protocol_xml "${VIDEO_WAYLAND_PROTOCOLS_DIR}/${protocol_relative}")
++    set(protocol_header "${OPENNOW_VIDEO_PROTOCOL_DIR}/${protocol_name}-client-protocol.h")
++    set(protocol_code "${OPENNOW_VIDEO_PROTOCOL_DIR}/${protocol_name}-protocol.c")
++    add_custom_command(OUTPUT "${protocol_header}" "${protocol_code}"
++        COMMAND "${VIDEO_WAYLAND_SCANNER}" client-header "${protocol_xml}" "${protocol_header}"
++        COMMAND "${VIDEO_WAYLAND_SCANNER}" private-code "${protocol_xml}" "${protocol_code}"
++        DEPENDS "${protocol_xml}" VERBATIM)
++    target_sources(opennow-platform-video PRIVATE "${protocol_header}" "${protocol_code}")
++endforeach()
++target_include_directories(opennow-platform-video PRIVATE "${OPENNOW_VIDEO_PROTOCOL_DIR}")
++target_compile_definitions(opennow-platform-video PRIVATE OPENNOW_WAYLAND_VIDEO)
++target_link_libraries(opennow-platform-video PRIVATE PkgConfig::VIDEO_WAYLAND_CLIENT)
++message(STATUS "Wayland stream window enabled with xdg-shell and linux-dmabuf")
+diff --git a/opennow-qt/cmake/Tests.cmake b/opennow-qt/cmake/Tests.cmake
+index e4a20b9c..891453ac 100644
+--- a/opennow-qt/cmake/Tests.cmake
++++ b/opennow-qt/cmake/Tests.cmake
+@@ -1029,7 +1029,8 @@ if(BUILD_TESTING)
+         target_link_libraries(opennow-streamvideo-tests PRIVATE user32)
+     endif()
+     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+-        target_link_libraries(opennow-streamvideo-tests PRIVATE Vulkan::Vulkan)
++        target_link_libraries(opennow-streamvideo-tests PRIVATE Vulkan::Vulkan
++            opennow-platform-video)
+     endif()
+     add_dependencies(opennow-streamvideo-tests opennow-streamer-ffi-build)
+     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+@@ -1045,7 +1046,8 @@ if(BUILD_TESTING)
+         target_link_libraries(opennow-nativeframegeneration-tests PRIVATE
+             Qt6::Test Qt6::GuiPrivate Qt6::Quick Qt6::QuickPrivate opennow-streamer-ffi opennow-platform-hdr)
+         if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+-            target_link_libraries(opennow-nativeframegeneration-tests PRIVATE Vulkan::Vulkan)
++            target_link_libraries(opennow-nativeframegeneration-tests PRIVATE Vulkan::Vulkan
++                opennow-platform-video)
+         endif()
+         add_dependencies(opennow-nativeframegeneration-tests opennow-streamer-ffi-build)
+         qt_add_shaders(opennow-nativeframegeneration-tests "opennow-native-framegen-test-shaders"
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 06930fe9..699ec9f4 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -10,6 +10,9 @@
+ #include "input/SonySnapshotWire.h"
+ #include "localization/Localization.h"
+ #include "streaming/rendering/LinuxVulkanGraphics.h"
++#if defined(Q_OS_LINUX)
++#include "streaming/rendering/WaylandVideoSurface.h"
++#endif
+ #include "streaming/rendering/HdrOutput.h"
+ #include "streaming/rendering/HdrChromeEffect.h"
+ #ifdef OPENNOW_EMBEDDED_STREAMER
+@@ -160,15 +163,7 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     QGuiApplication::setOrganizationName(u"OpenCloudGaming"_s);
+     QGuiApplication::setOrganizationDomain(u"opennow.app"_s);
+     QGuiApplication::setApplicationVersion(QString::fromLatin1(OPENNOW_VERSION));
+-    // A window with an alpha channel makes the Wayland surface translucent, so
+-    // the compositor has to blend the whole full-screen video buffer every
+-    // frame. On the STM32MP25 the Vivante GCNANO is already the bottleneck of
+-    // the streaming path, so the distro can run the window opaque and let the
+-    // DRM backend hand the buffer to a plane instead. OPENNOW_OPAQUE_WINDOW=1
+-    // enables that; the default keeps the upstream alpha window.
+-    const bool opaqueWindow =
+-        qEnvironmentVariable("OPENNOW_OPAQUE_WINDOW") == u"1"_s;
+-    QQuickWindow::setDefaultAlphaBuffer(!opaqueWindow);
++    QQuickWindow::setDefaultAlphaBuffer(true);
+     QQuickWindow::setTextRenderType(QQuickWindow::QtTextRendering);
+ #if defined(Q_OS_WIN)
+     QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11);
+@@ -196,6 +191,12 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     QGuiApplication::setWindowIcon(applicationIcon);
+ #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
+     LinuxVulkanGraphics::requestDeviceExtensions();
++#endif
++#if defined(Q_OS_LINUX)
++    // The stream window talks Wayland directly, so it must be created here on
++    // the GUI thread with the connection quiet; the render thread only posts
++    // frames to it later.
++    if (WaylandVideoSurface::environmentEnabled()) WaylandVideoSurface::instance();
+ #endif
+     registerStreamVideoItemQmlType();
+     qSetMessagePattern(u"%{time yyyy-MM-ddTHH:mm:ss.zzz} %{type} %{category}: %{message}"_s);
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 5829d2c5..ef934da9 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -1,5 +1,8 @@
+ #include "streaming/rendering/NativeStreamRenderCallback.h"
+ #include "streaming/rendering/HdrOutput.h"
++#if defined(Q_OS_LINUX)
++#include "streaming/rendering/WaylandVideoSurface.h"
++#endif
+ 
+ #include "streaming/NativeStreamRuntime.h"
+ #include "streaming/rendering/LinuxVulkanGraphics.h"
+@@ -13,6 +16,7 @@
+ #include <rhi/qrhi.h>
+ #include <rhi/qrhi_platform.h>
+ #include <QDebug>
++#include <QMetaObject>
+ 
+ #include <utility>
+ #include <atomic>
+@@ -230,6 +234,36 @@ public:
+             prepareOriginal();
+             return;
+         }
++#if defined(Q_OS_LINUX)
++        // A compositor-bound frame carries the decoder's DMA-BUF instead of a
++        // converted GPU texture. Handing it to the stream window keeps the
++        // whole 1080p conversion and the sampled copy out of the frame, which
++        // is what the GPU cannot afford on this board.
++        if (status == OPENNOW_STREAMER_OK && frame && recorded.dmabuf_fd >= 0
++                && WaylandVideoSurface::environmentEnabled()) {
++            WaylandVideoSurface::Frame videoFrame;
++            videoFrame.fd = recorded.dmabuf_fd;
++            videoFrame.format = recorded.dmabuf_format;
++            videoFrame.modifier = recorded.dmabuf_modifier;
++            videoFrame.size = QSize(int(recorded.dmabuf_width), int(recorded.dmabuf_height));
++            videoFrame.planeCount = recorded.dmabuf_plane_count;
++            for (int plane = 0; plane < 2; ++plane) {
++                videoFrame.offsets[plane] = recorded.dmabuf_plane_offset[plane];
++                videoFrame.strides[plane] = recorded.dmabuf_plane_stride[plane];
++            }
++            auto *surface = WaylandVideoSurface::instance();
++            QMetaObject::invokeMethod(surface, [surface, videoFrame] {
++                surface->present(videoFrame);
++            }, Qt::QueuedConnection);
++            m_waylandVideo = true;
++            m_runtime->releaseFrame(frame);
++            m_outputKind = 0;
++            m_outputDirty = false;
++            m_needsFrame.store(true);
++            return;
++        }
++        m_waylandVideo = false;
++#endif
+         if (status == OPENNOW_STREAMER_GRAPHICS_UNSUPPORTED) {
+             if (frame) m_runtime->releaseFrame(frame);
+             reportFailure(QStringLiteral("OpenNOW's current Vulkan graphics device cannot import the hardware decoder's video frames, so reconnecting would fail the same way. Select Video backend: Software (CPU) in Stream settings, or export diagnostics. Your cloud session is still running."),
+@@ -478,7 +512,8 @@ public:
+         ++m_renderCount;
+         if (!m_runtime || !m_runtime->presentationAllowed()
+                 || m_presentationGeneration != m_runtime->presentationGeneration()) return;
+-        m_textures.render(commandBuffer, m_stencil, m_stencilReference);
++        if (!m_waylandVideo)
++            m_textures.render(commandBuffer, m_stencil, m_stencilReference);
+         if (m_outputDirty) {
+             m_submittedKind.store(m_outputKind);
+             m_outputDirty = false;
+@@ -500,6 +535,14 @@ public:
+ 
+     void tearDownResources(bool ownRearm, bool deviceChanged, bool generationChanged)
+     {
++#if defined(Q_OS_LINUX)
++        if (m_waylandVideo) {
++            m_waylandVideo = false;
++            auto *surface = WaylandVideoSurface::instance();
++            QMetaObject::invokeMethod(surface, [surface] { surface->dismiss(); },
++                                      Qt::QueuedConnection);
++        }
++#endif
+         m_swapStall.onResourcesReleased(ownRearm, deviceChanged, generationChanged);
+         if (m_rhi && m_graphicsReady) m_rhi->finish();
+         finishFrame();
+@@ -576,6 +619,7 @@ private:
+     bool m_outputDirty = false;
+     int m_outputKind = 0;
+     std::atomic_bool m_needsFrame = false;
++    std::atomic_bool m_waylandVideo = false;
+     std::atomic_bool m_midpointSwapped = false;
+     std::atomic_int m_submittedKind = 0;
+     std::atomic<FrameGenerationState> m_frameGenerationStatus = FrameGenerationState::Off;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+new file mode 100644
+index 00000000..758cfd11
+--- /dev/null
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -0,0 +1,300 @@
++#include "streaming/rendering/WaylandVideoSurface.h"
++
++#include <QDebug>
++#include <QGuiApplication>
++#include <QMetaObject>
++#include <QtGui/qguiapplication_platform.h>
++
++#include <algorithm>
++#include <cstring>
++#include <ctime>
++#include <unistd.h>
++#include <wayland-client.h>
++
++#include "linux-dmabuf-unstable-v1-client-protocol.h"
++#include "xdg-shell-client-protocol.h"
++
++namespace {
++
++wl_display *qtWaylandDisplay()
++{
++    auto *native = qGuiApp
++        ? qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>() : nullptr;
++    return native ? native->display() : nullptr;
++}
++
++quint64 monotonicNs()
++{
++    timespec ts{};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return quint64(ts.tv_sec) * 1'000'000'000ull + quint64(ts.tv_nsec);
++}
++
++}  // namespace
++
++WaylandVideoSurface::WaylandVideoSurface(QObject *parent)
++    : QObject(parent)
++{
++}
++
++WaylandVideoSurface::~WaylandVideoSurface()
++{
++    dismiss();
++    if (m_dmabuf) zwp_linux_dmabuf_v1_destroy(m_dmabuf);
++    if (m_shell) xdg_wm_base_destroy(m_shell);
++    if (m_compositor) wl_compositor_destroy(m_compositor);
++    if (m_registry) wl_registry_destroy(m_registry);
++    if (m_display) wl_display_flush(m_display);
++    m_dmabuf = nullptr;
++    m_shell = nullptr;
++    m_compositor = nullptr;
++    m_registry = nullptr;
++    m_display = nullptr;
++}
++
++WaylandVideoSurface *WaylandVideoSurface::instance()
++{
++    static WaylandVideoSurface *surface = nullptr;
++    if (!surface) surface = new WaylandVideoSurface();
++    return surface;
++}
++
++bool WaylandVideoSurface::environmentEnabled()
++{
++    static const bool enabled = qEnvironmentVariableIsSet("OPENNOW_WAYLAND_VIDEO");
++    return enabled;
++}
++
++void WaylandVideoSurface::handleGlobal(void *data, wl_registry *registry, quint32 name,
++                                       const char *interface, quint32 version)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    if (std::strcmp(interface, wl_compositor_interface.name) == 0) {
++        const quint32 bindVersion = std::min(version, 4u);
++        self->m_compositor = static_cast<wl_compositor *>(
++            wl_registry_bind(registry, name, &wl_compositor_interface, bindVersion));
++    } else if (std::strcmp(interface, xdg_wm_base_interface.name) == 0) {
++        self->m_shell = static_cast<xdg_wm_base *>(
++            wl_registry_bind(registry, name, &xdg_wm_base_interface, std::min(version, 2u)));
++        static const xdg_wm_base_listener shellListener = [] {
++            xdg_wm_base_listener listener{};
++            listener.ping = handlePing;
++            return listener;
++        }();
++        xdg_wm_base_add_listener(self->m_shell, &shellListener, self);
++    } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
++        self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
++            wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
++                             std::min(version, 3u)));
++    }
++}
++
++void WaylandVideoSurface::handleGlobalRemove(void *, wl_registry *, quint32)
++{
++}
++
++void WaylandVideoSurface::handlePing(void *, xdg_wm_base *shell, quint32 serial)
++{
++    xdg_wm_base_pong(shell, serial);
++}
++
++void WaylandVideoSurface::handleConfigure(void *data, xdg_surface *surface, quint32 serial)
++{
++    xdg_surface_ack_configure(surface, serial);
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->m_configured = true;
++}
++
++void WaylandVideoSurface::handleToplevelConfigure(void *, xdg_toplevel *, qint32, qint32,
++                                                  wl_array *)
++{
++}
++
++void WaylandVideoSurface::handleToplevelClose(void *data, xdg_toplevel *)
++{
++    // Closing the stream window must end the stream, not leave a black window
++    // covering the interface. The compositor sends this for its own close
++    // button and for anything else that asks the window to go away. The surface
++    // cannot be destroyed inside its own event dispatch, so defer it.
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    QMetaObject::invokeMethod(self, [self] { self->dismiss(); }, Qt::QueuedConnection);
++}
++
++void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
++{
++    Q_UNUSED(data);
++    wl_buffer_destroy(buffer);
++}
++
++bool WaylandVideoSurface::ensureSurface()
++{
++    if (m_surface) return true;
++    if (!m_display) m_display = qtWaylandDisplay();
++    if (!m_display) {
++        qWarning("wayland-video: Qt has no Wayland display, cannot create the stream window");
++        return false;
++    }
++    if (!m_registry) {
++        m_registry = wl_display_get_registry(m_display);
++        static const wl_registry_listener registryListener = [] {
++            wl_registry_listener listener{};
++            listener.global = handleGlobal;
++            listener.global_remove = handleGlobalRemove;
++            return listener;
++        }();
++        wl_registry_add_listener(m_registry, &registryListener, this);
++        wl_display_roundtrip(m_display);
++    }
++    if (!m_compositor || !m_shell) {
++        qWarning("wayland-video: compositor globals missing (compositor=%p shell=%p)",
++                 static_cast<void *>(m_compositor), static_cast<void *>(m_shell));
++        return false;
++    }
++
++    m_surface = wl_compositor_create_surface(m_compositor);
++    m_xdgSurface = xdg_wm_base_get_xdg_surface(m_shell, m_surface);
++    static const xdg_surface_listener surfaceListener = [] {
++        xdg_surface_listener listener{};
++        listener.configure = handleConfigure;
++        return listener;
++    }();
++    xdg_surface_add_listener(m_xdgSurface, &surfaceListener, this);
++    m_toplevel = xdg_surface_get_toplevel(m_xdgSurface);
++    static const xdg_toplevel_listener toplevelListener = [] {
++        xdg_toplevel_listener listener{};
++        listener.configure = handleToplevelConfigure;
++        listener.close = handleToplevelClose;
++        return listener;
++    }();
++    xdg_toplevel_add_listener(m_toplevel, &toplevelListener, this);
++    xdg_toplevel_set_app_id(m_toplevel, "opennow-video");
++    xdg_toplevel_set_title(m_toplevel, "OpenNOW stream");
++    xdg_toplevel_set_fullscreen(m_toplevel, nullptr);
++
++    // The Qt window underneath keeps the input focus: game input travels the
++    // path that already forwards it to the host, and this surface never eats a
++    // click meant for the interface.
++    if (wl_region *region = wl_compositor_create_region(m_compositor)) {
++        wl_surface_set_input_region(m_surface, region);
++        wl_region_destroy(region);
++    }
++    wl_surface_commit(m_surface);
++    wl_display_roundtrip(m_display);
++    if (!m_configured) {
++        qWarning("wayland-video: the compositor sent no configure event");
++        destroySurface();
++        return false;
++    }
++    qInfo("wayland-video: stream window created");
++    return true;
++}
++
++void WaylandVideoSurface::destroySurface()
++{
++    if (m_pendingBuffer) {
++        wl_buffer_destroy(m_pendingBuffer);
++        m_pendingBuffer = nullptr;
++    }
++    if (m_toplevel) xdg_toplevel_destroy(m_toplevel);
++    if (m_xdgSurface) xdg_surface_destroy(m_xdgSurface);
++    if (m_surface) wl_surface_destroy(m_surface);
++    m_toplevel = nullptr;
++    m_xdgSurface = nullptr;
++    m_surface = nullptr;
++    m_configured = false;
++    m_mapped = false;
++}
++
++bool WaylandVideoSurface::ensureDmabuf()
++{
++    return m_dmabuf != nullptr;
++}
++
++void WaylandVideoSurface::flushDisplay()
++{
++    if (m_display) wl_display_flush(m_display);
++}
++
++void WaylandVideoSurface::present(Frame frame)
++{
++    if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
++            && frame.size.height() > 0) {
++        if (ensureSurface() && ensureDmabuf() && m_configured) {
++            attachFrame(frame);
++        } else {
++            ++m_dropped;
++        }
++    }
++    if (frame.fd >= 0) close(frame.fd);
++
++    const quint64 now = monotonicNs();
++    if (m_sampleStart == 0) {
++        m_sampleStart = now;
++        m_sampleCount = 0;
++    } else if (now - m_sampleStart >= 1'000'000'000ull) {
++        const double fps = double(m_sampleCount) * 1.0e9 / double(now - m_sampleStart);
++        m_sampleStart = now;
++        m_sampleCount = 0;
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
++            qInfo("wayland-video fps=%.1f committed=%llu dropped=%llu",
++                  fps, m_committed, m_dropped);
++    }
++}
++
++void WaylandVideoSurface::attachFrame(const Frame &frame)
++{
++    zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
++    if (!params) {
++        ++m_dropped;
++        return;
++    }
++    const quint32 planes = std::min<quint32>(frame.planeCount, 2);
++    for (quint32 plane = 0; plane < planes; ++plane) {
++        zwp_linux_buffer_params_v1_add(params, frame.fd, int(plane), frame.offsets[plane],
++                                       frame.strides[plane],
++                                       quint32(frame.modifier >> 32),
++                                       quint32(frame.modifier & 0xffffffffu));
++    }
++    wl_buffer *buffer = zwp_linux_buffer_params_v1_create_immed(
++        params, quint32(frame.size.width()), quint32(frame.size.height()), frame.format, 0);
++    zwp_linux_buffer_params_v1_destroy(params);
++    if (!buffer) {
++        ++m_dropped;
++        return;
++    }
++    static const wl_buffer_listener bufferListener = [] {
++        wl_buffer_listener listener{};
++        listener.release = handleBufferRelease;
++        return listener;
++    }();
++    wl_buffer_add_listener(buffer, &bufferListener, this);
++
++    if (m_pendingBuffer) {
++        // The compositor already has the previous frame; this one replaces it.
++        wl_buffer_destroy(m_pendingBuffer);
++    }
++    m_pendingBuffer = buffer;
++    wl_surface_attach(m_surface, buffer, 0, 0);
++    if (wl_proxy_get_version(reinterpret_cast<wl_proxy *>(m_surface)) >= 4)
++        wl_surface_damage_buffer(m_surface, 0, 0, frame.size.width(), frame.size.height());
++    else
++        wl_surface_damage(m_surface, 0, 0, frame.size.width(), frame.size.height());
++    wl_surface_commit(m_surface);
++    flushDisplay();
++    m_mapped = true;
++    ++m_committed;
++    ++m_sampleCount;
++}
++
++void WaylandVideoSurface::dismiss()
++{
++    if (!m_surface) return;
++    wl_surface_attach(m_surface, nullptr, 0, 0);
++    wl_surface_commit(m_surface);
++    flushDisplay();
++    destroySurface();
++    m_committed = 0;
++    m_sampleStart = 0;
++    qInfo("wayland-video: stream window closed");
++}
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+new file mode 100644
+index 00000000..3472b7d6
+--- /dev/null
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -0,0 +1,87 @@
++#pragma once
++
++#include <QObject>
++#include <QSize>
++#include <cstdint>
++
++struct wl_array;
++struct wl_buffer;
++struct wl_compositor;
++struct wl_display;
++struct wl_registry;
++struct wl_surface;
++struct xdg_surface;
++struct xdg_toplevel;
++struct xdg_wm_base;
++struct zwp_linux_dmabuf_v1;
++
++// Presents decoded frames on a Wayland surface of its own instead of handing
++// them to the Qt scene graph. The decoder writes NV12 into a DMA-BUF that the
++// compositor can take straight to a plane, so nothing on the GPU has to convert
++// or copy a 1080p frame before it reaches the screen. The surface is created on
++// demand, ignores input (the Qt window underneath keeps receiving it) and is
++// torn down when the stream ends.
++class WaylandVideoSurface final : public QObject
++{
++    Q_OBJECT
++public:
++    struct Frame {
++        int fd = -1;
++        quint32 format = 0;
++        quint64 modifier = 0;
++        QSize size;
++        quint32 planeCount = 0;
++        quint32 offsets[2] = {0, 0};
++        quint32 strides[2] = {0, 0};
++    };
++
++    // One process-wide surface: the compositor connection comes from Qt, and a
++    // stream has exactly one video window.
++    static WaylandVideoSurface *instance();
++    static bool environmentEnabled();
++
++    // Takes ownership of frame.fd and closes it whatever happens.
++    void present(Frame frame);
++    void dismiss();
++
++    [[nodiscard]] bool isMapped() const { return m_mapped; }
++    [[nodiscard]] quint64 committed() const { return m_committed; }
++    [[nodiscard]] quint64 dropped() const { return m_dropped; }
++
++private:
++    explicit WaylandVideoSurface(QObject *parent = nullptr);
++    ~WaylandVideoSurface() override;
++
++    bool ensureSurface();
++    void destroySurface();
++    bool ensureDmabuf();
++    void attachFrame(const Frame &frame);
++    void flushDisplay();
++
++    static void handleGlobal(void *data, wl_registry *registry, quint32 name,
++                             const char *interface, quint32 version);
++    static void handleGlobalRemove(void *data, wl_registry *registry, quint32 name);
++    static void handlePing(void *data, xdg_wm_base *shell, quint32 serial);
++    static void handleConfigure(void *data, xdg_surface *surface, quint32 serial);
++    static void handleToplevelConfigure(void *data, xdg_toplevel *toplevel,
++                                       qint32 width, qint32 height, wl_array *states);
++    static void handleToplevelClose(void *data, xdg_toplevel *toplevel);
++    static void handleBufferRelease(void *data, wl_buffer *buffer);
++
++    wl_display *m_display = nullptr;
++    wl_registry *m_registry = nullptr;
++    wl_compositor *m_compositor = nullptr;
++    xdg_wm_base *m_shell = nullptr;
++    zwp_linux_dmabuf_v1 *m_dmabuf = nullptr;
++
++    wl_surface *m_surface = nullptr;
++    xdg_surface *m_xdgSurface = nullptr;
++    xdg_toplevel *m_toplevel = nullptr;
++    wl_buffer *m_pendingBuffer = nullptr;
++    bool m_configured = false;
++    bool m_mapped = false;
++    quint64 m_committed = 0;
++    quint64 m_dropped = 0;
++    quint64 m_sampleStart = 0;
++    quint64 m_sampleCount = 0;
++};

@@ -1,0 +1,56 @@
+Subject: [PATCH 0026] Make the stream window the default presentation path
+
+The compositor path went from six to about thirty frames a second on the reference
+board and leaves the audio path untouched, so it should not need an environment
+variable to be used. It is now the default, and OPENNOW_WAYLAND_VIDEO=0 brings
+back upstream's presentation inside the interface.
+
+Both halves have to agree on this: the application decides whether to create the
+stream window, and the native side decides whether to export the DMA-BUF instead
+of converting it into a texture. A frame that is exported while the application
+shows the interface, or converted while it wants a compositor surface, would
+leave a black picture with no error.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 4bbfc3e6..81253d52 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -440,7 +440,16 @@ pub enum PreparedLinuxFrame {
+ /// being converted on the GPU.
+ fn wayland_video_requested() -> bool {
+     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *REQUESTED.get_or_init(|| std::env::var_os("OPENNOW_WAYLAND_VIDEO").is_some())
++    *REQUESTED.get_or_init(|| match std::env::var_os("OPENNOW_WAYLAND_VIDEO") {
++        // The compositor path is the default here; only an explicit "off" keeps
++        // the frame inside the interface. This has to agree with
++        // WaylandVideoSurface::environmentEnabled() in the application.
++        Some(value) => {
++            let value = value.to_string_lossy().to_ascii_lowercase();
++            value != "0" && value != "false"
++        }
++        None => true,
++    })
+ }
+ 
+ /// Duplicates the decoder's DMA-BUF into a [`DmabufExport`]. The receiver owns
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index dd1e459e..ba9cd728 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -68,7 +68,13 @@ WaylandVideoSurface *WaylandVideoSurface::instance()
+ 
+ bool WaylandVideoSurface::environmentEnabled()
+ {
+-    static const bool enabled = qEnvironmentVariableIsSet("OPENNOW_WAYLAND_VIDEO");
++    // Presenting the decoder's DMA-BUF on a surface of its own is the only path
++    // that reaches a usable frame rate on this board, so it is the default. Set
++    // OPENNOW_WAYLAND_VIDEO=0 to present inside the interface again.
++    static const bool enabled = [] {
++        const QByteArray value = qgetenv("OPENNOW_WAYLAND_VIDEO");
++        return value.isEmpty() || (value != "0" && value.toLower() != "false");
++    }();
+     return enabled;
+ }
+ 

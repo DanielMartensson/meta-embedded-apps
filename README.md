@@ -170,8 +170,9 @@ is `1.0.4+git...` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0014` in `recipes-apps/opennow/files/` are the only changes to the
-upstream tree.
+`0001`-`0026` in `recipes-apps/opennow/files/` are the only changes to the
+upstream tree. (`0022` is not part of the series: it was an abandoned
+experiment and never entered the tree.)
 
 | Patch | What it does |
 | --- | --- |
@@ -189,6 +190,44 @@ upstream tree.
 | `0012` | Log presented frames and dump the first copied frame. |
 | `0013` | Import the decoder's linear NV12 dma-buf frames as Vulkan buffers, without a copy. |
 | `0014` | Cache imported dma-buf buffers and log the render rate. |
+| `0015` | Count the frame notifications and offer a forced repaint, so a session can be instrumented without a debugger. |
+| `0016` | Run the stream window opaque and sample the video 1:1 (`OPENNOW_OPAQUE_WINDOW=1`, `OPENNOW_VIDEO_NEAREST=1`). |
+| `0017` | `OPENNOW_VIDEO_MODE_FILE` switches the video pass while streaming, to attribute its GPU cost within one session. |
+| `0018` | Hand the decoder's DMA-BUF to a Wayland surface of its own instead of converting it (`OPENNOW_WAYLAND_VIDEO=1`). |
+| `0019` | Opt-in development capture: `OPENNOW_FRAME_DUMP=<dir>` for the decoded frame, a trigger file for the interface window. |
+| `0020` | Describe the decoder's 1080p buffer at its visible height; the padded height made the compositor kill the connection. |
+| `0021` | `F11` switches the stream window between click-through fullscreen and a decorated 1280x720 window whose close button ends the stream. |
+| `0023` | Install every `wl_keyboard` listener (a missing one desynchronised the connection), keep the keyboard on the interface, re-enable `F11` during a stream, and fix the frame dump's buffer sizes. |
+| `0024` | Repaint the interface on a clock of its own while the stream window exists, and add `/tmp/opennow-close` for the compositor's close path. |
+| `0025` | Pull and present frames from the interface thread on a clock of its own, so the interface can no longer throttle the video. |
+| `0026` | The stream window becomes the default presentation path; `OPENNOW_WAYLAND_VIDEO=0` opts out. |
+
+#### The stream window
+
+A running stream has two surfaces on the board's Weston: the application's own
+window, which draws the interface, and a toplevel of OpenNOW's own that carries
+the decoder's frames. The second is created from Qt's existing compositor
+connection with `xdg-shell` and `linux-dmabuf`, so one connection serves both,
+and OpenNOW owns its lifetime.
+
+| Mode | How it behaves |
+| --- | --- |
+| Fullscreen, the default while a stream runs | Click-through: the window has an empty input region, so the interface underneath keeps the keyboard and pointer, and game input travels the path it always did. `F11` leaves this mode. |
+| Windowed | A decorated 1280x720 toplevel, scaled with `wp_viewporter`. It can be moved and minimised, and it takes the input itself and hands it to the interface, because the game is not being played while the window is small. `F11` returns to fullscreen. |
+| Closed | The compositor's close button, or the trigger below, ends the session exactly like the application's own stop. |
+
+The path is on by default. `OPENNOW_WAYLAND_VIDEO=0` restores upstream's
+presentation inside the Qt scene graph, which is what an older package does and
+is worth having when comparing.
+
+Three development aids exist because Weston 13 refuses the screen capture
+protocol and the stream window is not part of the interface window:
+
+| Aid | Effect |
+| --- | --- |
+| `OPENNOW_FRAME_DUMP=<dir>` | Write the newest decoded frame to `<dir>/frame.ppm`, at most once a second, converted on the CPU. |
+| `touch /tmp/opennow-grab` | Write the interface window to `/tmp/opennow-grab.png`. |
+| `touch /tmp/opennow-close` | Do what the compositor's close button does to the stream window. |
 
 #### Why the Ui looks right on the STM32MP257F
 
@@ -209,50 +248,61 @@ device, so `OPENNOW_RENDERER` only moves the Ui, never the video.
 
 #### Measured stream throughput
 
-The present path logs itself. With `OPENNOW_LOG_PRESENT=1` the Qt render
-callback prints about once every 1.5 s:
+The stream no longer travels through the Qt scene graph. The decoder's DMA-BUF
+is handed to a Wayland surface of its own, which the compositor composites - and
+scans out when the format allows - without the GPU converting a pixel. It is the
+same path YtGst reaches through `waylandsink`.
+
+With `OPENNOW_LOG_PRESENT=1` both halves log themselves, about once a second:
 
 ```
-opennow-present fps=6.9 render=7.9 swapped=2629 p50=1.10ms p95=216.00ms max=221.00ms
+wayland-video fps=55.0 committed=4226 dropped=0
+opennow-present fps=0.0 render=28.6 swapped=0
 ```
 
-`fps` is frames the compositor took during the sample window, `render` is how
-often Qt rendered the video node, `swapped` is the running total, and
-`p50`/`p95`/`max` are the submit-to-swap times. Measured in a live session
-(Ontario zone, 1280x720 stream, fullscreen on the 1920x1080 output, Vulkan
-import, package `r0.20`):
+`wayland-video fps=` is how often a decoded frame reached the compositor,
+`dropped=` counts frames that were superseded before they could be shown, and
+`committed=` is the running total. `opennow-present render=` is how often the
+interface repainted; the video no longer depends on it.
+
+Measured in a live session (Ontario zone, 1280x720 stream, fullscreen on the
+1920x1080 output, Vulkan decoder, package `r0.33`):
 
 | Reading | Value | Source |
 | --- | --- | --- |
-| Frames the server sent | ~60 /s | `NVST rx-stats ... frames=` |
-| Frames acknowledged | ~60 /s | `NVST control-stats ... frameAck=` |
-| Frames presented | 6-8 /s | `opennow-present fps=` |
-| Submit-to-swap | p50 1.2 ms, p95 220 ms | `opennow-present` |
-| CPU, whole application | ~35 % of one core (2 x A35 @1.2 GHz) | `/proc/<pid>/task/*/stat` |
-| CMA free | ~10 MB of 128 MB | `/proc/meminfo`, `dmesg` |
+| Frames the server sent | ~55 /s | `NVST rx-stats ... frames=` |
+| Frames presented | 54-55 /s | `wayland-video fps=` |
+| Frames dropped | 0 | `wayland-video dropped=` |
+| Interface repaints | ~29 /s | `opennow-present render=` |
+| Audio | armed, no underruns logged | `NVST control/audio bundle armed` |
 | Decoder in use | `/dev/video4`, `st,stm32mp25-vdec-dec` | `/proc/<pid>/fd` |
 
-The wire delivers 60 fps and the compositor takes a frame in 1.2 ms, but the
-application hands over only 6-8 a second, so the loss is between "frame
-decoded" and "frame drawn" - not on the network and not in the compositor.
-`render` tracks `fps`, so Qt is not holding frames back either: the rate at
-which `NativeStreamRuntime::frameAvailable` reaches
-`StreamVideoItem::requestFrame` is the same 6-8 per second. Audio is on a
-separate path and is unaffected.
+`F11` between fullscreen and windowed does not change the rate, and closing the
+stream window ends the session: `native-streamer.log` records
+`status=stopped message=User stopped the session`.
 
-With CMA down to 10 MB of 128 MB the decoder can only keep a couple of capture
-buffers queued, and `dmesg` shows allocations failing outright:
+The same session presented 6-8 frames a second while the video went through the
+Qt scene graph (patches `0013`/`0014`, package `r0.20`), and about 28 once the
+decoder's DMA-BUF was imported into that scene graph as a Vulkan buffer. Two GPU
+passes - NV12 to RGBA, then a sampled texel copy - cost more than everything
+else in the frame together.
+
+Two things are worth knowing before trusting a low number in a session log:
+
+- `OPENNOW_FRAME_DUMP` is not free. Converting one 1080p frame from NV12 to RGB
+  on the two A35 cores costs about a second, so a session with the dump enabled
+  presents about one frame a second. It is a diagnostic, not a setting.
+- The decoder still needs CMA. With CMA down to 10 MB of 128 MB it can only keep
+  a couple of capture buffers queued, and `dmesg` shows allocations failing
+  outright:
 
 ```
 cma: cma_alloc: linux,cma: alloc failed, req-size: 394 pages, ret: -12
 ```
 
-So the image should reserve 256 MB of CMA on the kernel command line
-(`UBOOT_EXTLINUX_KERNEL_ARGS:append = " cma=256M"`, as
-`meta-watermelon-wine` does). If the decoder still cannot keep up after that,
-the next step is to take the Qt scene graph out of the video path entirely and
-give the decoder's dma-bufs to a Wayland subsurface, which is what
-`waylandsink` already does for YtGst on this board.
+  so the image should reserve 256 MB of CMA on the kernel command line
+  (`UBOOT_EXTLINUX_KERNEL_ARGS:append = " cma=256M"`, as
+  `meta-watermelon-wine` does).
 
 For comparison, the shell's own profiler (`--performance-report`) on an idle
 home screen has a cost that is linear in the *window area*, about 25 ms fixed
@@ -268,7 +318,7 @@ Throughput per application, same board and session conditions:
 
 | Application | Video path | Stream | Presented fps | Measured with |
 | --- | --- | --- | --- | --- |
-| OpenNOW | Vulkan dma-buf import into the Qt scene graph | 1280x720, fullscreen | 6-8 | `OPENNOW_LOG_PRESENT=1` |
+| OpenNOW | Own Wayland toplevel, DMA-BUF to the compositor | 1280x720, fullscreen | 54-55 | `wayland-video fps=` |
 | YtGst | GStreamer `waylandsink`, own subsurface | 1920x1080 | not measured yet | GStreamer `fpsdisplaysink` |
 | NanoBrowser | QtWebEngine | - | not measured yet | compositor frame count |
 

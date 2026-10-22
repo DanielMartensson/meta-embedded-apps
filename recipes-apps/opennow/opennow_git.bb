@@ -30,6 +30,14 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0015-count-the-frame-notifications-and-allow-a-forced-repaint.patch \
            file://0016-run-the-stream-window-opaque-and-sample-the-video-1-1.patch \
            file://0017-let-the-video-pass-be-switched-while-streaming.patch \
+           file://0018-present-decoded-frames-through-a-wayland-surface.patch \
+           file://0019-add-opt-in-frame-and-interface-capture-for-development.patch \
+           file://0020-describe-the-decoder-buffer-at-its-visible-height.patch \
+           file://0021-let-the-stream-window-be-windowed-or-closed-by-the-user.patch \
+           file://0023-keep-the-keyboard-f11-and-the-frame-dump-working.patch \
+           file://0024-keep-the-video-flowing-while-the-interface-rests.patch \
+           file://0025-pull-frames-from-the-interface-thread.patch \
+           file://0026-make-the-stream-window-the-default-presentation-path.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
@@ -44,7 +52,7 @@ PV = "1.0.4+git${SRCPV}"
 # The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
 # r0.12 leaves the process when the event loop ends instead of running Qt
 # teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.23"
+PKGR = "r0.33"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
