@@ -1,0 +1,151 @@
+From 2a3eae3423d67c64ddbc4722ff1ba4641839c465 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 20:11:23 +0200
+Subject: [PATCH 0030] Do not repaint an interface the stream window covers
+
+Patch 0024 gave the interface a repaint clock because every frame of the stream
+used to be pulled during an interface repaint. Patch 0025 moved the pull to a
+clock of its own, so the clock is now only keeping an invisible window -
+fullscreen stream window is opaque and covers the whole screen - in the
+compositor's buffer queue. That costs the GPU that the video needs, and it keeps
+the VeriSilicon swapchain busy for nothing: the one crash seen with a working
+video path was an assertion in the driver's own Wayland WSI
+(gc_wsi_surface_wayland.c, buffer_fenced_release) while the interface was
+repainting behind the stream.
+
+The clock now runs only while the stream window is windowed, where the interface
+can actually be seen around it, and stops in fullscreen. The interface is
+repainted again as soon as the window returns or the stream ends.
+
+The same patch reports what the surface hands to the compositor - fourcc, size,
+modifier and plane layout of every buffer it creates - and counts the flushes
+that fail. The flush of this Qt connection reports an error on every frame while
+the video plays, which is worth knowing before believing any of it: the frames
+still reach the compositor, because Qt's own event thread flushes the same
+connection.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+---
+ opennow-qt/qml/Main.qml                       | 15 ++++---
+ .../rendering/WaylandVideoSurface.cpp         | 39 ++++++++++++++-----
+ .../streaming/rendering/WaylandVideoSurface.h |  1 +
+ 3 files changed, 37 insertions(+), 18 deletions(-)
+
+diff --git a/opennow-qt/qml/Main.qml b/opennow-qt/qml/Main.qml
+index 50a5d673..c72320d6 100644
+--- a/opennow-qt/qml/Main.qml
++++ b/opennow-qt/qml/Main.qml
+@@ -246,18 +246,17 @@ ApplicationWindow {
+         }
+     }
+ 
+-    // Each frame of the stream is pulled during an interface repaint, so the
+-    // window has to keep repainting even when everything in it is static: with
+-    // the stream window on top the interface underneath shows nothing but its
+-    // backdrop, and Qt would otherwise stop rendering and freeze the video.
+-    // The video no longer waits for a repaint, but the window still has to show
+-    // its picture now and then: the decoder is set up during a render pass, and
+-    // the interface would freeze on screen without any.
++    // The video runs on a clock of its own (0025), so the interface only has to
++    // repaint when it can be seen. A fullscreen stream window covers it
++    // completely, and repainting an invisible window only keeps the GPU busy -
++    // and the compositor's buffer queue moving - while the video needs both.
++    // The interface is repainted again as soon as the window returns or the
++    // stream ends.
+     Timer {
+         objectName: "streamWindowRepaintTimer"
+         interval: 250
+         repeat: true
+-        running: NativeVideoWindow.mapped
++        running: NativeVideoWindow.mapped && NativeVideoWindow.windowed
+         onTriggered: window.update()
+     }
+ 
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 4d89cb5f..cd80ee21 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -31,6 +31,15 @@ constexpr int kWindowHeight = 720;
+ // without bound.
+ constexpr int kMaxCachedBuffers = 24;
+ 
++QString fourccName(quint32 format)
++{
++    char name[5] = {char(format & 0xff), char((format >> 8) & 0xff),
++                    char((format >> 16) & 0xff), char((format >> 24) & 0xff), 0};
++    for (int i = 0; i < 4; ++i)
++        if (name[i] < 0x20 || name[i] > 0x7e) name[i] = '?';
++    return QString::fromLatin1(name, 4);
++}
++
+ wl_display *qtWaylandDisplay()
+ {
+     auto *native = qGuiApp
+@@ -631,14 +640,19 @@ void WaylandVideoSurface::flushDisplay()
+         return;
+     }
+     const int error = errno;
+-    if (error != EAGAIN && qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
+-        qWarning("wayland-video: flush failed: %s", std::strerror(error));
+-    if (m_deferredFds.size() > 64) {
+-        // Never let a stuck socket pin descriptors without bound; the oldest
+-        // frames are long gone by now.
+-        while (m_deferredFds.size() > 64)
+-            ::close(m_deferredFds.takeFirst());
++    if (error != EAGAIN) {
++        ++m_flushFailures;
++        // Qt's own event thread flushes the same connection, so a failing flush
++        // here does not stop the video; report the first one only, and count
++        // the rest in the rate line.
++        if (m_flushFailures == 1 && qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
++            qWarning("wayland-video: flush failed: %s (display error %d)",
++                     std::strerror(error), wl_display_get_error(m_display));
+     }
++    // Never let a stuck socket pin descriptors without bound; a frame that is
++    // still queued after a few more is long gone by now.
++    while (m_deferredFds.size() > 8)
++        ::close(m_deferredFds.takeFirst());
+ }
+ 
+ void WaylandVideoSurface::present(Frame frame)
+@@ -665,8 +679,8 @@ void WaylandVideoSurface::present(Frame frame)
+         m_sampleStart = now;
+         m_sampleCount = 0;
+         if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
+-            qInfo("wayland-video fps=%.1f committed=%llu dropped=%llu",
+-                  fps, m_committed, m_dropped);
++            qInfo("wayland-video fps=%.1f committed=%llu dropped=%llu flushFailed=%llu",
++                  fps, m_committed, m_dropped, m_flushFailures);
+     }
+ }
+ 
+@@ -732,7 +746,12 @@ wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame)
+     created.lastUsed = ++m_bufferClock;
+     m_buffers.append(created);
+     if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
+-        qInfo("wayland-video: dmabuf buffer %d created", int(m_buffers.size()));
++        qInfo("wayland-video: dmabuf buffer %d created (%s %dx%d modifier=0x%llx planes=%u "
++              "stride=%u/%u offset=%u/%u)", int(m_buffers.size()),
++              qPrintable(fourccName(frame.format)), frame.size.width(),
++              frame.size.height(), static_cast<unsigned long long>(frame.modifier),
++              planeCount, frame.strides[0], frame.strides[1], frame.offsets[0],
++              frame.offsets[1]);
+     return buffer;
+ }
+ 
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 8ec8d91b..060f32c9 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -209,6 +209,7 @@ private:
+     void destroyBuffers();
+     QVector<CachedBuffer> m_buffers;
+     quint64 m_bufferClock = 0;
++    quint64 m_flushFailures = 0;
+     // Frame fds are handed to libwayland, which only duplicates them into the
+     // socket when the request is actually written. A frame can be dropped by a
+     // full socket, so the fd stays open until a later flush reports success.
+-- 
+2.43.0
+

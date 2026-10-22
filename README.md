@@ -170,7 +170,7 @@ is `1.0.4+git...` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0026` in `recipes-apps/opennow/files/` are the only changes to the
+`0001`-`0030` in `recipes-apps/opennow/files/` are the only changes to the
 upstream tree. (`0022` is not part of the series: it was an abandoned
 experiment and never entered the tree.)
 
@@ -196,11 +196,15 @@ experiment and never entered the tree.)
 | `0018` | Hand the decoder's DMA-BUF to a Wayland surface of its own instead of converting it (`OPENNOW_WAYLAND_VIDEO=1`). |
 | `0019` | Opt-in development capture: `OPENNOW_FRAME_DUMP=<dir>` for the decoded frame, a trigger file for the interface window. |
 | `0020` | Describe the decoder's 1080p buffer at its visible height; the padded height made the compositor kill the connection. |
-| `0021` | `F11` switches the stream window between click-through fullscreen and a decorated 1280x720 window whose close button ends the stream. |
-| `0023` | Install every `wl_keyboard` listener (a missing one desynchronised the connection), keep the keyboard on the interface, re-enable `F11` during a stream, and fix the frame dump's buffer sizes. |
+| `0021` | `F11` switches the stream window between a fullscreen toplevel and a decorated 1280x720 window whose close button ends the stream. |
+| `0023` | Install every `wl_keyboard` listener (a missing one desynchronised the connection), re-enable `F11` during a stream, and fix the frame dump's buffer sizes. |
 | `0024` | Repaint the interface on a clock of its own while the stream window exists, and add `/tmp/opennow-close` for the compositor's close path. |
 | `0025` | Pull and present frames from the interface thread on a clock of its own, so the interface can no longer throttle the video. |
 | `0026` | The stream window becomes the default presentation path; `OPENNOW_WAYLAND_VIDEO=0` opts out. |
+| `0027` | The stream window takes the pointer and the keyboard and forwards them to the host. Before this, only `F11` reached the game, because the interface window was never active behind the stream window. |
+| `0028` | Close the frame descriptor only once Wayland has taken it, and close the descriptor of a recorded frame that is not presented. A stream that keeps producing frames while the picture is refused no longer leaks a descriptor per frame. |
+| `0029` | Keep one `wl_buffer` per decoder buffer instead of building one per frame. Weston 13 never closes the descriptors behind an imported dma-buf buffer, so a stream at 50 fps exhausted the compositor's 1024 descriptors in about twenty seconds and the connection died with `invalid arguments for zwp_linux_buffer_params_v1.add`. |
+| `0030` | Stop repainting the interface while the stream window covers it, and report the fourcc, size, modifier and plane layout of every buffer the surface hands to the compositor. The repaint clock was left over from `0024`, when each frame was pulled during an interface repaint; it kept an invisible window in the compositor's buffer queue, and the one assertion seen in the VeriSilicon driver's Wayland WSI came from that swapchain. |
 
 #### The stream window
 
@@ -212,13 +216,69 @@ and OpenNOW owns its lifetime.
 
 | Mode | How it behaves |
 | --- | --- |
-| Fullscreen, the default while a stream runs | Click-through: the window has an empty input region, so the interface underneath keeps the keyboard and pointer, and game input travels the path it always did. `F11` leaves this mode. |
-| Windowed | A decorated 1280x720 toplevel, scaled with `wp_viewporter`. It can be moved and minimised, and it takes the input itself and hands it to the interface, because the game is not being played while the window is small. `F11` returns to fullscreen. |
+| Fullscreen, the default while a stream runs | The whole screen, and the window owns the pointer, the wheel and the keyboard. `F11` leaves this mode. |
+| Windowed | A decorated 1280x720 toplevel, scaled with `wp_viewporter`. It can be moved and minimised, and it keeps forwarding input, scaled to its size. `F11` returns to fullscreen. |
 | Closed | The compositor's close button, or the trigger below, ends the session exactly like the application's own stop. |
 
 The path is on by default. `OPENNOW_WAYLAND_VIDEO=0` restores upstream's
 presentation inside the Qt scene graph, which is what an older package does and
 is worth having when comparing.
+
+#### The compositor's descriptor budget
+
+Weston 13 does not close the dma-buf descriptors of a buffer it has imported.
+That is invisible to a client that presents a handful of buffers and fatal to one
+that presents fifty a second: the compositor holds one descriptor per buffer
+until it reaches its limit of 1024, and from then on it cannot take another
+descriptor from any client. On this board the limit arrived after about twenty
+seconds of video. The first symptom was not the picture: the compositor could no
+longer send the keymap of the next stream window and dropped the client, and the
+frame that was already in flight arrived without its descriptor and came back as
+`invalid arguments for zwp_linux_buffer_params_v1.add`, which Qt reports as a
+fatal Wayland error and turns into an abort. Restarting Weston clears the count;
+the numbers here come from a freshly started compositor.
+
+Patch `0029` keeps the compositor out of that corner by giving it fewer objects
+to hold. The hardware decoder cycles through a small pool of capture buffers, so
+the same dma-buf returns frame after frame: the surface recognises it by the
+device and inode of the descriptor together with the layout it was imported with,
+and re-attaches the `wl_buffer` it already built instead of creating a new one. A
+session now creates as many buffers as the decoder's pool holds, and the
+compositor's descriptor count stays flat instead of climbing once per frame.
+Buffers are destroyed only after the compositor has released them.
+
+To watch it on a running session:
+
+```
+for f in /proc/$(pgrep -x weston)/fd/*; do readlink $f; done | grep -c dmabuf
+```
+
+#### Input
+
+The stream window stands in front of the interface, and a compositor gives the
+keyboard to the front window. Weston 13 does not implement `xdg-activation`, so
+an application cannot ask for the focus back: while a stream ran, the interface
+window was inactive, and OpenNOW's own input path - which only forwards events
+while its window is active - dropped every pointer and key event. Only `F11`
+arrived, because the stream window handled that key itself.
+
+Patch `0027` reads input where the compositor sends it. The stream window takes
+the whole surface as its input region, keeps a `wl_pointer` next to the
+`wl_keyboard` it already had, and forwards positions, buttons, the wheel and keys
+to the host through the streamer's input API. Positions are expressed in the
+frame's own pixels - the surface carries the whole frame, so fullscreen is 1:1
+and the windowed form is scaled - keys are translated from Linux key codes to the
+Windows virtual keys the host speaks, and the local cursor is hidden because the
+game draws its own. Keys still held when the window goes away are released
+first, so the game is not left walking.
+
+The video target links Qt Gui only, so it does not call the streamer itself: it
+takes a small table of input hooks that the render callback fills in with the
+streamer's input calls. That keeps the Rust FFI and Qt Quick out of a target that
+has no business including them.
+
+`OPENNOW_LOG_INPUT=1` logs what the stream window forwards; pointer positions at
+most twice a second, keys and buttons one line each.
 
 Three development aids exist because Weston 13 refuses the screen capture
 protocol and the stream window is not part of the interface window:

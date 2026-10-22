@@ -1,0 +1,162 @@
+From 2a3eae3423d67c64ddbc4722ff1ba4641839c465 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 20:11:23 +0200
+Subject: [PATCH 0028] Keep the frame descriptor open until Wayland owns it
+
+The decoder hands every recorded frame over as a duplicated DMA-BUF descriptor
+that the receiver owns, and libwayland only copies that descriptor into the
+socket when the request that carries it is written out. The surface closed it
+as soon as the attach had been queued and ignored what the flush returned, so a
+frame that a full socket postponed left a descriptor behind that the process no
+longer held open. The compositor then read a buffer add without its descriptor
+and answered with "invalid arguments for zwp_linux_buffer_params_v1.add", which
+Qt turns into a fatal Wayland error and the app aborts some tens of seconds into
+a stream.
+
+Descriptors are now closed only after a flush reports that everything queued has
+reached the compositor, capped so a compositor that stops reading cannot pin
+them without bound, and closed when the window goes away.
+
+The render callback had a second leak of the same kind: a recorded frame that it
+decided not to present, because presentation was refused or the stream had moved
+on, kept its duplicated descriptor forever. A stream that keeps producing frames
+while the picture is refused therefore leaked one descriptor per frame, and the
+process would have run into the same wall after a few thousand frames.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+---
+ .../rendering/NativeStreamRenderCallback.cpp  |  8 +++++
+ .../rendering/WaylandVideoSurface.cpp         | 29 +++++++++++++++++--
+ .../streaming/rendering/WaylandVideoSurface.h |  6 ++++
+ 3 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 66ede6c8..43b2aead 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -22,6 +22,9 @@
+ #include <utility>
+ #include <atomic>
+ #include <chrono>
++#if defined(Q_OS_LINUX)
++#include <unistd.h>
++#endif
+ 
+ namespace {
+ #if defined(Q_OS_LINUX)
+@@ -271,6 +274,11 @@ public:
+             reportFailure(QStringLiteral("Could not hand the decoded frame to the compositor (status %1). Check native-streamer.log for decoder errors.").arg(int(status)));
+         }
+         if (frame) m_runtime->releaseFrame(frame);
++        // The decoder duplicates the DMA-BUF once per recorded frame and the
++        // receiver owns that descriptor. A frame that never reaches the surface
++        // must be closed here, otherwise a stream that keeps producing frames
++        // while presentation is refused runs the process out of descriptors.
++        if (!usable && recorded.dmabuf_fd >= 0) ::close(recorded.dmabuf_fd);
+         // Keep the interface asking for frames: it drives the pull while the
+         // stream window owns the picture.
+         m_needsFrame.store(true);
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 658b5cd7..12f5c92c 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -9,6 +9,7 @@
+ #include <QtGui/qguiapplication_platform.h>
+ 
+ #include <algorithm>
++#include <cerrno>
+ #include <cmath>
+ #include <cstring>
+ #include <ctime>
+@@ -54,6 +55,7 @@ WaylandVideoSurface::~WaylandVideoSurface()
+     if (m_compositor) wl_compositor_destroy(m_compositor);
+     if (m_registry) wl_registry_destroy(m_registry);
+     if (m_display) wl_display_flush(m_display);
++    closeDeferredFds();
+     m_dmabuf = nullptr;
+     m_shell = nullptr;
+     m_compositor = nullptr;
+@@ -603,9 +605,30 @@ bool WaylandVideoSurface::ensureDmabuf()
+     return m_dmabuf != nullptr;
+ }
+ 
++void WaylandVideoSurface::closeDeferredFds()
++{
++    for (int fd : m_deferredFds) ::close(fd);
++    m_deferredFds.clear();
++}
++
+ void WaylandVideoSurface::flushDisplay()
+ {
+-    if (m_display) wl_display_flush(m_display);
++    if (!m_display) return;
++    if (wl_display_flush(m_display) == 0) {
++        // Everything queued so far reached the compositor, so the fd numbers
++        // libwayland kept for those requests are no longer needed.
++        closeDeferredFds();
++        return;
++    }
++    const int error = errno;
++    if (error != EAGAIN && qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
++        qWarning("wayland-video: flush failed: %s", std::strerror(error));
++    if (m_deferredFds.size() > 64) {
++        // Never let a stuck socket pin descriptors without bound; the oldest
++        // frames are long gone by now.
++        while (m_deferredFds.size() > 64)
++            ::close(m_deferredFds.takeFirst());
++    }
+ }
+ 
+ void WaylandVideoSurface::present(Frame frame)
+@@ -621,7 +644,7 @@ void WaylandVideoSurface::present(Frame frame)
+             ++m_dropped;
+         }
+     }
+-    if (frame.fd >= 0) close(frame.fd);
++    if (frame.fd >= 0) m_deferredFds.append(frame.fd);
+ 
+     const quint64 now = monotonicNs();
+     if (m_sampleStart == 0) {
+@@ -750,6 +773,8 @@ void WaylandVideoSurface::dismiss()
+     wl_surface_attach(m_surface, nullptr, 0, 0);
+     wl_surface_commit(m_surface);
+     flushDisplay();
++    if (m_display) wl_display_flush(m_display);
++    closeDeferredFds();
+     destroySurface();
+     m_committed = 0;
+     m_sampleStart = 0;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 686457d8..2139225b 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <QList>
+ #include <QObject>
+ #include <QSet>
+ #include <QSize>
+@@ -111,6 +112,7 @@ private:
+     bool ensureDmabuf();
+     void attachFrame(const Frame &frame);
+     void flushDisplay();
++    void closeDeferredFds();
+ 
+     static void handleGlobal(void *data, wl_registry *registry, quint32 name,
+                              const char *interface, quint32 version);
+@@ -180,6 +182,10 @@ private:
+     xdg_surface *m_xdgSurface = nullptr;
+     xdg_toplevel *m_toplevel = nullptr;
+     wl_buffer *m_pendingBuffer = nullptr;
++    // Frame fds are handed to libwayland, which only duplicates them into the
++    // socket when the request is actually written. A frame can be dropped by a
++    // full socket, so the fd stays open until a later flush reports success.
++    QList<int> m_deferredFds;
+     wp_viewporter *m_viewporter = nullptr;
+     wp_viewport *m_viewport = nullptr;
+     bool m_configured = false;
+-- 
+2.43.0
+

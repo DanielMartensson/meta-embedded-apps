@@ -1,0 +1,273 @@
+From 2a3eae3423d67c64ddbc4722ff1ba4641839c465 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 20:11:23 +0200
+Subject: [PATCH 0029] Give the compositor one buffer per decoder buffer
+
+Weston 13 never closes the DMA-BUF descriptors of a buffer it has imported, so
+every buffer the stream window created cost the compositor a descriptor. A
+session at 50 fps pushed the compositor into its 1024-descriptor limit in about
+twenty seconds: its descriptor count climbed frame by frame, 20, 66, 126, 197,
+276, 376, 499, 609, 756, 944, 979, until it was full. From then on it could not
+even send the keymap of the next stream window and dropped the client, and a
+frame that was already in flight arrived without its descriptor and was
+answered with "invalid arguments for zwp_linux_buffer_params_v1.add", which Qt
+reports as a fatal Wayland error and turns into an abort.
+
+The leak is in the compositor and cannot be fixed from here, but it can be
+starved of targets. The hardware decoder cycles through a small pool of capture
+buffers, so the same DMA-BUF comes back frame after frame. The surface now keeps
+one wl_buffer per DMA-BUF, recognised by the device and inode of the descriptor
+together with the layout it was imported with, and re-attaches that buffer for
+every frame that comes from the same slot. A session creates as many buffers as
+the decoder's pool holds instead of one per frame.
+
+Buffers are no longer destroyed as soon as the next frame arrives. They stay
+until the compositor releases them, which is when it is done with them, and the
+cache is capped so a decoder that does hand out a new buffer every frame cannot
+grow it without bound.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+---
+ .../rendering/WaylandVideoSurface.cpp         | 119 ++++++++++++++----
+ .../streaming/rendering/WaylandVideoSurface.h |  29 ++++-
+ 2 files changed, 125 insertions(+), 23 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 12f5c92c..4d89cb5f 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -15,6 +15,7 @@
+ #include <ctime>
+ #include <utility>
+ #include <unistd.h>
++#include <sys/stat.h>
+ #include <wayland-client.h>
+ 
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
+@@ -25,6 +26,10 @@ namespace {
+ 
+ constexpr int kWindowWidth = 1280;
+ constexpr int kWindowHeight = 720;
++// A decoder pool is far smaller than this; the cap only exists so that a
++// decoder that hands out a fresh buffer every frame cannot grow the cache
++// without bound.
++constexpr int kMaxCachedBuffers = 24;
+ 
+ wl_display *qtWaylandDisplay()
+ {
+@@ -462,8 +467,15 @@ void WaylandVideoSurface::setInputHooks(InputHooks hooks)
+ 
+ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+ {
+-    Q_UNUSED(data);
+-    wl_buffer_destroy(buffer);
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    for (CachedBuffer &cached : self->m_buffers) {
++        if (cached.buffer != buffer) continue;
++        // The compositor is done with it, so it may be reused or, if the cache
++        // is full, destroyed.
++        cached.inFlight = false;
++        return;
++    }
+ }
+ 
+ bool WaylandVideoSurface::ensureSurface()
+@@ -569,10 +581,6 @@ void WaylandVideoSurface::destroySurface()
+ {
+     // The game must not be left with keys held down when the window goes away.
+     releaseHeldKeys();
+-    if (m_pendingBuffer) {
+-        wl_buffer_destroy(m_pendingBuffer);
+-        m_pendingBuffer = nullptr;
+-    }
+     if (m_pointer) {
+         wl_pointer_release(m_pointer);
+         m_pointer = nullptr;
+@@ -588,6 +596,8 @@ void WaylandVideoSurface::destroySurface()
+     if (m_toplevel) xdg_toplevel_destroy(m_toplevel);
+     if (m_xdgSurface) xdg_surface_destroy(m_xdgSurface);
+     if (m_surface) wl_surface_destroy(m_surface);
++    // The surface is gone, so nothing can still be scanning these out.
++    destroyBuffers();
+     m_viewport = nullptr;
+     m_toplevel = nullptr;
+     m_xdgSurface = nullptr;
+@@ -660,15 +670,36 @@ void WaylandVideoSurface::present(Frame frame)
+     }
+ }
+ 
+-void WaylandVideoSurface::attachFrame(const Frame &frame)
+-{
+-    zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
+-    if (!params) {
+-        ++m_dropped;
+-        return;
++wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame)
++{
++    struct stat info {};
++    if (::fstat(frame.fd, &info) != 0) return nullptr;
++    const quint64 device = quint64(info.st_dev);
++    const quint64 inode = quint64(info.st_ino);
++    const quint32 planeCount = std::min<quint32>(frame.planeCount, 2);
++
++    for (CachedBuffer &cached : m_buffers) {
++        if (cached.device != device || cached.inode != inode) continue;
++        if (cached.size != frame.size || cached.format != frame.format
++            || cached.modifier != frame.modifier || cached.planeCount != planeCount)
++            continue;
++        bool samePlanes = true;
++        for (quint32 plane = 0; plane < planeCount; ++plane) {
++            if (cached.offsets[plane] != frame.offsets[plane]
++                || cached.strides[plane] != frame.strides[plane]) {
++                samePlanes = false;
++                break;
++            }
++        }
++        if (!samePlanes) continue;
++        cached.inFlight = true;
++        cached.lastUsed = ++m_bufferClock;
++        return cached.buffer;
+     }
+-    const quint32 planes = std::min<quint32>(frame.planeCount, 2);
+-    for (quint32 plane = 0; plane < planes; ++plane) {
++
++    zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
++    if (!params) return nullptr;
++    for (quint32 plane = 0; plane < planeCount; ++plane) {
+         zwp_linux_buffer_params_v1_add(params, frame.fd, int(plane), frame.offsets[plane],
+                                        frame.strides[plane],
+                                        quint32(frame.modifier >> 32),
+@@ -677,10 +708,7 @@ void WaylandVideoSurface::attachFrame(const Frame &frame)
+     wl_buffer *buffer = zwp_linux_buffer_params_v1_create_immed(
+         params, quint32(frame.size.width()), quint32(frame.size.height()), frame.format, 0);
+     zwp_linux_buffer_params_v1_destroy(params);
+-    if (!buffer) {
+-        ++m_dropped;
+-        return;
+-    }
++    if (!buffer) return nullptr;
+     static const wl_buffer_listener bufferListener = [] {
+         wl_buffer_listener listener{};
+         listener.release = handleBufferRelease;
+@@ -688,11 +716,57 @@ void WaylandVideoSurface::attachFrame(const Frame &frame)
+     }();
+     wl_buffer_add_listener(buffer, &bufferListener, this);
+ 
+-    if (m_pendingBuffer) {
+-        // The compositor already has the previous frame; this one replaces it.
+-        wl_buffer_destroy(m_pendingBuffer);
++    CachedBuffer created;
++    created.buffer = buffer;
++    created.device = device;
++    created.inode = inode;
++    created.size = frame.size;
++    created.format = frame.format;
++    created.modifier = frame.modifier;
++    created.planeCount = planeCount;
++    for (quint32 plane = 0; plane < planeCount; ++plane) {
++        created.offsets[plane] = frame.offsets[plane];
++        created.strides[plane] = frame.strides[plane];
++    }
++    created.inFlight = true;
++    created.lastUsed = ++m_bufferClock;
++    m_buffers.append(created);
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
++        qInfo("wayland-video: dmabuf buffer %d created", int(m_buffers.size()));
++    return buffer;
++}
++
++void WaylandVideoSurface::evictBuffers()
++{
++    while (m_buffers.size() > kMaxCachedBuffers) {
++        int victim = -1;
++        quint64 oldest = ~0ull;
++        for (int i = 0; i < m_buffers.size(); ++i) {
++            const CachedBuffer &cached = m_buffers[i];
++            if (cached.inFlight || cached.lastUsed >= oldest) continue;
++            oldest = cached.lastUsed;
++            victim = i;
++        }
++        if (victim < 0) return;  // everything is still in use; try again later
++        wl_buffer_destroy(m_buffers[victim].buffer);
++        m_buffers.removeAt(victim);
++    }
++}
++
++void WaylandVideoSurface::destroyBuffers()
++{
++    for (const CachedBuffer &cached : m_buffers) wl_buffer_destroy(cached.buffer);
++    m_buffers.clear();
++    m_bufferClock = 0;
++}
++
++void WaylandVideoSurface::attachFrame(const Frame &frame)
++{
++    wl_buffer *buffer = bufferFor(frame);
++    if (!buffer) {
++        ++m_dropped;
++        return;
+     }
+-    m_pendingBuffer = buffer;
+     wl_surface_attach(m_surface, buffer, 0, 0);
+     if (wl_proxy_get_version(reinterpret_cast<wl_proxy *>(m_surface)) >= 4)
+         wl_surface_damage_buffer(m_surface, 0, 0, frame.size.width(), frame.size.height());
+@@ -704,6 +778,7 @@ void WaylandVideoSurface::attachFrame(const Frame &frame)
+         m_mapped = true;
+         emit mappedChanged();
+     }
++    evictBuffers();
+     ++m_committed;
+     ++m_sampleCount;
+ }
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 2139225b..8ec8d91b 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -4,6 +4,7 @@
+ #include <QObject>
+ #include <QSet>
+ #include <QSize>
++#include <QVector>
+ #include <cstdint>
+ #include <functional>
+ 
+@@ -181,7 +182,33 @@ private:
+     wl_surface *m_surface = nullptr;
+     xdg_surface *m_xdgSurface = nullptr;
+     xdg_toplevel *m_toplevel = nullptr;
+-    wl_buffer *m_pendingBuffer = nullptr;
++    // This Weston never closes the DMA-BUF descriptors behind a buffer it has
++    // imported, so every buffer the client creates costs the compositor one
++    // descriptor. It runs out after about a thousand of them and then refuses
++    // the next frame, which ends the stream with a fatal protocol error. The
++    // decoder cycles through a small pool of capture buffers, so the same
++    // DMA-BUF comes back frame after frame: keeping one wl_buffer per pool
++    // entry turns the leak into a handful of descriptors per session instead
++    // of one per frame. A buffer is only destroyed once the compositor has
++    // released it, never while it may still be in use.
++    struct CachedBuffer {
++        wl_buffer *buffer = nullptr;
++        quint64 device = 0;
++        quint64 inode = 0;
++        QSize size;
++        quint32 format = 0;
++        quint64 modifier = 0;
++        quint32 planeCount = 0;
++        quint32 offsets[2] = {0, 0};
++        quint32 strides[2] = {0, 0};
++        bool inFlight = false;
++        quint64 lastUsed = 0;
++    };
++    [[nodiscard]] wl_buffer *bufferFor(const Frame &frame);
++    void evictBuffers();
++    void destroyBuffers();
++    QVector<CachedBuffer> m_buffers;
++    quint64 m_bufferClock = 0;
+     // Frame fds are handed to libwayland, which only duplicates them into the
+     // socket when the request is actually written. A frame can be dropped by a
+     // full socket, so the fd stays open until a later flush reports success.
+-- 
+2.43.0
+

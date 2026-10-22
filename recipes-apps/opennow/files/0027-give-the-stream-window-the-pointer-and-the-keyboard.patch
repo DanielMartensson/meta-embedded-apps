@@ -1,0 +1,660 @@
+Subject: [PATCH 0027] Give the stream window the pointer and the keyboard
+
+The stream window stands in front of the interface, and a compositor gives the
+keyboard to the front window. This Weston has no xdg-activation, so asking for
+the focus back cannot work: the interface stayed inactive for as long as the
+stream ran, and the stream item ignores every pointer and key event unless its
+window is active. The only key that arrived was F11, because the stream window
+handled that one itself, and nothing clicked in the game.
+
+Input therefore has to be read where the compositor sends it. The stream window
+takes the whole surface as its input region, listens to the pointer as well as
+to the keyboard it already had, and forwards both to the host through the
+streamer's input API: absolute pointer positions in the frame's own pixels,
+buttons, the wheel, and keys mapped to Windows virtual keys with the same
+physical table the Qt item uses. F11 keeps switching between the windowed and
+the fullscreen form, and keys still held when the window goes away are released
+so the game is not left walking.
+
+Positions are scaled from the surface to the frame, so the windowed 1280x720
+form reports the same coordinates as the fullscreen one, and the local cursor is
+hidden because the game draws its own.
+
+The video target links Qt Gui and nothing else, so it does not reach for the
+streamer itself: it takes a small table of hooks that the render callback fills
+in with the streamer's input calls. That keeps the surface free of the Rust FFI
+and of Qt Quick, which it has no business including.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index a390c123..66ede6c8 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -17,12 +17,55 @@
+ #include <rhi/qrhi_platform.h>
+ #include <QDebug>
+ #include <QMetaObject>
++#include <QPointer>
+ 
+ #include <utility>
+ #include <atomic>
+ #include <chrono>
+ 
+ namespace {
++#if defined(Q_OS_LINUX)
++// The stream window is where the pointer and the keyboard are while the game
++// runs, so it is also the surface that feeds them to the host. It lives in a
++// target that knows nothing about the streamer, so the path is installed here.
++QPointer<NativeStreamRuntime> videoInputRuntime;
++
++void submitVideoInputAbsolute(int x, int y, int width, int height)
++{
++    if (!videoInputRuntime) return;
++    videoInputRuntime->submitMouseAbsolute(
++        static_cast<std::uint16_t>(qBound(0, x, 65535)),
++        static_cast<std::uint16_t>(qBound(0, y, 65535)),
++        static_cast<std::uint16_t>(qBound(1, width, 65535)),
++        static_cast<std::uint16_t>(qBound(1, height, 65535)));
++}
++
++void submitVideoInputButton(quint8 button, bool pressed)
++{
++    if (videoInputRuntime) videoInputRuntime->submitMouseButton(button, pressed);
++}
++
++void submitVideoInputWheel(qint16 deltaY)
++{
++    if (videoInputRuntime) videoInputRuntime->submitMouseWheel(0, deltaY);
++}
++
++void submitVideoInputKey(quint16 virtualKey, quint16 modifiers, bool pressed)
++{
++    if (videoInputRuntime) videoInputRuntime->submitKey(virtualKey, modifiers, pressed);
++}
++
++WaylandVideoSurface::InputHooks videoInputHooks()
++{
++    WaylandVideoSurface::InputHooks hooks;
++    hooks.absolute = submitVideoInputAbsolute;
++    hooks.button = submitVideoInputButton;
++    hooks.wheel = submitVideoInputWheel;
++    hooks.key = submitVideoInputKey;
++    return hooks;
++}
++#endif
++
+ class ExternalCommandScope final
+ {
+ public:
+@@ -244,9 +287,11 @@ public:
+             // Nothing in the render pass is needed: the pull runs on its own
+             // clock, and this only makes sure it is running. The clock belongs
+             // to the interface thread, so it is created there.
++            videoInputRuntime = m_runtime;
+             if (!m_waylandPullerInstalled.exchange(true)) {
+                 auto *surface = WaylandVideoSurface::instance();
+                 QMetaObject::invokeMethod(surface, [surface, this] {
++                    surface->setInputHooks(videoInputHooks());
+                     surface->setFramePuller([this] { pullWaylandFrame(); });
+                 }, Qt::QueuedConnection);
+             }
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index ba9cd728..658b5cd7 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -9,8 +9,10 @@
+ #include <QtGui/qguiapplication_platform.h>
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstring>
+ #include <ctime>
++#include <utility>
+ #include <unistd.h>
+ #include <wayland-client.h>
+ 
+@@ -154,18 +156,23 @@ void WaylandVideoSurface::handleKeyboardKeymap(void *, wl_keyboard *, quint32, i
+ void WaylandVideoSurface::handleKeyboardEnter(void *data, wl_keyboard *, quint32,
+                                               wl_surface *, wl_array *)
+ {
+-    // Any focus that lands here is a detour: the interface needs the keyboard
+-    // for game input, so ask for it back.
+-    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->focusInterfaceWindow();
++    // The stream window is the front window, so the compositor hands it the
++    // keyboard for as long as it exists. That is exactly what the game needs:
++    // every key is forwarded to the host from here.
++    Q_UNUSED(data);
+ }
+ 
+ void WaylandVideoSurface::handleKeyboardLeave(void *, wl_keyboard *, quint32, wl_surface *)
+ {
++    // Releasing on the way out would leave the game with keys held down; the
++    // surface releases them when it goes away instead.
+ }
+ 
+-void WaylandVideoSurface::handleKeyboardModifiers(void *, wl_keyboard *, quint32, quint32,
+-                                                  quint32, quint32, quint32)
++void WaylandVideoSurface::handleKeyboardModifiers(void *data, wl_keyboard *, quint32,
++                                                  quint32 depressed, quint32, quint32,
++                                                  quint32)
+ {
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->m_xkbModifiers = depressed;
+ }
+ 
+ void WaylandVideoSurface::handleKeyboardRepeatInfo(void *, wl_keyboard *, qint32, qint32)
+@@ -175,29 +182,280 @@ void WaylandVideoSurface::handleKeyboardRepeatInfo(void *, wl_keyboard *, qint32
+ void WaylandVideoSurface::handleKeyboardKey(void *data, wl_keyboard *, quint32, quint32,
+                                             quint32 key, quint32 state)
+ {
+-    // In windowed mode the user clicks the stream window, the compositor gives
+-    // it the keyboard and the interface would stop receiving F11. Hand that one
+-    // shortcut over; everything else has no use here because the interface
+-    // window is the one that forwards game input.
+     auto *self = static_cast<WaylandVideoSurface *>(data);
+-    if (!self || key != 87 /* KEY_F11 */
+-            || state != WL_KEYBOARD_KEY_STATE_PRESSED) {
++    if (!self) return;
++    const bool pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
++    if (key == 87 /* KEY_F11 */) {
++        // F11 is the interface's shortcut: it switches the window mode. The
++        // surface both consumes it and hands it over, so it works whether the
++        // key arrives here or at the interface.
++        if (!pressed) return;
++        QMetaObject::invokeMethod(self, [self] { emit self->toggleRequested(); },
++                                  Qt::QueuedConnection);
+         return;
+     }
+-    QMetaObject::invokeMethod(self, [self] { emit self->toggleRequested(); },
+-                              Qt::QueuedConnection);
++    self->submitKey(key, pressed);
++}
++
++void WaylandVideoSurface::handlePointerEnter(void *data, wl_pointer *pointer, quint32 serial,
++                                             wl_surface *, wl_fixed_t x, wl_fixed_t y)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    self->m_pointerInside = true;
++    // The game draws the cursor that matters; a second one under it would only
++    // be in the way.
++    wl_pointer_set_cursor(pointer, serial, nullptr, 0, 0);
++    self->flushDisplay();
++    self->submitPointer(wl_fixed_to_double(x), wl_fixed_to_double(y));
++}
++
++void WaylandVideoSurface::handlePointerLeave(void *data, wl_pointer *, quint32, wl_surface *)
++{
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->m_pointerInside = false;
++}
++
++void WaylandVideoSurface::handlePointerMotion(void *data, wl_pointer *, quint32, wl_fixed_t x,
++                                              wl_fixed_t y)
++{
++    if (auto *self = static_cast<WaylandVideoSurface *>(data))
++        self->submitPointer(wl_fixed_to_double(x), wl_fixed_to_double(y));
++}
++
++void WaylandVideoSurface::handlePointerButton(void *data, wl_pointer *, quint32, quint32,
++                                              quint32 button, quint32 state)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self || !self->m_input.button) return;
++    quint8 wire = 0;
++    switch (button) {
++    case 0x110: wire = 1; break;  // BTN_LEFT
++    case 0x111: wire = 3; break;  // BTN_RIGHT
++    case 0x112: wire = 2; break;  // BTN_MIDDLE
++    case 0x113: wire = 4; break;  // BTN_SIDE
++    case 0x114: wire = 5; break;  // BTN_EXTRA
++    default: return;
++    }
++    const bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
++    self->m_input.button(wire, pressed);
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: button %u pressed=%d", wire, pressed);
++}
++
++void WaylandVideoSurface::handlePointerAxis(void *data, wl_pointer *, quint32, quint32 axis,
++                                            wl_fixed_t value)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self || !self->m_input.wheel || axis != WL_POINTER_AXIS_VERTICAL_SCROLL) return;
++    // Wayland counts scroll steps downwards as positive; the host expects the
++    // Qt wheel delta, which is 120 units per notch and positive upwards.
++    const double steps = wl_fixed_to_double(value);
++    if (steps == 0.0) return;
++    const long units = std::lround(-steps * 12.0);
++    const auto delta = static_cast<qint16>(std::clamp(units, -32768L, 32767L));
++    self->m_input.wheel(delta);
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: wheel %ld", units);
++}
++
++void WaylandVideoSurface::handlePointerFrame(void *, wl_pointer *)
++{
++}
++
++void WaylandVideoSurface::handlePointerAxisSource(void *, wl_pointer *, quint32)
++{
+ }
+ 
+-void WaylandVideoSurface::focusInterfaceWindow()
++void WaylandVideoSurface::handlePointerAxisStop(void *, wl_pointer *, quint32, quint32)
+ {
+-    QPointer<QWindow> window = m_appWindow;
+-    if (!window) return;
+-    // The compositor focuses a fresh toplevel while it maps it, so ask for the
+-    // keyboard back once that has settled: without it the game would get no
+-    // input at all.
+-    QTimer::singleShot(150, window, [window] {
+-        if (window) window->requestActivate();
+-    });
++}
++
++void WaylandVideoSurface::handlePointerAxisDiscrete(void *, wl_pointer *, quint32, qint32)
++{
++}
++
++void WaylandVideoSurface::submitPointer(double x, double y)
++{
++    if (!m_input.absolute || !m_videoSize.isValid()) return;
++    // The surface carries the whole frame: unscaled when it is fullscreen, at
++    // the window's destination size when it is windowed. The host gets the
++    // point in the video's own pixels.
++    const QSizeF surfaceSize = m_windowed ? QSizeF(kWindowWidth, kWindowHeight)
++                                          : QSizeF(m_videoSize);
++    if (surfaceSize.width() <= 0 || surfaceSize.height() <= 0) return;
++    const double videoX = std::clamp(x * m_videoSize.width() / surfaceSize.width(), 0.0,
++                                     double(m_videoSize.width() - 1));
++    const double videoY = std::clamp(y * m_videoSize.height() / surfaceSize.height(), 0.0,
++                                     double(m_videoSize.height() - 1));
++    m_input.absolute(int(std::lround(videoX)), int(std::lround(videoY)),
++                     m_videoSize.width(), m_videoSize.height());
++    static quint64 lastLog = 0;
++    const quint64 now = monotonicNs();
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT") && now - lastLog > 500'000'000ull) {
++        lastLog = now;
++        qInfo("wayland-video input: pointer %dx%d of %dx%d", int(videoX), int(videoY),
++              m_videoSize.width(), m_videoSize.height());
++    }
++}
++
++void WaylandVideoSurface::submitKey(quint32 evdev, bool pressed)
++{
++    if (!m_input.key) return;
++    const quint16 virtualKey = virtualKeyFor(evdev);
++    if (virtualKey == 0) return;
++    if (pressed) {
++        if (m_heldKeys.contains(evdev)) return;  // compositor auto-repeat
++        m_heldKeys.insert(evdev);
++    } else if (!m_heldKeys.remove(evdev)) {
++        return;
++    }
++    const quint16 modifiers = wireModifiers(virtualKey);
++    m_input.key(virtualKey, modifiers, pressed);
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: key %u vk=0x%x mods=0x%x pressed=%d", evdev, virtualKey,
++              modifiers, pressed);
++}
++
++void WaylandVideoSurface::releaseHeldKeys()
++{
++    if (m_input.key) {
++        for (const quint32 evdev : std::as_const(m_heldKeys))
++            m_input.key(virtualKeyFor(evdev), 0, false);
++    }
++    m_heldKeys.clear();
++}
++
++quint16 WaylandVideoSurface::wireModifiers(quint16 virtualKey) const
++{
++    // wl_keyboard.modifiers carries the XKB masks: shift, lock, control, mod1
++    // (alt) and mod4 (super). The host wants the same bits the Qt path sends.
++    quint16 wire = 0;
++    if (m_xkbModifiers & 0x01) wire |= 0x01;
++    if (m_xkbModifiers & 0x04) wire |= 0x02;
++    if (m_xkbModifiers & 0x08) wire |= 0x04;
++    if (m_xkbModifiers & 0x40) wire |= 0x08;
++    // A modifier key is not also a held modifier while it travels.
++    switch (virtualKey) {
++    case 0xa0:
++    case 0xa1: wire &= ~0x01; break;
++    case 0xa2:
++    case 0xa3: wire &= ~0x02; break;
++    case 0xa4:
++    case 0xa5: wire &= ~0x04; break;
++    case 0x5b:
++    case 0x5c: wire &= ~0x08; break;
++    default: break;
++    }
++    return wire;
++}
++
++quint16 WaylandVideoSurface::virtualKeyFor(quint32 evdev)
++{
++    // Linux key codes as the compositor reports them, translated to the Windows
++    // virtual keys the host speaks. The physical keys of a keyboard game are all
++    // here; anything else is left alone rather than guessed.
++    switch (evdev) {
++    case 2: return 0x31;   // 1
++    case 3: return 0x32;   // 2
++    case 4: return 0x33;   // 3
++    case 5: return 0x34;   // 4
++    case 6: return 0x35;   // 5
++    case 7: return 0x36;   // 6
++    case 8: return 0x37;   // 7
++    case 9: return 0x38;   // 8
++    case 10: return 0x39;  // 9
++    case 11: return 0x30;  // 0
++    case 12: return 0xbd;  // -
++    case 13: return 0xbb;  // =
++    case 14: return 0x08;  // Backspace
++    case 15: return 0x09;  // Tab
++    case 16: return 0x51;  // Q
++    case 17: return 0x57;  // W
++    case 18: return 0x45;  // E
++    case 19: return 0x52;  // R
++    case 20: return 0x54;  // T
++    case 21: return 0x59;  // Y
++    case 22: return 0x55;  // U
++    case 23: return 0x49;  // I
++    case 24: return 0x4f;  // O
++    case 25: return 0x50;  // P
++    case 26: return 0xdb;  // [
++    case 27: return 0xdd;  // ]
++    case 28: return 0x0d;  // Enter
++    case 29: return 0xa2;  // Left control
++    case 30: return 0x41;  // A
++    case 31: return 0x53;  // S
++    case 32: return 0x44;  // D
++    case 33: return 0x46;  // F
++    case 34: return 0x47;  // G
++    case 35: return 0x48;  // H
++    case 36: return 0x4a;  // J
++    case 37: return 0x4b;  // K
++    case 38: return 0x4c;  // L
++    case 39: return 0xba;  // ;
++    case 40: return 0xde;  // '
++    case 41: return 0xc0;  // `
++    case 42: return 0xa0;  // Left shift
++    case 43: return 0xdc;  // Backslash
++    case 44: return 0x5a;  // Z
++    case 45: return 0x58;  // X
++    case 46: return 0x43;  // C
++    case 47: return 0x56;  // V
++    case 48: return 0x42;  // B
++    case 49: return 0x4e;  // N
++    case 50: return 0x4d;  // M
++    case 51: return 0xbc;  // ,
++    case 52: return 0xbe;  // .
++    case 53: return 0xbf;  // /
++    case 54: return 0xa1;  // Right shift
++    case 56: return 0xa4;  // Left alt
++    case 57: return 0x20;  // Space
++    case 58: return 0x14;  // Caps lock
++    case 69: return 0x90;  // Num lock
++    case 70: return 0x91;  // Scroll lock
++    case 71: return 0x67;  // Keypad 7
++    case 72: return 0x68;  // Keypad 8
++    case 73: return 0x69;  // Keypad 9
++    case 74: return 0x6d;  // Keypad -
++    case 75: return 0x64;  // Keypad 4
++    case 76: return 0x65;  // Keypad 5
++    case 77: return 0x66;  // Keypad 6
++    case 78: return 0x6b;  // Keypad +
++    case 79: return 0x61;  // Keypad 1
++    case 80: return 0x62;  // Keypad 2
++    case 81: return 0x63;  // Keypad 3
++    case 82: return 0x60;  // Keypad 0
++    case 83: return 0x6e;  // Keypad .
++    case 86: return 0xe2;  // The extra key next to left shift
++    case 88: return 0x7b;  // F12
++    case 96: return 0x0d;  // Keypad enter
++    case 97: return 0xa3;  // Right control
++    case 98: return 0x6f;  // Keypad /
++    case 99: return 0x2c;  // Print screen
++    case 100: return 0xa5; // Right alt
++    case 102: return 0x24; // Home
++    case 103: return 0x26; // Up
++    case 104: return 0x21; // Page up
++    case 105: return 0x25; // Left
++    case 106: return 0x27; // Right
++    case 107: return 0x23; // End
++    case 108: return 0x28; // Down
++    case 109: return 0x22; // Page down
++    case 110: return 0x2d; // Insert
++    case 111: return 0x2e; // Delete
++    case 119: return 0x13; // Pause
++    case 125: return 0x5b; // Left super
++    case 126: return 0x5c; // Right super
++    case 127: return 0x5d; // Menu
++    default: break;
++    }
++    if (evdev >= 59 && evdev <= 68) return quint16(0x70 + evdev - 59);  // F1..F10
++    return 0;
++}
++
++void WaylandVideoSurface::setInputHooks(InputHooks hooks)
++{
++    m_input = hooks;
+ }
+ 
+ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+@@ -231,10 +489,9 @@ bool WaylandVideoSurface::ensureSurface()
+         return false;
+     }
+ 
+-    // Every key belongs to the interface window, which forwards game input to
+-    // the host; remember which window that is before the compositor moves the
+-    // focus to the new toplevel.
+-    if (!m_appWindow) m_appWindow = QGuiApplication::focusWindow();
++    // The stream window is the surface the user is playing in, so it is also
++    // the one that has to feed the host: a compositor gives the pointer and the
++    // keyboard focus to the front window, not to the interface behind it.
+     m_surface = wl_compositor_create_surface(m_compositor);
+     m_xdgSurface = xdg_wm_base_get_xdg_surface(m_shell, m_surface);
+     static const xdg_surface_listener surfaceListener = [] {
+@@ -257,13 +514,10 @@ bool WaylandVideoSurface::ensureSurface()
+ 
+     if (m_viewporter) m_viewport = wp_viewporter_get_viewport(m_viewporter, m_surface);
+ 
+-    // The Qt window underneath keeps the input focus: game input travels the
+-    // path that already forwards it to the host, and this surface never eats a
+-    // click meant for the interface.
+-    if (wl_region *region = wl_compositor_create_region(m_compositor)) {
+-        wl_surface_set_input_region(m_surface, region);
+-        wl_region_destroy(region);
+-    }
++    // The stream window takes the pointer and the keyboard: it is the front
++    // window while the game runs, and a compositor gives the focus to the front
++    // window, so this is the only surface that can feed input to the host.
++    wl_surface_set_input_region(m_surface, nullptr);
+     wl_surface_commit(m_surface);
+     wl_display_roundtrip(m_display);
+     if (!m_configured) {
+@@ -288,21 +542,46 @@ bool WaylandVideoSurface::ensureSurface()
+         }();
+         wl_keyboard_add_listener(m_keyboard, &keyboardListener, this);
+     }
+-    focusInterfaceWindow();
++    if (m_seat && !m_pointer) {
++        m_pointer = wl_seat_get_pointer(m_seat);
++        static const wl_pointer_listener pointerListener = [] {
++            wl_pointer_listener listener{};
++            listener.enter = handlePointerEnter;
++            listener.leave = handlePointerLeave;
++            listener.motion = handlePointerMotion;
++            listener.button = handlePointerButton;
++            listener.axis = handlePointerAxis;
++            listener.frame = handlePointerFrame;
++            listener.axis_source = handlePointerAxisSource;
++            listener.axis_stop = handlePointerAxisStop;
++            listener.axis_discrete = handlePointerAxisDiscrete;
++            return listener;
++        }();
++        wl_pointer_add_listener(m_pointer, &pointerListener, this);
++    }
+     qInfo("wayland-video: stream window created");
+     return true;
+ }
+ 
+ void WaylandVideoSurface::destroySurface()
+ {
++    // The game must not be left with keys held down when the window goes away.
++    releaseHeldKeys();
+     if (m_pendingBuffer) {
+         wl_buffer_destroy(m_pendingBuffer);
+         m_pendingBuffer = nullptr;
+     }
++    if (m_pointer) {
++        wl_pointer_release(m_pointer);
++        m_pointer = nullptr;
++    }
+     if (m_keyboard) {
+         wl_keyboard_release(m_keyboard);
+         m_keyboard = nullptr;
+     }
++    m_pointerInside = false;
++    m_xkbModifiers = 0;
++    m_videoSize = QSize();
+     if (m_viewport) wp_viewport_destroy(m_viewport);
+     if (m_toplevel) xdg_toplevel_destroy(m_toplevel);
+     if (m_xdgSurface) xdg_surface_destroy(m_xdgSurface);
+@@ -333,6 +612,9 @@ void WaylandVideoSurface::present(Frame frame)
+ {
+     if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
+             && frame.size.height() > 0) {
++        // Pointer positions are reported in surface pixels; the video size is
++        // what they have to be expressed in.
++        m_videoSize = frame.size;
+         if (ensureSurface() && ensureDmabuf() && m_configured) {
+             attachFrame(frame);
+         } else {
+@@ -422,10 +704,9 @@ void WaylandVideoSurface::setWindowed(bool windowed)
+     } else {
+         xdg_toplevel_set_fullscreen(m_toplevel, nullptr);
+         if (m_viewport) wp_viewport_set_destination(m_viewport, -1, -1);
+-        if (wl_region *region = wl_compositor_create_region(m_compositor)) {
+-            wl_surface_set_input_region(m_surface, region);
+-            wl_region_destroy(region);
+-        }
++        // The whole surface takes input in both modes: the game is played in
++        // this window, whichever size it has.
++        wl_surface_set_input_region(m_surface, nullptr);
+     }
+     wl_surface_commit(m_surface);
+     flushDisplay();
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 079fd9da..686457d8 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -1,13 +1,17 @@
+ #pragma once
+ 
+ #include <QObject>
++#include <QSet>
+ #include <QSize>
+ #include <cstdint>
+ #include <functional>
+ 
++#include <wayland-client-core.h>
++
+ struct wl_array;
+ struct wl_buffer;
+ struct wl_keyboard;
++struct wl_pointer;
+ struct wl_seat;
+ class QTimer;
+ class QWindow;
+@@ -26,8 +30,10 @@ struct zwp_linux_dmabuf_v1;
+ // them to the Qt scene graph. The decoder writes NV12 into a DMA-BUF that the
+ // compositor can take straight to a plane, so nothing on the GPU has to convert
+ // or copy a 1080p frame before it reaches the screen. The surface is created on
+-// demand, ignores input (the Qt window underneath keeps receiving it) and is
+-// torn down when the stream ends.
++// demand, takes the pointer and the keyboard while it exists (it is the window
++// the user is playing in, and the compositor can only focus one window), feeds
++// them to the host through the streamer's own input API, and is torn down when
++// the stream ends.
+ class WaylandVideoSurface final : public QObject
+ {
+     Q_OBJECT
+@@ -53,13 +59,23 @@ public:
+     void present(Frame frame);
+     void dismiss();
+ 
+-    // Windowed mode is the interactive one: the compositor decorates the
+-    // window, its close button works, and clicking it does not reach the game.
+-    // Fullscreen mode is click-through so game input keeps reaching the
+-    // interface window that forwards it.
++    // Windowed mode is the manageable one: the compositor decorates the window
++    // and its close button works. Both modes forward the pointer and the
++    // keyboard to the host, so the game is playable in either of them.
+     Q_INVOKABLE void toggleWindowed();
+     void setWindowed(bool windowed);
+ 
++    // This target links Qt Gui only: it knows nothing about the streamer or the
++    // Qt Quick interface. Whoever owns the stream installs the path that carries
++    // input to the host, and the hooks speak plain numbers.
++    struct InputHooks {
++        void (*absolute)(int x, int y, int width, int height) = nullptr;
++        void (*button)(quint8 button, bool pressed) = nullptr;
++        void (*wheel)(qint16 deltaY) = nullptr;
++        void (*key)(quint16 virtualKey, quint16 modifiers, bool pressed) = nullptr;
++    };
++    void setInputHooks(InputHooks hooks);
++
+     // Development aid: behaves like the compositor's close button, so the
+     // stop-the-stream path can be exercised without aiming at a decoration.
+     void simulateCloseForDevelopment();
+@@ -118,8 +134,33 @@ private:
+                                         quint32 group);
+     static void handleKeyboardRepeatInfo(void *data, wl_keyboard *keyboard, qint32 rate,
+                                          qint32 delay);
+-    void focusInterfaceWindow();
++    static void handlePointerEnter(void *data, wl_pointer *pointer, quint32 serial,
++                                   wl_surface *surface, wl_fixed_t x, wl_fixed_t y);
++    static void handlePointerLeave(void *data, wl_pointer *pointer, quint32 serial,
++                                   wl_surface *surface);
++    static void handlePointerMotion(void *data, wl_pointer *pointer, quint32 time,
++                                    wl_fixed_t x, wl_fixed_t y);
++    static void handlePointerButton(void *data, wl_pointer *pointer, quint32 serial,
++                                    quint32 time, quint32 button, quint32 state);
++    static void handlePointerAxis(void *data, wl_pointer *pointer, quint32 time,
++                                  quint32 axis, wl_fixed_t value);
++    static void handlePointerFrame(void *data, wl_pointer *pointer);
++    static void handlePointerAxisSource(void *data, wl_pointer *pointer, quint32 source);
++    static void handlePointerAxisStop(void *data, wl_pointer *pointer, quint32 time,
++                                      quint32 axis);
++    static void handlePointerAxisDiscrete(void *data, wl_pointer *pointer, quint32 axis,
++                                          qint32 discrete);
++
++    // The stream window is the one the user is looking at, so it is also the
++    // one that has to feed the host: the compositor cannot hand the pointer or
++    // the keyboard to the interface window behind it.
++    void submitPointer(double x, double y);
++    void submitKey(quint32 evdev, bool pressed);
++    void releaseHeldKeys();
++    [[nodiscard]] quint16 wireModifiers(quint16 virtualKey) const;
++    [[nodiscard]] static quint16 virtualKeyFor(quint32 evdev);
+ 
++    InputHooks m_input;
+     wl_display *m_display = nullptr;
+     wl_registry *m_registry = nullptr;
+     wl_compositor *m_compositor = nullptr;
+@@ -127,9 +168,13 @@ private:
+     zwp_linux_dmabuf_v1 *m_dmabuf = nullptr;
+     wl_seat *m_seat = nullptr;
+     wl_keyboard *m_keyboard = nullptr;
+-    QWindow *m_appWindow = nullptr;
++    wl_pointer *m_pointer = nullptr;
+     FramePuller m_puller;
+     QTimer *m_pullTimer = nullptr;
++    QSize m_videoSize;
++    QSet<quint32> m_heldKeys;
++    quint32 m_xkbModifiers = 0;
++    bool m_pointerInside = false;
+ 
+     wl_surface *m_surface = nullptr;
+     xdg_surface *m_xdgSurface = nullptr;
