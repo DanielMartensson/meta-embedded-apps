@@ -1,0 +1,342 @@
+From 5fbe306c8f84c7176a7fcb5a0b4ba065b3c509ef Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 21:53:44 +0200
+Subject: [PATCH 0031] Let the mouse turn the game instead of pointing at it
+
+A game that looks with the mouse reads raw movement, not a position: a position
+stops at the edge of the screen, and so does the turn. Until now the stream
+window forwarded where the pointer was, which is enough for a menu and useless
+for aiming.
+
+While the window is fullscreen the pointer is now locked to it
+(zwp_pointer_constraints_v1), the movement is read from
+zwp_relative_pointer_v1 and sent as opennow_streamer_submit_mouse_relative. The
+windowed form keeps absolute positions, because that is the form used to reach
+the interface, and the lock is not guaranteed to activate: while it has not, the
+position keeps being forwarded, so nothing regresses on a compositor that does
+not grant it.
+
+The fraction of a surface unit is carried over between events instead of being
+rounded away, so a slow turn is not lost.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ opennow-qt/cmake/PlatformVideo.cmake          |   4 +-
+ .../rendering/NativeStreamRenderCallback.cpp  |  11 ++
+ .../rendering/WaylandVideoSurface.cpp         | 140 ++++++++++++++++++
+ .../streaming/rendering/WaylandVideoSurface.h |  24 +++
+ 4 files changed, 178 insertions(+), 1 deletion(-)
+
+diff --git a/opennow-qt/cmake/PlatformVideo.cmake b/opennow-qt/cmake/PlatformVideo.cmake
+index 22f56bd2..af34bfb2 100644
+--- a/opennow-qt/cmake/PlatformVideo.cmake
++++ b/opennow-qt/cmake/PlatformVideo.cmake
+@@ -20,7 +20,9 @@ file(MAKE_DIRECTORY "${OPENNOW_VIDEO_PROTOCOL_DIR}")
+ set(OPENNOW_VIDEO_PROTOCOLS
+     "xdg-shell|stable/xdg-shell/xdg-shell.xml"
+     "linux-dmabuf-unstable-v1|unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml"
+-    "viewporter|stable/viewporter/viewporter.xml")
++    "viewporter|stable/viewporter/viewporter.xml"
++    "pointer-constraints-unstable-v1|unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"
++    "relative-pointer-unstable-v1|unstable/relative-pointer/relative-pointer-unstable-v1.xml")
+ foreach(entry IN LISTS OPENNOW_VIDEO_PROTOCOLS)
+     string(REPLACE "|" ";" parts "${entry}")
+     list(GET parts 0 protocol_name)
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 43b2aead..7f54eeaf 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -43,6 +43,16 @@ void submitVideoInputAbsolute(int x, int y, int width, int height)
+         static_cast<std::uint16_t>(qBound(1, height, 65535)));
+ }
+ 
++void submitVideoInputRelative(int dx, int dy)
++{
++    if (!videoInputRuntime) return;
++    // The host takes a 16-bit step, and a compositor can report a jump larger
++    // than that when the pointer is locked and the mouse flies.
++    videoInputRuntime->submitMouseRelative(
++        static_cast<qint16>(qBound(-32768, dx, 32767)),
++        static_cast<qint16>(qBound(-32768, dy, 32767)));
++}
++
+ void submitVideoInputButton(quint8 button, bool pressed)
+ {
+     if (videoInputRuntime) videoInputRuntime->submitMouseButton(button, pressed);
+@@ -62,6 +72,7 @@ WaylandVideoSurface::InputHooks videoInputHooks()
+ {
+     WaylandVideoSurface::InputHooks hooks;
+     hooks.absolute = submitVideoInputAbsolute;
++    hooks.relative = submitVideoInputRelative;
+     hooks.button = submitVideoInputButton;
+     hooks.wheel = submitVideoInputWheel;
+     hooks.key = submitVideoInputKey;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index cd80ee21..6ffd646c 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -19,6 +19,8 @@
+ #include <wayland-client.h>
+ 
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
++#include "pointer-constraints-unstable-v1-client-protocol.h"
++#include "relative-pointer-unstable-v1-client-protocol.h"
+ #include "viewporter-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ 
+@@ -64,6 +66,8 @@ WaylandVideoSurface::WaylandVideoSurface(QObject *parent)
+ WaylandVideoSurface::~WaylandVideoSurface()
+ {
+     dismiss();
++    if (m_relativePointerManager) zwp_relative_pointer_manager_v1_destroy(m_relativePointerManager);
++    if (m_pointerConstraints) zwp_pointer_constraints_v1_destroy(m_pointerConstraints);
+     if (m_dmabuf) zwp_linux_dmabuf_v1_destroy(m_dmabuf);
+     if (m_shell) xdg_wm_base_destroy(m_shell);
+     if (m_compositor) wl_compositor_destroy(m_compositor);
+@@ -71,6 +75,8 @@ WaylandVideoSurface::~WaylandVideoSurface()
+     if (m_display) wl_display_flush(m_display);
+     closeDeferredFds();
+     m_dmabuf = nullptr;
++    m_relativePointerManager = nullptr;
++    m_pointerConstraints = nullptr;
+     m_shell = nullptr;
+     m_compositor = nullptr;
+     m_registry = nullptr;
+@@ -124,6 +130,14 @@ void WaylandVideoSurface::handleGlobal(void *data, wl_registry *registry, quint3
+         self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
+             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+                              std::min(version, 3u)));
++    } else if (std::strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
++        self->m_pointerConstraints = static_cast<zwp_pointer_constraints_v1 *>(
++            wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface,
++                             std::min(version, 1u)));
++    } else if (std::strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
++        self->m_relativePointerManager = static_cast<zwp_relative_pointer_manager_v1 *>(
++            wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface,
++                             std::min(version, 1u)));
+     }
+ }
+ 
+@@ -222,6 +236,7 @@ void WaylandVideoSurface::handlePointerEnter(void *data, wl_pointer *pointer, qu
+     // The game draws the cursor that matters; a second one under it would only
+     // be in the way.
+     wl_pointer_set_cursor(pointer, serial, nullptr, 0, 0);
++    self->updatePointerConstraint();
+     self->flushDisplay();
+     self->submitPointer(wl_fixed_to_double(x), wl_fixed_to_double(y));
+ }
+@@ -290,8 +305,105 @@ void WaylandVideoSurface::handlePointerAxisDiscrete(void *, wl_pointer *, quint3
+ {
+ }
+ 
++void WaylandVideoSurface::handleRelativeMotion(void *data, zwp_relative_pointer_v1 *, quint32,
++                                               quint32, wl_fixed_t dx, wl_fixed_t dy,
++                                               wl_fixed_t, wl_fixed_t)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    // Only movement is taken while the pointer is actually held in place; the
++    // rest of the time the position keeps the host cursor where the user sees
++    // it, which is what menus are aimed with.
++    if (!self || !self->m_lockActive) return;
++    self->submitRelative(wl_fixed_to_double(dx), wl_fixed_to_double(dy));
++}
++
++void WaylandVideoSurface::handleLocked(void *data, zwp_locked_pointer_v1 *)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    self->m_lockActive = true;
++    self->m_relativeRest[0] = self->m_relativeRest[1] = 0.0;
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: pointer locked to the stream window");
++}
++
++void WaylandVideoSurface::handleUnlocked(void *data, zwp_locked_pointer_v1 *lockedPointer)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    // The compositor took the pointer away, which it does when another window
++    // takes the focus. Drop the constraint and ask for a new one after this
++    // event has been dispatched, so the next entry is captured too.
++    self->m_lockedPointer = nullptr;
++    self->m_lockActive = false;
++    zwp_locked_pointer_v1_destroy(lockedPointer);
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: pointer lock released by the compositor");
++    QMetaObject::invokeMethod(self, [self] { self->updatePointerConstraint(); },
++                              Qt::QueuedConnection);
++}
++
++void WaylandVideoSurface::updatePointerConstraint()
++{
++    // Fullscreen is the playing mode: the frame fills the screen, so where the
++    // pointer sits carries nothing the host needs. The pointer is locked to the
++    // window instead and only the movement travels, which is what a game that
++    // turns with the mouse reads - an absolute position stops at the edge of
++    // the screen, and so does the turn. The windowed form exists to reach the
++    // interface, so the pointer stays free and absolute there.
++    const bool wanted = m_surface && m_pointer && !m_windowed;
++    m_capturePointer = wanted;
++    if (!wanted) {
++        if (m_lockedPointer) {
++            zwp_locked_pointer_v1_destroy(m_lockedPointer);
++            m_lockedPointer = nullptr;
++        }
++        m_relativeRest[0] = m_relativeRest[1] = 0.0;
++        m_lockActive = false;
++        return;
++    }
++    if (m_lockedPointer || !m_pointerConstraints || !m_pointerInside) return;
++    m_lockedPointer = zwp_pointer_constraints_v1_lock_pointer(
++        m_pointerConstraints, m_surface, m_pointer, nullptr,
++        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
++    static const zwp_locked_pointer_v1_listener lockedListener = [] {
++        zwp_locked_pointer_v1_listener listener{};
++        listener.locked = handleLocked;
++        listener.unlocked = handleUnlocked;
++        return listener;
++    }();
++    zwp_locked_pointer_v1_add_listener(m_lockedPointer, &lockedListener, this);
++    flushDisplay();
++}
++
++void WaylandVideoSurface::submitRelative(double dx, double dy)
++{
++    if (!m_input.relative) return;
++    // Wayland counts surface units, and in fullscreen the surface is the frame
++    // at its own size, so the host receives movement in its own pixels. The
++    // fraction is carried over rather than rounded away: a slow turn arrives in
++    // pieces smaller than a pixel.
++    m_relativeRest[0] += dx;
++    m_relativeRest[1] += dy;
++    const int wholeX = int(m_relativeRest[0]);
++    const int wholeY = int(m_relativeRest[1]);
++    if (wholeX == 0 && wholeY == 0) return;
++    m_relativeRest[0] -= wholeX;
++    m_relativeRest[1] -= wholeY;
++    m_input.relative(wholeX, wholeY);
++    static quint64 lastLog = 0;
++    const quint64 now = monotonicNs();
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT") && now - lastLog > 500'000'000ull) {
++        lastLog = now;
++        qInfo("wayland-video input: relative %dx%d", wholeX, wholeY);
++    }
++}
++
+ void WaylandVideoSurface::submitPointer(double x, double y)
+ {
++    // A locked pointer carries no position worth sending; its movement goes
++    // through submitRelative instead.
++    if (m_lockActive) return;
+     if (!m_input.absolute || !m_videoSize.isValid()) return;
+     // The surface carries the whole frame: unscaled when it is fullscreen, at
+     // the window's destination size when it is windowed. The host gets the
+@@ -582,6 +694,21 @@ bool WaylandVideoSurface::ensureSurface()
+         }();
+         wl_pointer_add_listener(m_pointer, &pointerListener, this);
+     }
++    if (m_pointer && !m_relativePointer && m_relativePointerManager) {
++        // Raw movement is a different stream from the position: a game that
++        // looks with the mouse needs the deltas, and they keep coming while
++        // the pointer itself is locked in place.
++        m_relativePointer =
++            zwp_relative_pointer_manager_v1_get_relative_pointer(m_relativePointerManager,
++                                                                 m_pointer);
++        static const zwp_relative_pointer_v1_listener relativeListener = [] {
++            zwp_relative_pointer_v1_listener listener{};
++            listener.relative_motion = handleRelativeMotion;
++            return listener;
++        }();
++        zwp_relative_pointer_v1_add_listener(m_relativePointer, &relativeListener, this);
++    }
++    updatePointerConstraint();
+     qInfo("wayland-video: stream window created");
+     return true;
+ }
+@@ -590,6 +717,18 @@ void WaylandVideoSurface::destroySurface()
+ {
+     // The game must not be left with keys held down when the window goes away.
+     releaseHeldKeys();
++    // The constraint and the relative pointer both belong to the pointer, so
++    // they have to go first.
++    m_capturePointer = false;
++    m_lockActive = false;
++    if (m_lockedPointer) {
++        zwp_locked_pointer_v1_destroy(m_lockedPointer);
++        m_lockedPointer = nullptr;
++    }
++    if (m_relativePointer) {
++        zwp_relative_pointer_v1_destroy(m_relativePointer);
++        m_relativePointer = nullptr;
++    }
+     if (m_pointer) {
+         wl_pointer_release(m_pointer);
+         m_pointer = nullptr;
+@@ -826,6 +965,7 @@ void WaylandVideoSurface::setWindowed(bool windowed)
+         wl_surface_set_input_region(m_surface, nullptr);
+     }
+     wl_surface_commit(m_surface);
++    updatePointerConstraint();
+     flushDisplay();
+     qInfo("wayland-video: stream window %s", windowed ? "windowed" : "fullscreen");
+     emit windowedChanged();
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 060f32c9..b02464f5 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -26,7 +26,11 @@ struct xdg_toplevel;
+ struct xdg_wm_base;
+ struct wp_viewport;
+ struct wp_viewporter;
++struct zwp_locked_pointer_v1;
+ struct zwp_linux_dmabuf_v1;
++struct zwp_pointer_constraints_v1;
++struct zwp_relative_pointer_manager_v1;
++struct zwp_relative_pointer_v1;
+ 
+ // Presents decoded frames on a Wayland surface of its own instead of handing
+ // them to the Qt scene graph. The decoder writes NV12 into a DMA-BUF that the
+@@ -72,6 +76,7 @@ public:
+     // input to the host, and the hooks speak plain numbers.
+     struct InputHooks {
+         void (*absolute)(int x, int y, int width, int height) = nullptr;
++        void (*relative)(int dx, int dy) = nullptr;
+         void (*button)(quint8 button, bool pressed) = nullptr;
+         void (*wheel)(qint16 deltaY) = nullptr;
+         void (*key)(quint16 virtualKey, quint16 modifiers, bool pressed) = nullptr;
+@@ -153,6 +158,18 @@ private:
+                                       quint32 axis);
+     static void handlePointerAxisDiscrete(void *data, wl_pointer *pointer, quint32 axis,
+                                           qint32 discrete);
++    static void handleRelativeMotion(void *data, zwp_relative_pointer_v1 *relativePointer,
++                                     quint32 timeHi, quint32 timeLo, wl_fixed_t dx,
++                                     wl_fixed_t dy, wl_fixed_t dxUnaccelerated,
++                                     wl_fixed_t dyUnaccelerated);
++    static void handleLocked(void *data, zwp_locked_pointer_v1 *lockedPointer);
++    static void handleUnlocked(void *data, zwp_locked_pointer_v1 *lockedPointer);
++
++    // A game that looks with the mouse reads raw movement, not a position that
++    // stops at the edge of the screen: while the window is fullscreen the
++    // pointer is locked to it and only the deltas travel to the host.
++    void updatePointerConstraint();
++    void submitRelative(double dx, double dy);
+ 
+     // The stream window is the one the user is looking at, so it is also the
+     // one that has to feed the host: the compositor cannot hand the pointer or
+@@ -172,6 +189,13 @@ private:
+     wl_seat *m_seat = nullptr;
+     wl_keyboard *m_keyboard = nullptr;
+     wl_pointer *m_pointer = nullptr;
++    zwp_pointer_constraints_v1 *m_pointerConstraints = nullptr;
++    zwp_relative_pointer_manager_v1 *m_relativePointerManager = nullptr;
++    zwp_relative_pointer_v1 *m_relativePointer = nullptr;
++    zwp_locked_pointer_v1 *m_lockedPointer = nullptr;
++    bool m_capturePointer = false;
++    bool m_lockActive = false;
++    double m_relativeRest[2] = {0.0, 0.0};
+     FramePuller m_puller;
+     QTimer *m_pullTimer = nullptr;
+     QSize m_videoSize;
+-- 
+2.43.0
+

@@ -1,0 +1,84 @@
+From ff7cb2f1af6a055908195622dc4d1a910fb365c2 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 22:17:59 +0200
+Subject: [PATCH 0032] Switch the window once per F11 press
+
+Holding F11 flipped the stream window between windowed and fullscreen six times
+a second: the shortcut repeats while the key is down, and on the stream window's
+own connection Wayland reports a held key as further presses. Fifteen switches
+in two seconds ended in the VeriSilicon driver's Wayland WSI
+(gc_wsi_surface_wayland.c, buffer_fenced_release) and took the application with
+it - twice, both times after a stream had just ended and the key was pressed
+again to get out.
+
+The shortcut no longer repeats, and the stream window's key handler counts one
+F11 until the key is released, so one press is one switch however long it is
+held.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ opennow-qt/qml/Main.qml                              |  4 ++++
+ .../src/streaming/rendering/WaylandVideoSurface.cpp  | 12 ++++++++++--
+ .../src/streaming/rendering/WaylandVideoSurface.h    |  1 +
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/opennow-qt/qml/Main.qml b/opennow-qt/qml/Main.qml
+index c72320d6..8f6c6296 100644
+--- a/opennow-qt/qml/Main.qml
++++ b/opennow-qt/qml/Main.qml
+@@ -264,6 +264,10 @@ ApplicationWindow {
+         objectName: "shellFullscreenShortcut"
+         sequence: "F11"
+         context: Qt.ApplicationShortcut
++        // A held key repeats, and every repeat would switch the window again:
++        // holding F11 for a second flipped the stream window six times and took
++        // the graphics driver down with it. One switch per press.
++        autoRepeat: false
+         // With a stream window of its own, F11 keeps working: it switches that
+         // window between windowed and fullscreen instead of the interface.
+         enabled: window.activeRoute !== "stream" || NativeVideoWindow.mapped
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 6ffd646c..a08a212d 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -218,8 +218,15 @@ void WaylandVideoSurface::handleKeyboardKey(void *data, wl_keyboard *, quint32,
+     if (key == 87 /* KEY_F11 */) {
+         // F11 is the interface's shortcut: it switches the window mode. The
+         // surface both consumes it and hands it over, so it works whether the
+-        // key arrives here or at the interface.
+-        if (!pressed) return;
++        // key arrives here or at the interface. Held keys repeat as further
++        // presses on this connection, and a repeating switch turns the window
++        // over several times a second, so only the first press counts.
++        if (!pressed) {
++            self->m_f11Down = false;
++            return;
++        }
++        if (self->m_f11Down) return;
++        self->m_f11Down = true;
+         QMetaObject::invokeMethod(self, [self] { emit self->toggleRequested(); },
+                                   Qt::QueuedConnection);
+         return;
+@@ -446,6 +453,7 @@ void WaylandVideoSurface::submitKey(quint32 evdev, bool pressed)
+ 
+ void WaylandVideoSurface::releaseHeldKeys()
+ {
++    m_f11Down = false;
+     if (m_input.key) {
+         for (const quint32 evdev : std::as_const(m_heldKeys))
+             m_input.key(virtualKeyFor(evdev), 0, false);
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index b02464f5..e67fd119 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -200,6 +200,7 @@ private:
+     QTimer *m_pullTimer = nullptr;
+     QSize m_videoSize;
+     QSet<quint32> m_heldKeys;
++    bool m_f11Down = false;
+     quint32 m_xkbModifiers = 0;
+     bool m_pointerInside = false;
+ 
+-- 
+2.43.0
+

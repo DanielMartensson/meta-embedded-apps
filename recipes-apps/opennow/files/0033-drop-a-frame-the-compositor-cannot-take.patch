@@ -1,0 +1,82 @@
+From 64f6a58c08e61fd48d9530716ee37e898df7ac75 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 22 Oct 2026 22:41:12 +0200
+Subject: [PATCH 0033] Treat a frame the compositor cannot take as a dropped frame
+
+A stream started, the stream window appeared, the pointer locked to it, and then
+one frame came back from the decoder that the compositor's DMA-BUF path could
+not hand over. The application treated that as a fatal presentation failure: it
+stopped the media transport, reopened the session and connected again, and the
+interface spent the whole reconnect showing its progress animation. One
+unpresentable frame cost the session.
+
+The decoder does produce such frames by itself - the first ones after a stream
+starts, a repeated picture, a frame that failed to decode into a buffer - and
+they carry no exportable object, so the native side reports a render failure.
+The compositor path now counts them and keeps pulling: a frame that cannot be
+shown is dropped, and only two seconds without a presentable frame is treated as
+a real failure, with the interface reporting it once.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ .../rendering/NativeStreamRenderCallback.cpp  | 29 +++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 7f54eeaf..46b04708 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -272,9 +272,11 @@ public:
+             m_waylandVideo = true;
+             m_outputKind = 0;
+             m_outputDirty = false;
++            m_droppedFrames = 0;
+         } else if (status == OPENNOW_STREAMER_OK && recorded.dmabuf_fd < 0) {
+-            reportFailure(QStringLiteral("The decoder handed over no DMA-BUF frame. Set OPENNOW_WAYLAND_VIDEO=0 to present inside the interface again."));
+-            m_waylandVideo = false;
++            dropUnpresentableFrame("the decoder handed over no DMA-BUF frame");
++        } else if (status == OPENNOW_STREAMER_RENDER_FAILED) {
++            dropUnpresentableFrame("the frame could not be exported as a DMA-BUF");
+         } else if (status != OPENNOW_STREAMER_OK && status != OPENNOW_STREAMER_NO_FRAME
+                    && status != OPENNOW_STREAMER_STALE_FRAME
+                    && status != OPENNOW_STREAMER_CLOSED
+@@ -296,6 +298,25 @@ public:
+     }
+ #endif
+ 
++    // A single frame that cannot reach the compositor is a dropped frame, not a
++    // broken stream. The decoder produces a few frames that expose no
++    // exportable buffer (the first ones after a stream starts, a repeated
++    // picture, a frame that failed to decode into a buffer), and treating one
++    // of them as fatal stopped the media transport and reopened the session
++    // over a stutter. Nothing is shown for two seconds only when the frames
++    // really stopped being presentable, and then the interface says so.
++    void dropUnpresentableFrame(const char *reason)
++    {
++        if (++m_droppedFrames < kDroppedFrameLimit) {
++            if (m_droppedFrames == 1)
++                qWarning("wayland-video: dropping a frame (%s); continuing", reason);
++            return;
++        }
++        m_waylandVideo = false;
++        reportFailure(QStringLiteral("The decoder stopped handing over DMA-BUF frames (%1). Set OPENNOW_WAYLAND_VIDEO=0 to present inside the interface again.")
++                          .arg(QLatin1String(reason)));
++    }
++
+     void prepareNativeFrame(QRhiCommandBuffer *commandBuffer)
+     {
+         if (!m_runtime || !m_runtime->presentationAllowed()
+@@ -749,6 +770,10 @@ private:
+     int m_outputKind = 0;
+     std::atomic_bool m_needsFrame = false;
+     std::atomic_bool m_waylandVideo = false;
++    // Frames the compositor path could not take since the last good one: about
++    // two seconds at stream rate.
++    static constexpr int kDroppedFrameLimit = 120;
++    int m_droppedFrames = 0;
+     std::atomic_bool m_waylandPullerInstalled = false;
+     std::atomic_bool m_midpointSwapped = false;
+     std::atomic_int m_submittedKind = 0;
+-- 
+2.43.0
+

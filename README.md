@@ -170,7 +170,7 @@ is `1.0.4+git...` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0030` in `recipes-apps/opennow/files/` are the only changes to the
+`0001`-`0034` in `recipes-apps/opennow/files/` are the only changes to the
 upstream tree. (`0022` is not part of the series: it was an abandoned
 experiment and never entered the tree.)
 
@@ -205,6 +205,10 @@ experiment and never entered the tree.)
 | `0028` | Close the frame descriptor only once Wayland has taken it, and close the descriptor of a recorded frame that is not presented. A stream that keeps producing frames while the picture is refused no longer leaks a descriptor per frame. |
 | `0029` | Keep one `wl_buffer` per decoder buffer instead of building one per frame. Weston 13 never closes the descriptors behind an imported dma-buf buffer, so a stream at 50 fps exhausted the compositor's 1024 descriptors in about twenty seconds and the connection died with `invalid arguments for zwp_linux_buffer_params_v1.add`. |
 | `0030` | Stop repainting the interface while the stream window covers it, and report the fourcc, size, modifier and plane layout of every buffer the surface hands to the compositor. The repaint clock was left over from `0024`, when each frame was pulled during an interface repaint; it kept an invisible window in the compositor's buffer queue, and the one assertion seen in the VeriSilicon driver's Wayland WSI came from that swapchain. |
+| `0031` | Let the mouse turn the game: while the stream window is fullscreen the pointer is locked to it and only the movement goes to the host, so a game turns instead of the cursor running into the edge of the screen. |
+| `0032` | Switch the window mode once per `F11` press. The release repeated the switch, so one tap went fullscreen, windowed and fullscreen again. |
+| `0033` | Treat a frame the compositor cannot take as a dropped frame instead of a failed session. The first unpresentable frame after a stream starts used to stop the transport and reconnect; now two seconds without a presentable frame is the failure. |
+| `0034` | Open the streamer's input path from the stream window, and let the host decide whether it wants a position or movement. Without `opennow_streamer_set_capture_active` the input queue discarded every event, so the cursor in the game never moved and no key reached it. Locking the pointer for every fullscreen stream also sent movement to menus and login screens, which are aimed with a position; the window now follows the host's cursor state. |
 
 #### The stream window
 

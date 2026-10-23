@@ -1,0 +1,197 @@
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 46b04708..fa55a390 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -68,6 +68,17 @@ void submitVideoInputKey(quint16 virtualKey, quint16 modifiers, bool pressed)
+     if (videoInputRuntime) videoInputRuntime->submitKey(virtualKey, modifiers, pressed);
+ }
+ 
++void setVideoInputCapture(bool active, bool relative)
++{
++    if (!videoInputRuntime) return;
++    // The streamer discards every event until it has been told that the user is
++    // playing in a window the embedder feeds, and it refuses input until the
++    // host has authorized the session. Both gates are opened here.
++    bool rawInput = false;
++    videoInputRuntime->setCaptureActive(active && videoInputRuntime->inputAllowed(),
++                                        relative, 0, &rawInput);
++}
++
+ WaylandVideoSurface::InputHooks videoInputHooks()
+ {
+     WaylandVideoSurface::InputHooks hooks;
+@@ -76,6 +87,7 @@ WaylandVideoSurface::InputHooks videoInputHooks()
+     hooks.button = submitVideoInputButton;
+     hooks.wheel = submitVideoInputWheel;
+     hooks.key = submitVideoInputKey;
++    hooks.capture = setVideoInputCapture;
+     return hooks;
+ }
+ #endif
+@@ -330,6 +342,29 @@ public:
+             videoInputRuntime = m_runtime;
+             if (!m_waylandPullerInstalled.exchange(true)) {
+                 auto *surface = WaylandVideoSurface::instance();
++                auto *runtime = m_runtime;
++                // Which kind of pointer the host wants is the host's decision:
++                // a game that hides the cursor reads raw movement, every other
++                // screen is aimed with a position. The window follows that
++                // instead of assuming that fullscreen means mouselook.
++                QObject::connect(runtime, &NativeStreamRuntime::cursorUpdated, surface,
++                                 [surface](const QByteArray &bytes) {
++                                     const bool hidden = bytes.size() >= 2
++                                         && quint8(bytes[0]) == 0 && quint8(bytes[1]) == 0;
++                                     surface->setServerCursorHidden(hidden);
++                                 }, Qt::QueuedConnection);
++                QObject::connect(runtime, &NativeStreamRuntime::cursorCaptureChanged, surface,
++                                 [surface](bool composited) {
++                                     if (composited) surface->setServerCursorHidden(false);
++                                 }, Qt::QueuedConnection);
++                QObject::connect(runtime, &NativeStreamRuntime::cursorStateReset, surface,
++                                 [surface] { surface->setServerCursorHidden(false); },
++                                 Qt::QueuedConnection);
++                // Input stays refused until the host authorizes the session, so
++                // the window has to re-open the path when that happens.
++                QObject::connect(runtime, &NativeStreamRuntime::inputAllowedChanged, surface,
++                                 [surface] { surface->refreshCaptureState(); },
++                                 Qt::QueuedConnection);
+                 QMetaObject::invokeMethod(surface, [surface, this] {
+                     surface->setInputHooks(videoInputHooks());
+                     surface->setFramePuller([this] { pullWaylandFrame(); });
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index a08a212d..705e2f06 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -188,14 +188,45 @@ void WaylandVideoSurface::handleKeyboardEnter(void *data, wl_keyboard *, quint32
+ {
+     // The stream window is the front window, so the compositor hands it the
+     // keyboard for as long as it exists. That is exactly what the game needs:
+-    // every key is forwarded to the host from here.
+-    Q_UNUSED(data);
++    // every key is forwarded to the host from here - once the streamer has been
++    // told that the user is playing in this window.
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->setCaptureActive(true);
+ }
+ 
+-void WaylandVideoSurface::handleKeyboardLeave(void *, wl_keyboard *, quint32, wl_surface *)
++void WaylandVideoSurface::handleKeyboardLeave(void *data, wl_keyboard *, quint32, wl_surface *)
+ {
+-    // Releasing on the way out would leave the game with keys held down; the
+-    // surface releases them when it goes away instead.
++    // Another window took the keyboard, so the game must not keep receiving
++    // keys the user is typing somewhere else. Releasing the held ones here is
++    // what a real keyboard focus change does.
++    if (auto *self = static_cast<WaylandVideoSurface *>(data)) self->setCaptureActive(false);
++}
++
++void WaylandVideoSurface::setCaptureActive(bool active)
++{
++    if (m_captureActive == active) return;
++    m_captureActive = active;
++    if (active && m_input.capture)
++        m_input.capture(true, m_serverCursorHidden);
++    else if (m_input.capture)
++        m_input.capture(false, false);
++    if (!active) releaseHeldKeys();
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: capture %s", active ? "active" : "inactive");
++}
++
++void WaylandVideoSurface::refreshCaptureState()
++{
++    if (m_input.capture) m_input.capture(m_captureActive, m_serverCursorHidden);
++}
++
++void WaylandVideoSurface::setServerCursorHidden(bool hidden)
++{
++    if (m_serverCursorHidden == hidden) return;
++    m_serverCursorHidden = hidden;
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: host %s the cursor", hidden ? "hides" : "shows");
++    updatePointerConstraint();
++    refreshCaptureState();
+ }
+ 
+ void WaylandVideoSurface::handleKeyboardModifiers(void *data, wl_keyboard *, quint32,
+@@ -352,13 +383,12 @@ void WaylandVideoSurface::handleUnlocked(void *data, zwp_locked_pointer_v1 *lock
+ 
+ void WaylandVideoSurface::updatePointerConstraint()
+ {
+-    // Fullscreen is the playing mode: the frame fills the screen, so where the
+-    // pointer sits carries nothing the host needs. The pointer is locked to the
+-    // window instead and only the movement travels, which is what a game that
+-    // turns with the mouse reads - an absolute position stops at the edge of
+-    // the screen, and so does the turn. The windowed form exists to reach the
+-    // interface, so the pointer stays free and absolute there.
+-    const bool wanted = m_surface && m_pointer && !m_windowed;
++    // A game that hides the cursor and turns with the mouse reads raw movement,
++    // not a position that stops at the edge of the screen, so the pointer is
++    // locked to the window for as long as the host keeps the cursor hidden.
++    // Every other screen - a menu, an inventory, a launcher - is aimed with a
++    // cursor, and those need the position: the pointer stays free.
++    const bool wanted = m_surface && m_pointer && m_serverCursorHidden;
+     m_capturePointer = wanted;
+     if (!wanted) {
+         if (m_lockedPointer) {
+@@ -592,6 +622,10 @@ quint16 WaylandVideoSurface::virtualKeyFor(quint32 evdev)
+ void WaylandVideoSurface::setInputHooks(InputHooks hooks)
+ {
+     m_input = hooks;
++    // The window is focused before the first frame asks for the hooks, so the
++    // capture state it collected has to be handed over now rather than at the
++    // next focus change.
++    refreshCaptureState();
+ }
+ 
+ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+@@ -1012,6 +1046,8 @@ void WaylandVideoSurface::simulateCloseForDevelopment()
+ void WaylandVideoSurface::dismiss()
+ {
+     if (!m_surface) return;
++    // The window is about to go away; no key may stay held down in the game.
++    setCaptureActive(false);
+     wl_surface_attach(m_surface, nullptr, 0, 0);
+     wl_surface_commit(m_surface);
+     flushDisplay();
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index e67fd119..9a2fc189 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -80,6 +80,11 @@ public:
+         void (*button)(quint8 button, bool pressed) = nullptr;
+         void (*wheel)(qint16 deltaY) = nullptr;
+         void (*key)(quint16 virtualKey, quint16 modifiers, bool pressed) = nullptr;
++        // The streamer keeps its input path closed until it is told that the
++        // user is playing in this window, and it drops every event while it is
++        // closed. relative says whether the host wants movement rather than a
++        // position.
++        void (*capture)(bool active, bool relative) = nullptr;
+     };
+     void setInputHooks(InputHooks hooks);
+ 
+@@ -87,6 +92,15 @@ public:
+     // stop-the-stream path can be exercised without aiming at a decoration.
+     void simulateCloseForDevelopment();
+ 
++    // The host decides which kind of pointer it wants. A game that shows a
++    // cursor (a menu, an inventory) needs positions; a game that hides it and
++    // turns with the mouse needs raw movement, which is why the compositor
++    // locks the pointer for as long as the host hides the cursor.
++    void setServerCursorHidden(bool hidden);
++    // The streamer authorizes input only once the session is streaming; ask the
++    // owner to re-apply the current state when that changes.
++    void refreshCaptureState();
++
+     // The video advances on a clock of its own instead of once per interface
+     // repaint. The callback is called from the interface thread and is expected
+     // to pull one frame from the decoder and present it here.
+@@ -195,6 +209,9 @@ private:
+     zwp_locked_pointer_v1 *m_lockedPointer = nullptr;
+     bool m_capturePointer = false;
+     bool m_lockActive = false;
++    bool m_serverCursorHidden = false;
++    bool m_captureActive = false;
++    void setCaptureActive(bool active);
+     double m_relativeRest[2] = {0.0, 0.0};
+     FramePuller m_puller;
+     QTimer *m_pullTimer = nullptr;
