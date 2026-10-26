@@ -1,0 +1,251 @@
+From 6e4d5e970c8f4f2988d7f32b56f51ced142e058c Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Mon, 26 Oct 2026 08:08:34 +0100
+Subject: [PATCH] Create a buffer-export Vulkan device when the board has no
+ Vulkan Video
+
+The compositor path presents the decoder's DMA-BUF through wl_dmabuf and
+never records a GPU command, but the native frame producer still validates
+the adopted Vulkan handles before it can export a frame. On the STM32MP25
+the VeriSilicon device has no VK_KHR_video_queue or decode extensions, so
+the shared-device probe rejected every candidate and the interface was left
+without a device: the stream window reported "The streamer has no Vulkan
+device for the video" and presented nothing.
+
+A board that decodes through V4L2 Request or VA-API does not need a Vulkan
+Video decoder. Build the shared device as a plain buffer-export device in
+that case: take the first graphics queue family instead of reserving an
+isolated Qt queue, advertise no decode profiles, and keep the instance and
+swapchain extensions the interface needs to adopt the device. The gate in
+ApplicationStartup no longer probes for Vulkan Video first, so the device is
+created on these boards instead of being skipped.
+
+Qt only wraps the native instance in a QVulkanInstance when the scene graph
+draws with Vulkan. With OpenGL the streamer keeps the device to itself, so
+Qt is no longer asked to take over an instance it never uses.
+
+Ask FFmpeg only for the surface extensions this session has, which also
+removes its "extension not found, excluding" warnings on a Wayland-only
+board.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ .../src/vulkan_device.rs                      | 116 ++++++++++++++----
+ opennow-qt/src/app/ApplicationStartup.cpp     |  11 +-
+ .../rendering/LinuxVulkanGraphics.cpp         |  25 ++--
+ 3 files changed, 118 insertions(+), 34 deletions(-)
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
+index 696e015a..2fdf675a 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
+@@ -322,15 +322,30 @@ mod implementation {
+     use super::*;
+     use ash::{vk, vk::Handle};
+     use ffmpeg_next::ffi;
+-    use std::{ffi::CStr, ptr};
++    use std::{
++        ffi::{CStr, CString},
++        ptr,
++    };
+ 
+     fn build_options(hdr_colorspace: bool) -> *mut ffi::AVDictionary {
+         let mut options = ptr::null_mut();
+-        let instance_extensions = if hdr_colorspace {
+-            c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_xcb_surface+VK_KHR_wayland_surface+VK_EXT_swapchain_colorspace"
+-        } else {
+-            c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_xcb_surface+VK_KHR_wayland_surface"
+-        };
++        // FFmpeg reports every instance extension it was asked for and could
++        // not find ("instance extension VK_KHR_xlib_surface not found,
++        // excluding"). Ask only for the window systems this session can have: a
++        // Wayland-only board has no X11 surface, and a headless one has none.
++        let mut surfaces = String::from("VK_KHR_surface");
++        if std::env::var_os("WAYLAND_DISPLAY").is_some()
++            || std::env::var_os("WAYLAND_SOCKET").is_some()
++        {
++            surfaces.push_str("+VK_KHR_wayland_surface");
++        }
++        if std::env::var_os("DISPLAY").is_some() {
++            surfaces.push_str("+VK_KHR_xlib_surface+VK_KHR_xcb_surface");
++        }
++        if hdr_colorspace {
++            surfaces.push_str("+VK_EXT_swapchain_colorspace");
++        }
++        let instance_extensions = CString::new(surfaces).unwrap_or_default();
+         unsafe {
+             ffi::av_dict_set(
+                 &mut options,
+@@ -497,17 +512,6 @@ mod implementation {
+             vk::api_version_patch(properties.api_version)
+         );
+         let mut families = vulkan.qf[..usize::try_from(vulkan.nb_qf).unwrap_or(0).min(64)].to_vec();
+-        let (family, reserved, copy_family) = reserve_graphics_queue(&mut families)?;
+-        vulkan.nb_qf = families.len() as i32;
+-        vulkan.qf[..families.len()].copy_from_slice(&families);
+-        eprintln!(
+-            "embedded Vulkan Qt queue={family}:{reserved}, native copy queue={copy_family}:0, native families={:?}",
+-            families
+-                .iter()
+-                .map(|family| (family.idx, family.num, family.flags, family.video_caps))
+-                .collect::<Vec<_>>()
+-        );
+-        let queue = unsafe { logical.get_device_queue(family, reserved) };
+         let extensions = if vulkan.nb_enabled_dev_extensions > 0 {
+             unsafe {
+                 std::slice::from_raw_parts(
+@@ -523,13 +527,58 @@ mod implementation {
+                 .iter()
+                 .any(|extension| unsafe { CStr::from_ptr(*extension) == name })
+         };
+-        if !enabled(ash::khr::swapchain::NAME)
+-            || !enabled(ash::khr::video_queue::NAME)
+-            || !enabled(ash::khr::video_decode_queue::NAME)
+-        {
++        let video_decode_enabled = enabled(ash::khr::video_queue::NAME)
++            && enabled(ash::khr::video_decode_queue::NAME);
++        let swapchain_enabled = enabled(ash::khr::swapchain::NAME);
++        if !video_decode_enabled {
++            // The board decodes through V4L2 Request or VA-API, so this shared
++            // device never runs a Vulkan Video decoder. It still has to give the
++            // interface a live instance, physical device, logical device and
++            // graphics queue: the Wayland presenter adopts those handles to
++            // export the decoder's DMA-BUFs. Requiring an isolated Qt queue or a
++            // video profile here would reject every such board before the
++            // compositor path could start.
++            let (family, reserved) = export_graphics_queue(&families)?;
++            let queue = unsafe { logical.get_device_queue(family, reserved) };
++            eprintln!(
++                "embedded Vulkan buffer-export device (no video decode): queue={family}:{reserved}, families={:?}",
++                families
++                    .iter()
++                    .map(|family| (family.idx, family.num, family.flags, family.video_caps))
++                    .collect::<Vec<_>>()
++            );
++            let info = VulkanDeviceInfo {
++                instance: vulkan.inst as usize,
++                physical_device: vulkan.phys_dev as usize,
++                device: vulkan.act_dev as usize,
++                graphics_queue: queue.as_raw() as usize,
++                graphics_queue_family_index: family,
++                graphics_queue_index: reserved,
++                api_version: vk::API_VERSION_1_3,
++            };
++            return Ok(SharedVulkanDevice {
++                device,
++                info,
++                profiles: [None; 12],
++                failed: AtomicBool::new(false),
++                copy_queue: (family, reserved),
++            });
++        }
++        let (family, reserved, copy_family) = reserve_graphics_queue(&mut families)?;
++        vulkan.nb_qf = families.len() as i32;
++        vulkan.qf[..families.len()].copy_from_slice(&families);
++        eprintln!(
++            "embedded Vulkan Qt queue={family}:{reserved}, native copy queue={copy_family}:0, native families={:?}",
++            families
++                .iter()
++                .map(|family| (family.idx, family.num, family.flags, family.video_caps))
++                .collect::<Vec<_>>()
++        );
++        let queue = unsafe { logical.get_device_queue(family, reserved) };
++        if !swapchain_enabled {
+             return Err(Error::unavailable(
+                 Subsystem::Vulkan,
+-                "shared Vulkan device lacks enabled swapchain/video decode extensions",
++                "shared Vulkan device lacks the enabled swapchain extension",
+             ));
+         }
+         let video = ash::khr::video_queue::Instance::new(&entry, &instance);
+@@ -613,6 +662,29 @@ mod implementation {
+         })
+     }
+ 
++    /// Picks the graphics queue the interface can adopt when the shared device
++    /// has no Vulkan Video decoder. V4L2/VA-API boards expose a single graphics
++    /// family, so the interface takes queue 0 of the first graphics family
++    /// instead of reserving an isolated queue the driver does not have.
++    fn export_graphics_queue(
++        families: &[ffi::AVVulkanDeviceQueueFamily],
++    ) -> Result<(u32, u32)> {
++        families
++            .iter()
++            .find(|family| {
++                family.idx >= 0
++                    && family.num > 0
++                    && family.flags & vk::QueueFlags::GRAPHICS.as_raw() != 0
++            })
++            .map(|family| (family.idx as u32, 0))
++            .ok_or_else(|| {
++                Error::unavailable(
++                    Subsystem::Vulkan,
++                    "shared Vulkan device has no graphics queue for DMA-BUF export",
++                )
++            })
++    }
++
+     fn reserve_graphics_queue(
+         families: &mut Vec<ffi::AVVulkanDeviceQueueFamily>,
+     ) -> Result<(u32, u32, u32)> {
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 055180ea..4c53f03d 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -311,9 +311,14 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     // draws with OpenGL, where there is no Qt Vulkan device to borrow.
+     const bool needsOwnVulkanDevice = QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
+         || WaylandVideoSurface::environmentEnabled();
+-    if (needsOwnVulkanDevice && LinuxVulkanGraphics::hasVulkanVideoDecode()
+-            && !vulkanDevice.initialize())
+-        qWarning("Embedded Vulkan Video is unavailable: %s Qt will use its default graphics device.",
++    // A board that decodes through V4L2 Request or VA-API has no Vulkan Video
++    // extension, but the compositor path still needs a live Vulkan device and
++    // graphics queue to export the decoder's DMA-BUFs. The native side creates
++    // that buffer-export device even without Vulkan Video, so try it on every
++    // board that needs its own device instead of probing for decode support
++    // first.
++    if (needsOwnVulkanDevice && !vulkanDevice.initialize())
++        qWarning("Embedded Vulkan device is unavailable: %s Qt will use its default graphics device.",
+                  qUtf8Printable(vulkanDevice.lastError()));
+ #endif
+ #ifdef OPENNOW_EMBEDDED_STREAMER
+diff --git a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
+index e00976c0..3b977d8d 100644
+--- a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
++++ b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
+@@ -74,15 +74,22 @@ bool Device::initialize()
+         reset();
+         return false;
+     }
+-    m_instance.setApiVersion(QVersionNumber(VK_API_VERSION_MAJOR(m_info.api_version),
+-                                           VK_API_VERSION_MINOR(m_info.api_version),
+-                                           VK_API_VERSION_PATCH(m_info.api_version)));
+-    m_instance.setVkInstance(reinterpret_cast<VkInstance>(m_info.instance));
+-    if (!m_instance.create()) {
+-        m_lastError = QStringLiteral("Qt could not adopt the native Vulkan instance (status %1).")
+-                          .arg(int(m_instance.errorCode()));
+-        reset();
+-        return false;
++    // Only a Vulkan scene graph adopts the instance. With OpenGL the streamer
++    // keeps the device to itself and Qt never touches it, so wrapping the
++    // instance in a QVulkanInstance would ask Qt to take over an instance it
++    // has no use for - and, on a board whose driver exposes no Vulkan Video,
++    // fail the only device the video path has.
++    if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan) {
++        m_instance.setApiVersion(QVersionNumber(VK_API_VERSION_MAJOR(m_info.api_version),
++                                               VK_API_VERSION_MINOR(m_info.api_version),
++                                               VK_API_VERSION_PATCH(m_info.api_version)));
++        m_instance.setVkInstance(reinterpret_cast<VkInstance>(m_info.instance));
++        if (!m_instance.create()) {
++            m_lastError = QStringLiteral("Qt could not adopt the native Vulkan instance (status %1).")
++                              .arg(int(m_instance.errorCode()));
++            reset();
++            return false;
++        }
+     }
+     m_lastError.clear();
+     return true;
+-- 
+2.43.0
+

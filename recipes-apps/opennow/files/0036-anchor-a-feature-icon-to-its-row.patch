@@ -1,0 +1,40 @@
+From 53566100a047beae2e2a30083705ef2cbceec5ba Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Sun, 25 Oct 2026 02:41:33 +0200
+Subject: [PATCH 36/36] Anchor a feature icon to its row, not to a parent that
+ is briefly gone
+
+Every rebuild of the label row logged
+
+  DesktopGameLabels.qml:138: TypeError: Cannot read property
+  'verticalCenter' of null
+
+for each feature icon: a Repeater delegate has no parent for the moment between
+the model change and the row taking it back, and the binding read the anchor
+through that parent. Anchoring to the row by id gives the same layout without
+the transient null, which is what patch 0002 already did for the launcher row.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ opennow-qt/qml/desktop/components/DesktopGameLabels.qml | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+index b15f2ea1..e37cce1e 100644
+--- a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
++++ b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+@@ -135,7 +135,10 @@ Item {
+                 Image {
+                     required property int index
+                     objectName: "desktopGameFeature-" + root.features[index]
+-                    anchors.verticalCenter: parent.verticalCenter
++                    // Anchor to the row by id: a delegate is briefly parentless
++                    // while the model is rebuilt, and parent.verticalCenter then
++                    // logs a TypeError for every icon of every rebuild.
++                    anchors.verticalCenter: featureRow.verticalCenter
+                     width: root.glyphSize
+                     height: root.glyphSize
+                     source: DesktopTokens.featureIconUrl(root.features[index])
+-- 
+2.43.0
+

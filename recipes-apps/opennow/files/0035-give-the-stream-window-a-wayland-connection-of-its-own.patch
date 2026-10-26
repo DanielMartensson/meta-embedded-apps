@@ -1,0 +1,256 @@
+From 185d956bc382f9d3a1b41b47b8cf3508e3fe519d Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Sun, 25 Oct 2026 02:41:33 +0200
+Subject: [PATCH 35/36] Give the stream window a Wayland connection of its own
+
+The stream surface was created on Qt's Wayland display. Qt 6 dispatches that
+display on an event thread of its own, and libwayland allows one dispatcher per
+queue, so the video path and Qt raced on every event: the VeriSilicon WSI saw a
+second release fence for a buffer it had not finished with, which is the
+buffer_fenced_release assertion that ended a game, and a frame descriptor that
+the flush path closed after a full socket turned into "the Wayland connection
+experienced a fatal error: Bad file descriptor" for the whole application.
+
+The surface now connects for itself. That gives it one owner for its events, so
+the buffer cache is only touched from the interface thread, and it makes the
+descriptor lifetime trivial: a frame descriptor stays open until the flush that
+carries it succeeds. The socket is drained without blocking from the frame
+clock, so buffer releases arrive at 60 Hz instead of whenever Qt happens to
+dispatch, and a compositor that really goes away now ends the stream with a
+message instead of a frozen window.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ .../rendering/WaylandVideoSurface.cpp         | 140 ++++++++++++++----
+ .../streaming/rendering/WaylandVideoSurface.h |   4 +
+ 2 files changed, 113 insertions(+), 31 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index 705e2f06..b0c701e3 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -1,12 +1,10 @@
+ #include "streaming/rendering/WaylandVideoSurface.h"
+ 
+ #include <QDebug>
+-#include <QGuiApplication>
+ #include <QMetaObject>
+ #include <QPointer>
+ #include <QTimer>
+ #include <QWindow>
+-#include <QtGui/qguiapplication_platform.h>
+ 
+ #include <algorithm>
+ #include <cerrno>
+@@ -16,6 +14,7 @@
+ #include <utility>
+ #include <unistd.h>
+ #include <sys/stat.h>
++#include <poll.h>
+ #include <wayland-client.h>
+ 
+ #include "linux-dmabuf-unstable-v1-client-protocol.h"
+@@ -42,13 +41,6 @@ QString fourccName(quint32 format)
+     return QString::fromLatin1(name, 4);
+ }
+ 
+-wl_display *qtWaylandDisplay()
+-{
+-    auto *native = qGuiApp
+-        ? qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>() : nullptr;
+-    return native ? native->display() : nullptr;
+-}
+-
+ quint64 monotonicNs()
+ {
+     timespec ts{};
+@@ -72,8 +64,9 @@ WaylandVideoSurface::~WaylandVideoSurface()
+     if (m_shell) xdg_wm_base_destroy(m_shell);
+     if (m_compositor) wl_compositor_destroy(m_compositor);
+     if (m_registry) wl_registry_destroy(m_registry);
+-    if (m_display) wl_display_flush(m_display);
+     closeDeferredFds();
++    // The connection belongs to this surface, so it goes away with it.
++    if (m_display) wl_display_disconnect(m_display);
+     m_dmabuf = nullptr;
+     m_relativePointerManager = nullptr;
+     m_pointerConstraints = nullptr;
+@@ -641,25 +634,101 @@ void WaylandVideoSurface::handleBufferRelease(void *data, wl_buffer *buffer)
+     }
+ }
+ 
+-bool WaylandVideoSurface::ensureSurface()
++bool WaylandVideoSurface::ensureConnection()
+ {
+-    if (m_surface) return true;
+-    if (!m_display) m_display = qtWaylandDisplay();
++    if (m_display) {
++        if (!m_connectionFailed) return true;
++        // The last connection died with the last stream. Everything bound to it
++        // died with it too, so the next stream starts from a fresh one instead
++        // of failing on a dead socket.
++        m_registry = nullptr;
++        m_compositor = nullptr;
++        m_shell = nullptr;
++        m_viewporter = nullptr;
++        m_dmabuf = nullptr;
++        m_seat = nullptr;
++        m_keyboard = nullptr;
++        m_pointer = nullptr;
++        m_pointerConstraints = nullptr;
++        m_relativePointerManager = nullptr;
++        m_relativePointer = nullptr;
++        m_lockedPointer = nullptr;
++        m_buffers.clear();
++        wl_display_disconnect(m_display);
++        m_display = nullptr;
++        m_connectionFailed = false;
++        m_configured = false;
++    }
++    // A connection of its own, not Qt's. Qt 6 dispatches its Wayland display on
++    // an event thread of its own, and libwayland allows one thread per queue:
++    // sharing the connection made the two of us dispatch the same events, which
++    // the VeriSilicon WSI saw as a second release fence for a buffer it was
++    // still using (the buffer_fenced_release assertion that ended the game) and
++    // which turned a frame descriptor closed after a failed flush into a fatal
++    // error for the whole application. Owning the connection also means the
++    // buffer-release events below are dispatched on this thread only, so the
++    // buffer cache has a single owner.
++    m_display = wl_display_connect(nullptr);
+     if (!m_display) {
+-        qWarning("wayland-video: Qt has no Wayland display, cannot create the stream window");
++        qWarning("wayland-video: no Wayland connection for the stream window");
+         return false;
+     }
+-    if (!m_registry) {
+-        m_registry = wl_display_get_registry(m_display);
+-        static const wl_registry_listener registryListener = [] {
+-            wl_registry_listener listener{};
+-            listener.global = handleGlobal;
+-            listener.global_remove = handleGlobalRemove;
+-            return listener;
+-        }();
+-        wl_registry_add_listener(m_registry, &registryListener, this);
+-        wl_display_roundtrip(m_display);
++    m_registry = wl_display_get_registry(m_display);
++    static const wl_registry_listener registryListener = [] {
++        wl_registry_listener listener{};
++        listener.global = handleGlobal;
++        listener.global_remove = handleGlobalRemove;
++        return listener;
++    }();
++    wl_registry_add_listener(m_registry, &registryListener, this);
++    // One round trip for the globals, a second for what binding them sends: the
++    // seat's capabilities and the DMA-BUF formats.
++    wl_display_roundtrip(m_display);
++    wl_display_roundtrip(m_display);
++    return true;
++}
++
++void WaylandVideoSurface::reportConnectionError()
++{
++    if (m_connectionFailed) return;
++    m_connectionFailed = true;
++    const int error = wl_display_get_error(m_display);
++    qWarning("wayland-video: the compositor connection failed: %s",
++             error ? std::strerror(error) : "unknown error");
++    QMetaObject::invokeMethod(this, [this] {
++        emit closeRequested();
++        dismiss();
++    }, Qt::QueuedConnection);
++}
++
++void WaylandVideoSurface::pumpEvents()
++{
++    if (!m_display || m_connectionFailed) return;
++    // Take whatever the compositor has sent without ever waiting for it: this
++    // runs from the frame clock on the interface thread. The buffer releases
++    // arrive here, so a frame can be presented again only after this ran.
++    while (wl_display_prepare_read(m_display) != 0) {
++        // Events are already queued: dispatch them, then try to take the read
++        // side again.
++        if (wl_display_dispatch_pending(m_display) < 0) {
++            reportConnectionError();
++            return;
++        }
+     }
++    wl_display_flush(m_display);
++    pollfd descriptor{wl_display_get_fd(m_display), POLLIN, 0};
++    if (::poll(&descriptor, 1, 0) > 0 && (descriptor.revents & POLLIN))
++        wl_display_read_events(m_display);
++    else
++        wl_display_cancel_read(m_display);
++    if (wl_display_dispatch_pending(m_display) < 0 || wl_display_get_error(m_display) != 0)
++        reportConnectionError();
++}
++
++bool WaylandVideoSurface::ensureSurface()
++{
++    if (m_surface) return true;
++    if (!ensureConnection()) return false;
+     if (!m_compositor || !m_shell) {
+         qWarning("wayland-video: compositor globals missing (compositor=%p shell=%p)",
+                  static_cast<void *>(m_compositor), static_cast<void *>(m_shell));
+@@ -823,21 +892,30 @@ void WaylandVideoSurface::flushDisplay()
+     const int error = errno;
+     if (error != EAGAIN) {
+         ++m_flushFailures;
+-        // Qt's own event thread flushes the same connection, so a failing flush
+-        // here does not stop the video; report the first one only, and count
+-        // the rest in the rate line.
+         if (m_flushFailures == 1 && qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
+             qWarning("wayland-video: flush failed: %s (display error %d)",
+                      std::strerror(error), wl_display_get_error(m_display));
+     }
+-    // Never let a stuck socket pin descriptors without bound; a frame that is
+-    // still queued after a few more is long gone by now.
+-    while (m_deferredFds.size() > 8)
+-        ::close(m_deferredFds.takeFirst());
++    // The descriptors are still named by requests libwayland has not written
++    // yet, so they must stay open; closing one here is what made a full socket
++    // a fatal error for the connection. A compositor that stays behind for
++    // seconds is gone, and the stream is over either way.
++    if (m_deferredFds.size() > 240) {
++        qWarning("wayland-video: the compositor stopped reading the stream");
++        m_connectionFailed = true;
++        closeDeferredFds();
++    }
+ }
+ 
+ void WaylandVideoSurface::present(Frame frame)
+ {
++    // Release events are only delivered by this call, so a frame that is still
++    // held by the compositor becomes available here.
++    pumpEvents();
++    if (m_connectionFailed) {
++        if (frame.fd >= 0) ::close(frame.fd);
++        return;
++    }
+     if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
+             && frame.size.height() > 0) {
+         // Pointer positions are reported in surface pixels; the video size is
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 9a2fc189..838c8d02 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -128,6 +128,9 @@ private:
+     ~WaylandVideoSurface() override;
+ 
+     bool ensureSurface();
++    bool ensureConnection();
++    void pumpEvents();
++    void reportConnectionError();
+     void destroySurface();
+     bool ensureDmabuf();
+     void attachFrame(const Frame &frame);
+@@ -196,6 +199,7 @@ private:
+ 
+     InputHooks m_input;
+     wl_display *m_display = nullptr;
++    bool m_connectionFailed = false;
+     wl_registry *m_registry = nullptr;
+     wl_compositor *m_compositor = nullptr;
+     xdg_wm_base *m_shell = nullptr;
+-- 
+2.43.0
+
