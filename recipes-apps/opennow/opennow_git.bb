@@ -50,6 +50,7 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0036-anchor-a-feature-icon-to-its-row.patch \
            file://0037-let-the-interface-draw-with-opengl-while-the-video-keeps.patch \
            file://0038-create-a-buffer-export-vulkan-device.patch \
+           file://0039-keep-the-decoder-dma-buf-handle-open-until-the-presenter-copies-it.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
