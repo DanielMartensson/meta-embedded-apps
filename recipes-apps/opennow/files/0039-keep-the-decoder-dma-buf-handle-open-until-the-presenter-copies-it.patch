@@ -1,6 +1,8 @@
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+index 3f1b0df..9071240 100644
 --- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
 +++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
-@@ -1140,6 +1140,23 @@
+@@ -1140,6 +1140,23 @@ fn retain_request_frame(
      Ok(output)
  }
  
@@ -16,7 +18,7 @@
 +impl Drop for OwnedDmaBufFrame {
 +    fn drop(&mut self) {
 +        for fd in &self.fds {
-+            unsafe { libc::close(fd) };
++            unsafe { libc::close(*fd) };
 +        }
 +    }
 +}
@@ -24,7 +26,7 @@
  fn drm_frame(
      mapped: frame::Video,
      timestamp_us: u64,
-@@ -1167,10 +1184,22 @@
+@@ -1167,6 +1184,19 @@ fn drm_frame(
              "DMA-BUF mapping returned invalid object/layer counts",
          ));
      }
@@ -33,7 +35,9 @@
 +    // before the presenter maps the object for the CPU copy. Duplicate every
 +    // handle here: the duplicate keeps the buffer addressable for exactly the
 +    // lifetime of the frame, and `OwnedDmaBufFrame` below closes it when the
-+    // frame goes away, keeping the count of open handles balanced.
++    // frame goes away, keeping the count of open handles balanced. The frame
++    // hands the duplicates to the CPU copy through `map_fds`, and keeps the
++    // descriptor's original handle for the application.
 +    let duplicates: Vec<c_int> = descriptor.objects[..object_count]
 +        .iter()
 +        .map(|object| unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) })
@@ -41,22 +45,87 @@
 +    let owned_fds = duplicates.iter().filter(|fd| **fd >= 0).copied().collect();
      let objects = descriptor.objects[..object_count]
          .iter()
--        .map(|object| DmaBufObject {
--            fd: object.fd,
-+        .zip(duplicates)
-+        .map(|(object, duplicate)| DmaBufObject {
-+            fd: if duplicate >= 0 { duplicate } else { object.fd },
-             size: object.size,
+         .map(|object| DmaBufObject {
+@@ -1175,6 +1205,10 @@ fn drm_frame(
              format_modifier: object.format_modifier,
          })
-@@ -1205,7 +1234,9 @@
+         .collect();
++    let map_fds: Vec<c_int> = duplicates
++        .into_iter()
++        .map(|fd| if fd >= 0 { fd } else { -1 })
++        .collect();
+     let mut layers = Vec::with_capacity(layer_count);
+     for layer in &descriptor.layers[..layer_count] {
+         let plane_count = usize::try_from(layer.nb_planes).unwrap_or(usize::MAX);
+@@ -1205,7 +1239,14 @@ fn drm_frame(
              planes,
          });
      }
 -    let dmabuf = Arc::new(DmaBufFrame::new(objects, layers, Arc::new(mapped)));
-+    let dmabuf =
-+        Arc::new(DmaBufFrame::new(objects, layers, Arc::new(OwnedDmaBufFrame { video: mapped, fds: owned_fds })));
-+
++    let dmabuf = Arc::new(
++        DmaBufFrame::new(
++            objects,
++            layers,
++            Arc::new(OwnedDmaBufFrame { video: mapped, fds: owned_fds }),
++        )
++        .with_map_fds(map_fds),
++    );
      let frame = DecodedVideoFrame {
          format: output_format,
          planes: Vec::new(),
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+index c0609ab..3d20377 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
+@@ -253,10 +253,14 @@ pub(crate) fn nv12_coded_height(
+ 
+ /// A decoded hardware frame exported through DRM PRIME. `owner` retains the
+ /// FFmpeg/VAAPI frame and therefore the dma-buf file descriptors until the
+-/// Vulkan submission that samples them has completed.
++/// Vulkan submission that samples them has completed. `map_fds` carries the
++/// per-frame duplicates of the descriptor's dma-buf handles, aligned with
++/// `objects` by object index; the CPU copy maps the duplicate while the
++/// descriptor the application sees keeps the original handle.
+ pub struct DmaBufFrame {
+     pub objects: Vec<DmaBufObject>,
+     pub layers: Vec<DmaBufLayer>,
++    pub map_fds: Vec<RawFd>,
+     owner: Arc<dyn Send + Sync>,
+ }
+ 
+@@ -481,10 +485,20 @@ impl DmaBufFrame {
+         Self {
+             objects,
+             layers,
++            map_fds: Vec::new(),
+             owner,
+         }
+     }
+ 
++    /// Overrides the descriptor handle the CPU copy maps, by object index, with
++    /// the per-frame duplicates. Entries keep the alignment with `objects`; a
++    /// negative entry falls back to the object's own descriptor, which is what a
++    /// frame handed over without a duplicate maps by.
++    pub fn with_map_fds(mut self, map_fds: Vec<RawFd>) -> Self {
++        self.map_fds = map_fds;
++        self
++    }
++
+     /// Copies a linear NV12 DMA-BUF into tightly packed CPU planes.
+     ///
+     /// The presenter uses this when the graphics device cannot import the
+@@ -532,7 +546,12 @@ impl DmaBufFrame {
+                 ));
+             }
+             if mappings[plane.object_index].is_none() {
+-                mappings[plane.object_index] = Some(DmaBufMapping::new(object.fd, object.size)?);
++                let fd = if plane.object_index < self.map_fds.len() && self.map_fds[plane.object_index] >= 0 {
++                    self.map_fds[plane.object_index]
++                } else {
++                    object.fd
++                };
++                mappings[plane.object_index] = Some(DmaBufMapping::new(fd, object.size)?);
+             }
+             let mapping = mappings[plane.object_index]
+                 .as_ref()
