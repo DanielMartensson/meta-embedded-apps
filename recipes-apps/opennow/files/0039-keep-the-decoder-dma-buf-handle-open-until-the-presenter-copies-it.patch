@@ -1,131 +1,143 @@
-diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
-index 3f1b0df..9071240 100644
---- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
-+++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
-@@ -1140,6 +1140,23 @@ fn retain_request_frame(
-     Ok(output)
- }
- 
-+/// Owns the FFmpeg frame plus this crate's duplicates of the descriptor's
-+/// dma-buf handles; see `drm_frame` for why the duplicates exist. Closing the
-+/// duplicates happens here, before the FFmpeg frame is dropped, so neither the
-+/// presenter nor FFmpeg can see a closed handle while the frame is alive.
-+struct OwnedDmaBufFrame {
-+    video: frame::Video,
-+    fds: Vec<c_int>,
-+}
-+
-+impl Drop for OwnedDmaBufFrame {
-+    fn drop(&mut self) {
-+        for fd in &self.fds {
-+            unsafe { libc::close(*fd) };
-+        }
-+    }
-+}
-+
- fn drm_frame(
-     mapped: frame::Video,
-     timestamp_us: u64,
-@@ -1167,6 +1184,19 @@ fn drm_frame(
-             "DMA-BUF mapping returned invalid object/layer counts",
-         ));
-     }
-+    // The FFmpeg/v4l2request decoder hands the DRM descriptor a dma-buf handle
-+    // that the driver closes when it recycles the decode output, which can be
-+    // before the presenter maps the object for the CPU copy. Duplicate every
-+    // handle here: the duplicate keeps the buffer addressable for exactly the
-+    // lifetime of the frame, and `OwnedDmaBufFrame` below closes it when the
-+    // frame goes away, keeping the count of open handles balanced. The frame
-+    // hands the duplicates to the CPU copy through `map_fds`, and keeps the
-+    // descriptor's original handle for the application.
-+    let duplicates: Vec<c_int> = descriptor.objects[..object_count]
-+        .iter()
-+        .map(|object| unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) })
-+        .collect();
-+    let owned_fds = duplicates.iter().filter(|fd| **fd >= 0).copied().collect();
-     let objects = descriptor.objects[..object_count]
-         .iter()
-         .map(|object| DmaBufObject {
-@@ -1175,6 +1205,10 @@ fn drm_frame(
-             format_modifier: object.format_modifier,
-         })
-         .collect();
-+    let map_fds: Vec<c_int> = duplicates
-+        .into_iter()
-+        .map(|fd| if fd >= 0 { fd } else { -1 })
-+        .collect();
-     let mut layers = Vec::with_capacity(layer_count);
-     for layer in &descriptor.layers[..layer_count] {
-         let plane_count = usize::try_from(layer.nb_planes).unwrap_or(usize::MAX);
-@@ -1205,7 +1239,14 @@ fn drm_frame(
-             planes,
-         });
-     }
--    let dmabuf = Arc::new(DmaBufFrame::new(objects, layers, Arc::new(mapped)));
-+    let dmabuf = Arc::new(
-+        DmaBufFrame::new(
-+            objects,
-+            layers,
-+            Arc::new(OwnedDmaBufFrame { video: mapped, fds: owned_fds }),
-+        )
-+        .with_map_fds(map_fds),
-+    );
-     let frame = DecodedVideoFrame {
-         format: output_format,
-         planes: Vec::new(),
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Tue, 27 Oct 2026 09:12:04 +0200
+Subject: [PATCH 39/39] Keep the decoder's dma-buf open until the presenter copies it
 
-diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
-index c0609ab..3d20377 100644
---- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
-+++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/format.rs
-@@ -253,10 +253,14 @@ pub(crate) fn nv12_coded_height(
- 
- /// A decoded hardware frame exported through DRM PRIME. `owner` retains the
- /// FFmpeg/VAAPI frame and therefore the dma-buf file descriptors until the
--/// Vulkan submission that samples them has completed.
-+/// Vulkan submission that samples them has completed. `map_fds` carries the
-+/// per-frame duplicates of the descriptor's dma-buf handles, aligned with
-+/// `objects` by object index; the CPU copy maps the duplicate while the
-+/// descriptor the application sees keeps the original handle.
- pub struct DmaBufFrame {
-     pub objects: Vec<DmaBufObject>,
-     pub layers: Vec<DmaBufLayer>,
-+    pub map_fds: Vec<RawFd>,
-     owner: Arc<dyn Send + Sync>,
+A compositor handoff hands over a descriptor, not a buffer: export_dmabuf
+copies the two plane offsets, the strides and the dma-buf fds the decoder
+opened for them, and that POD is all the presenter ever receives. The frame
+token that carries it is released as soon as the render pass ends, which drops
+the AVFrame that video/ffmpeg.rs retained through drm_frame and lets v4l2
+request retire the output surface the frame was decoded into. Weston has not
+read the request yet: libwayland queued the add and create_immed pair when the
+stream surface sent it, and the compositor imports the planes only when that
+message reaches it, so it imports a retired surface and answers "Failed to
+import plane 0 as R8" followed by a protocol error that closes the stream
+window. This crate's CPU copy hits the same race one step later, as "failed to
+map DMA-BUF for the CPU copy: Bad file descriptor (os error 9)".
+
+The producer now keeps a bounded window of the decoder frames whose descriptor
+went out to the compositor, oldest first, and the ring is what retires one: a
+surface, and the fds its export named, stay alive until the queued CPU copy and
+the compositor import have read them. Nothing is duplicated and nothing is
+closed here: the export names the decoder's own fds, and the retention is an
+extra reference to the frame the producer already owns, so the descriptors the
+application counts stay exactly the ones the decoder exported. The two earlier
+attempts at this defect are both wrong and neither is kept: owning a duplicate
+of the decoder's dma-buf handle replaced DmaBufObject.fd and made the decoder
+itself fail, and duplicating a handle per frame made the exported descriptors
+differ from the ones the application's buffer cache counts, so v4l2 request
+refused packet submission ("Inappropriate ioctl for device") before the EGL
+side hit its release-fence assertion.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+---
+ .../opennow-streamer-platform-linux/src/frame_producer.rs | 69 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertion(s)
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 81253d5..cd430a1 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -21,6 +21,26 @@
+ const DRM_FORMAT_R8: u32 = u32::from_le_bytes(*b"R8  ");
+ const DRM_FORMAT_GR88: u32 = u32::from_le_bytes(*b"GR88");
+ const DECODE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
++/// How many compositor handoffs keep their decoder frame alive.
++///
++/// A compositor handoff exports only a descriptor: the two plane offsets, the
++/// strides and the dma-buf fds the decoder opened for them. Nothing here keeps
++/// those fds open afterwards. The caller that receives the descriptor is Qt's
++/// frame token, and the token is released as soon as the render pass that
++/// carries it ends, which drops the AVFrame that `video/ffmpeg.rs` retained for
++/// the frame and lets v4l2-request retire the output surface it decoded into.
++/// The compositor has not read the request yet: libwayland queued the `add` and
++/// `create_immed` pair when the stream surface sent it, and Weston imports the
++/// planes only when that message reaches it. A retired surface makes the import
++/// fail (`Failed to import plane 0 as R8` plus a protocol error that closes the
++/// stream window) and makes this crate's CPU copy fail with `Bad file
++/// descriptor (os error 9)` when the copy runs behind the decoder. Holding the
++/// frames whose descriptors went out for a fixed window keeps the surface, and
++/// the fds it named, alive until the queued copy and the compositor import have
++/// finished. The window is a ring, so the decoder is never asked to hold more
++/// than this many surfaces at a time: 24 frames is 0.4 s of video at 60 fps, a
++/// round trip the compositor cannot fall behind by.
++const COMPOSITOR_HANDOFF_RETAINED: usize = 24;
+ const NV12_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/nv12.vert.spv");
+ const NV12_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/embedded_yuv.frag.spv");
+ const DEFAULT_FRAME_SLOTS: u32 = 3;
+@@ -772,6 +792,10 @@
+     buffer_imports: sand::BufferImports,
+     renderers: HashMap<GpuTextureFormat, RendererResources>,
+     slots: Vec<Option<FrameSlotResources>>,
++    /// Decoder frames whose DMA-BUF went to the compositor instead of the GPU,
++    /// oldest-next-to-be-retired first; see [`Self::retain_handoff_frame`].
++    handoff_frames: Vec<Option<Arc<DmaBufFrame>>>,
++    handoff_slot: usize,
+     generation: u64,
+     device_lost: bool,
  }
- 
-@@ -481,10 +485,20 @@ impl DmaBufFrame {
-         Self {
-             objects,
-             layers,
-+            map_fds: Vec::new(),
-             owner,
-         }
+@@ -876,11 +900,35 @@
+             buffer_imports: sand::BufferImports::default(),
+             renderers: HashMap::new(),
+             slots: (0..slot_count).map(|_| None).collect(),
++            handoff_frames: (0..COMPOSITOR_HANDOFF_RETAINED).map(|_| None).collect(),
++            handoff_slot: 0,
+             generation: 0,
+             device_lost: false,
+         })
      }
  
-+    /// Overrides the descriptor handle the CPU copy maps, by object index, with
-+    /// the per-frame duplicates. Entries keep the alignment with `objects`; a
-+    /// negative entry falls back to the object's own descriptor, which is what a
-+    /// frame handed over without a duplicate maps by.
-+    pub fn with_map_fds(mut self, map_fds: Vec<RawFd>) -> Self {
-+        self.map_fds = map_fds;
-+        self
++    /// Keeps the decoder frame whose DMA-BUF went to a compositor alive.
++    ///
++    /// [`export_dmabuf`] only copies the descriptor the kernel exported: the
++    /// fds it names belong to the dma-buf the decoder opened for this frame's
++    /// output surface, and nothing else in this crate still holds them once
++    /// the call returns. The compositor has not read them yet: the surface
++    /// queued `add` and `create_immed` when the frame was handed over and only
++    /// imports the planes when that message arrives, and this crate's CPU copy
++    /// maps the same fds when it runs behind the decoder. Retaining the frame
++    /// here is what keeps its surface, and the fds it named, alive over that
++    /// window; when the ring wraps, overwriting the oldest entry is what lets
++    /// the decoder recycle the surface again. The frame arrives through the
++    /// producer's own reference, so this never closes or duplicates a
++    /// descriptor: the fds the export names are the decoder's own.
++    fn retain_handoff_frame(&mut self, frame: &DecodedVideoFrame) {
++        let Some(dmabuf) = frame.dmabuf.as_ref() else {
++            return;
++        };
++        self.handoff_frames[self.handoff_slot] = Some(Arc::clone(dmabuf));
++        self.handoff_slot = (self.handoff_slot + 1) % COMPOSITOR_HANDOFF_RETAINED;
 +    }
 +
-     /// Copies a linear NV12 DMA-BUF into tightly packed CPU planes.
+     /// Encodes NV12-to-RGBA into Qt's current Vulkan command buffer.
      ///
-     /// The presenter uses this when the graphics device cannot import the
-@@ -532,7 +546,12 @@ impl DmaBufFrame {
-                 ));
-             }
-             if mappings[plane.object_index].is_none() {
--                mappings[plane.object_index] = Some(DmaBufMapping::new(object.fd, object.size)?);
-+                let fd = if plane.object_index < self.map_fds.len() && self.map_fds[plane.object_index] >= 0 {
-+                    self.map_fds[plane.object_index]
-+                } else {
-+                    object.fd
-+                };
-+                mappings[plane.object_index] = Some(DmaBufMapping::new(fd, object.size)?);
-             }
-             let mapping = mappings[plane.object_index]
-                 .as_ref()
+     /// The command buffer must be recording but outside a render pass. This
+@@ -915,6 +963,27 @@
+             // either: this path also runs when the interface renders with a
+             // backend that has no Vulkan device to borrow.
+             if let Some(dmabuf) = export_dmabuf(&frame) {
++                // The descriptor names fds this call does not keep: the token
++                // carrying it is released when the render pass ends, which
++                // drops the decoded frame and lets v4l2-request retire the
++                // output surface it decoded into. Weston imports the queued
++                // planes only when its message arrives, and this crate's CPU
++                // copy maps the same fds when it runs behind the decoder, so a
++                // retired surface fails the import (`Failed to import plane 0
++                // as R8`) and closes the stream window with a protocol error.
++                // Holding the frame itself over the handoff ring keeps the
++                // surface, and the fds it named, alive until both have read
++                // them; nothing here closes or duplicates a descriptor.
++                self.retain_handoff_frame(&frame);
++                {
++                    use std::sync::atomic::{AtomicBool, Ordering};
++                    static RETAINED_LOGGED: AtomicBool = AtomicBool::new(false);
++                    if !RETAINED_LOGGED.swap(true, Ordering::Relaxed) {
++                        eprintln!(
++                            "opennow-diag: dma-buf export handles kept alive at handoff: retained={COMPOSITOR_HANDOFF_RETAINED}"
++                        );
++                    }
++                }
+                 return Ok(RecordedGpuFrame {
+                     slot,
+                     generation: self.generation,
