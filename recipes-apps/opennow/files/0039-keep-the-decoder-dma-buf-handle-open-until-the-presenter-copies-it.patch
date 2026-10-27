@@ -1,0 +1,62 @@
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+@@ -1140,6 +1140,23 @@
+     Ok(output)
+ }
+ 
++/// Owns the FFmpeg frame plus this crate's duplicates of the descriptor's
++/// dma-buf handles; see `drm_frame` for why the duplicates exist. Closing the
++/// duplicates happens here, before the FFmpeg frame is dropped, so neither the
++/// presenter nor FFmpeg can see a closed handle while the frame is alive.
++struct OwnedDmaBufFrame {
++    video: frame::Video,
++    fds: Vec<c_int>,
++}
++
++impl Drop for OwnedDmaBufFrame {
++    fn drop(&mut self) {
++        for fd in self.fds {
++            unsafe { libc::close(fd) };
++        }
++    }
++}
++
+ fn drm_frame(
+     mapped: frame::Video,
+     timestamp_us: u64,
+@@ -1167,10 +1184,22 @@
+             "DMA-BUF mapping returned invalid object/layer counts",
+         ));
+     }
++    // The FFmpeg/v4l2request decoder hands the DRM descriptor a dma-buf handle
++    // that the driver closes when it recycles the decode output, which can be
++    // before the presenter maps the object for the CPU copy. Duplicate every
++    // handle here: the duplicate keeps the buffer addressable for exactly the
++    // lifetime of the frame, and `OwnedDmaBufFrame` below closes it when the
++    // frame goes away, keeping the count of open handles balanced.
++    let duplicates: Vec<c_int> = descriptor.objects[..object_count]
++        .iter()
++        .map(|object| unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) })
++        .collect();
++    let owned_fds = duplicates.iter().filter(|fd| *fd >= 0).copied().collect();
+     let objects = descriptor.objects[..object_count]
+         .iter()
+-        .map(|object| DmaBufObject {
+-            fd: object.fd,
++        .zip(duplicates)
++        .map(|(object, duplicate)| DmaBufObject {
++            fd: if duplicate >= 0 { duplicate } else { object.fd },
+             size: object.size,
+             format_modifier: object.format_modifier,
+         })
+@@ -1205,7 +1234,9 @@
+             planes,
+         });
+     }
+-    let dmabuf = Arc::new(DmaBufFrame::new(objects, layers, Arc::new(mapped)));
++    let dmabuf =
++        Arc::new(DmaBufFrame::new(objects, layers, Arc::new(OwnedDmaBufFrame { video: mapped, fds: owned_fds })));
++
+     let frame = DecodedVideoFrame {
+         format: output_format,
+         planes: Vec::new(),
