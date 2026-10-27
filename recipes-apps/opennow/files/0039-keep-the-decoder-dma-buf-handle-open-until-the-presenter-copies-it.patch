@@ -15,7 +15,7 @@
 +
 +impl Drop for OwnedDmaBufFrame {
 +    fn drop(&mut self) {
-+        for fd in self.fds {
++        for fd in &self.fds {
 +            unsafe { libc::close(fd) };
 +        }
 +    }
@@ -38,7 +38,7 @@
 +        .iter()
 +        .map(|object| unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) })
 +        .collect();
-+    let owned_fds = duplicates.iter().filter(|fd| *fd >= 0).copied().collect();
++    let owned_fds = duplicates.iter().filter(|fd| **fd >= 0).copied().collect();
      let objects = descriptor.objects[..object_count]
          .iter()
 -        .map(|object| DmaBufObject {
