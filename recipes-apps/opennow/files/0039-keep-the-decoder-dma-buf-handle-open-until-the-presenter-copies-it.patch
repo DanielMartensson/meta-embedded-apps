@@ -1,7 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: noname <noname@example.com>
-Date: Tue, 27 Oct 2026 09:12:04 +0200
+Date: Wed, 28 Oct 2026 04:38:09 +0200
 Subject: [PATCH 39/39] Keep the decoder's dma-buf open until the presenter copies it
+
+Keep the decoder's dma-buf open until the presenter copies it
 
 A compositor handoff hands over a descriptor, not a buffer: export_dmabuf
 copies the two plane offsets, the strides and the dma-buf fds the decoder
@@ -30,13 +32,29 @@ differ from the ones the application's buffer cache counts, so v4l2 request
 refused packet submission ("Inappropriate ioctl for device") before the EGL
 side hit its release-fence assertion.
 
+The route chooser in this file then had a second problem. The interface
+describes the import contract it enabled, and an interface that adopts a
+device this crate created reports nothing at all: the context log reads
+"dmabuf_image_import=false dmabuf_buffer_import=false", and that report alone
+sends every DMA-BUF frame through the CPU copy, a three-megabyte memcpy of the
+NV12 planes per present that costs a fifth of the rate the decoder produced.
+Ask the device instead of the report. The first linear NV12 frame attempts the
+VkBuffer import, whose own probe of the device's external-buffer properties is
+already in sand::import_linear, and the answer - not the report - decides the
+rest of the run: a device that cannot import keeps taking the copy it took
+before, and one that can keeps the decoded NV12 on the GPU and lets the render
+pass sample the decoder's own planes. Only the buffer bit is derived this way.
+The image import contract, which asks the driver for a DMA-BUF image through
+the DRM format modifier extensions this one does not offer, stays as the
+interface reports it.
+
 Upstream-Status: Inappropriate [STM32MP25 performance work]
 ---
- .../opennow-streamer-platform-linux/src/frame_producer.rs | 69 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 69 insertion(s)
+ .../opennow-streamer-platform-linux/src/frame_producer.rs | 112 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 112 insertion(s)
 
 diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
-index 81253d5..cd430a1 100644
+index 81253d5..a78d429 100644
 --- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
 +++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
 @@ -21,6 +21,26 @@
@@ -66,7 +84,15 @@ index 81253d5..cd430a1 100644
  const NV12_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/nv12.vert.spv");
  const NV12_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/embedded_yuv.frag.spv");
  const DEFAULT_FRAME_SLOTS: u32 = 3;
-@@ -772,6 +792,10 @@
+@@ -769,9 +789,18 @@
+     device: ash::Device,
+     render: VulkanRenderDevice,
+     imported: HashMap<DmaBufKey, Weak<ImportedNv12Frame>>,
++    /// Whether the linear NV12 DMA-BUF buffer import route was tried on the
++    /// adopted device: `Some(true)` means the device imported the decoder's
++    /// DMA-BUF as a VkBuffer, `Some(false)` means it could not and every frame
++    /// keeps taking the CPU copy; see [`Self::prepare`].
++    buffer_import_probe: Option<bool>,
      buffer_imports: sand::BufferImports,
      renderers: HashMap<GpuTextureFormat, RendererResources>,
      slots: Vec<Option<FrameSlotResources>>,
@@ -77,7 +103,11 @@ index 81253d5..cd430a1 100644
      generation: u64,
      device_lost: bool,
  }
-@@ -876,11 +900,35 @@
+@@ -873,14 +902,39 @@
+             device,
+             render,
+             imported: HashMap::new(),
++            buffer_import_probe: None,
              buffer_imports: sand::BufferImports::default(),
              renderers: HashMap::new(),
              slots: (0..slot_count).map(|_| None).collect(),
@@ -113,7 +143,7 @@ index 81253d5..cd430a1 100644
      /// Encodes NV12-to-RGBA into Qt's current Vulkan command buffer.
      ///
      /// The command buffer must be recording but outside a render pass. This
-@@ -915,6 +963,27 @@
+@@ -915,6 +969,27 @@
              // either: this path also runs when the interface renders with a
              // backend that has no Vulkan device to borrow.
              if let Some(dmabuf) = export_dmabuf(&frame) {
@@ -141,3 +171,58 @@ index 81253d5..cd430a1 100644
                  return Ok(RecordedGpuFrame {
                      slot,
                      generation: self.generation,
+@@ -1033,7 +1108,28 @@
+                 source: frame,
+             }));
+         }
+-        match dmabuf_import_route(&frame, self.render)? {
++        // `enabled_capabilities` describes the import contract the *interface*
++        // enabled, and an interface that adopts a device this crate created
++        // reports nothing at all even when that device can import. Taking that
++        // report alone sends every DMA-BUF frame through the CPU copy: the
++        // producer memcpy's three megabytes of NV12 per present and the board
++        // presents at a fifth of the rate the decoder produced. Ask the device
++        // instead. The first linear NV12 frame attempts the VkBuffer import,
++        // whose own probe of the device's external-buffer properties is already
++        // in `sand::import_linear`, and the answer decides the rest of the run:
++        // a device that cannot import keeps taking the copy it took before, and
++        // one that can keeps the decoded NV12 on the GPU.
++        let mut render = self.render;
++        if !render.dmabuf_buffer_import_enabled
++            && self.buffer_import_probe != Some(false)
++            && matches!(
++                frame.dmabuf.as_ref(),
++                Some(dmabuf) if sand::is_linear(dmabuf),
++            )
++        {
++            render.dmabuf_buffer_import_enabled = true;
++        }
++        match dmabuf_import_route(&frame, render)? {
+             DmaBufImportRoute::Sand => {
+                 sand::import(&self.instance, self.physical_device, &self.device, frame)
+                     .map(PreparedLinuxFrame::Sand)
+@@ -1045,8 +1141,23 @@
+                 Arc::clone(&frame),
+                 &mut self.buffer_imports,
+             ) {
+-                Ok(imported) => Ok(PreparedLinuxFrame::Sand(imported)),
++                Ok(imported) => {
++                    if self.buffer_import_probe.is_none() {
++                        self.buffer_import_probe = Some(true);
++                        {
++                            use std::sync::atomic::{AtomicBool, Ordering};
++                            static PROVEN: AtomicBool = AtomicBool::new(false);
++                            if !PROVEN.swap(true, Ordering::Relaxed) {
++                                eprintln!(
++                                    "opennow-diag: linear NV12 DMA-BUF buffer import route chosen by the device, not the interface report"
++                                );
++                            }
++                        }
++                    }
++                    Ok(PreparedLinuxFrame::Sand(imported))
++                },
+                 Err(error) => {
++                    self.buffer_import_probe = Some(false);
+                     use std::sync::atomic::{AtomicBool, Ordering};
+                     static REPORTED: AtomicBool = AtomicBool::new(false);
+                     if !REPORTED.swap(true, Ordering::Relaxed) {
