@@ -13,47 +13,23 @@ LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
 SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev \
-           file://0001-quiet-the-vulkan-and-locale-lines.patch \
-           file://0002-anchor-the-launcher-badge-to-its-row.patch \
-           file://0003-ask-only-for-the-decoders-and-surfaces-this-machine-has.patch \
-           file://0004-drop-the-driver-s-orphaned-queue-report.patch \
-           file://0005-select-the-renderer-at-run-time.patch \
-           file://0006-let-sigterm-stop-the-application.patch \
-           file://0007-leave-the-process-when-the-event-loop-ends.patch \
-           file://0008-keep-the-sign-in-card-out-of-the-layer-path.patch \
-           file://0009-do-not-let-one-slow-region-block-a-launch.patch \
-           file://0010-print-the-native-error-message.patch \
-           file://0011-copy-decoded-dmabuf-frames-to-the-cpu-when-the-gpu-ca.patch \
-           file://0012-log-presented-frames-and-dump-the-first-copied-frame.patch \
-           file://0013-import-linear-nv12-dmabuf-frames-as-vulkan-buffers.patch \
-           file://0014-cache-imported-dmabuf-buffers-and-log-the-render-rate.patch \
-           file://0015-count-the-frame-notifications-and-allow-a-forced-repaint.patch \
-           file://0016-run-the-stream-window-opaque-and-sample-the-video-1-1.patch \
-           file://0017-let-the-video-pass-be-switched-while-streaming.patch \
-           file://0018-present-decoded-frames-through-a-wayland-surface.patch \
-           file://0019-add-opt-in-frame-and-interface-capture-for-development.patch \
-           file://0020-describe-the-decoder-buffer-at-its-visible-height.patch \
-           file://0021-let-the-stream-window-be-windowed-or-closed-by-the-user.patch \
-           file://0023-keep-the-keyboard-f11-and-the-frame-dump-working.patch \
-           file://0024-keep-the-video-flowing-while-the-interface-rests.patch \
-           file://0025-pull-frames-from-the-interface-thread.patch \
-           file://0026-make-the-stream-window-the-default-presentation-path.patch \
-           file://0027-give-the-stream-window-the-pointer-and-the-keyboard.patch \
-           file://0028-keep-the-frame-descriptor-open-until-wayland-owns-it.patch \
-           file://0029-give-the-compositor-one-buffer-per-decoder-buffer.patch \
-           file://0030-do-not-repaint-an-interface-the-stream-window-covers.patch \
-           file://0031-let-the-mouse-turn-the-game-instead-of-pointing-at-it.patch \
-           file://0032-switch-the-window-once-per-f11-press.patch \
-           file://0033-drop-a-frame-the-compositor-cannot-take.patch \
-           file://0034-forward-the-pointer-the-way-the-host-asks-for-it.patch \
-           file://0035-give-the-stream-window-a-wayland-connection-of-its-own.patch \
-           file://0036-anchor-a-feature-icon-to-its-row.patch \
-           file://0037-let-the-interface-draw-with-opengl-while-the-video-keeps.patch \
-           file://0038-create-a-buffer-export-vulkan-device.patch \
-           file://0039-keep-the-decoder-dma-buf-handle-open-until-the-presenter-copies-it.patch \
+           file://0001-settle-the-interface-on-this-board.patch \
+           file://0002-give-the-streamer-a-frame-the-compositor-can-import.patch \
+           file://0003-keep-the-video-pass-running-under-the-interface.patch \
+           file://0004-present-decoded-frames-through-a-wayland-surface.patch \
+           file://0005-make-the-stream-window-a-window-the-user-can-drive.patch \
+           file://0006-make-the-stream-window-the-presentation-path.patch \
+           file://0007-hand-input-to-the-game-and-own-the-connection.patch \
+           file://0008-draw-with-opengl-and-keep-the-decoder-s-buffers-alive.patch \
+           file://0009-take-the-seat-s-pointer-only-when-it-has-one.patch \
+           file://0010-hand-the-streamer-its-own-device-whatever-qt-draws-with.patch \
+           file://0011-let-libwayland-own-the-descriptors-the-stream-window-sends.patch \
+           file://0012-pin-one-handoff-frame-the-window-the-55-fps-series-measured.patch \
+           file://0013-throttle-the-interface-window-s-presents.patch \
+           file://0014-default-the-interface-window-s-present-throttle-on.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
-SRCREV = "987ab3da4bd0e5c4e942c94d548c5c6b2cc79707"
+SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"
 
 # Source for the bundled FFmpeg build (OPENNOW_CARGO_FEATURES = linux-ffmpeg-bundled).
 # The build script's default path clones github.com during configure, which a
@@ -65,7 +41,7 @@ PV = "1.0.4+git${SRCPV}"
 # The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
 # r0.12 leaves the process when the event loop ends instead of running Qt
 # teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.44"
+PKGR = "r0.45"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust

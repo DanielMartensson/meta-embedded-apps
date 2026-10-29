@@ -1,0 +1,62 @@
+From: noname <noname@example.com>
+Date: Thu, 29 Oct 2026 20:40:00 +0100
+Subject: [PATCH 14/14] default the interface window's present throttle on
+
+The throttle in 0013 was an opt-in, and the run that never asked for one
+died the moment the stream window started presenting:
+
+  opennow-qt: api/gc_egl_wayland.c:2699: buffer_fenced_release:
+  Assertion `buffer->release_fence_fd == -1' failed.
+
+weston is 45 ms away from answering a buffer release when the interface
+window asks for the next one, and with three images at 60 Hz an image is
+back after about 50 ms, so the vendor egl-wayland client rejects the
+present. That is the whole crash: the stream window is what forces the
+interface window to present again, so the game ends at its first frame
+unless the reuse distance already exceeds the lag.
+
+Making two the default costs nothing on the picture: the stream window
+draws through its own DMA-BUF surface and keeps its own 60 Hz present
+rate, as the same series measured (wayland-video fps=58.6..60, nvst-video
+elapsed=730.4s frames=42801). The interface window paints at 30 Hz, which
+is the seat UI, not the game. OPENNOW_SWAP_INTERVAL=1 still selects
+upstream's every-vsync behaviour for the A/B run, and that is the setting
+that reproduces the assertion.
+
+The companion memory change lives on the OS side in
+meta-watermelon-wine (transparent_hugepage=madvise in the machine conf):
+the kernel report of a running session counted anon_thp:299008kB of the
+inactive_anon:491820kB a session holds as huge-page padding, and the
+decode then failed its contiguous request
+  opennow-linux-v: page allocation failure: order:10, mode:0xcc1(GFP_KERNEL|GFP_DMA)
+  cma: cma_alloc: reserved: alloc failed, req-size: 893 pages, ret: -12
+which is the same starvation, not a bug in this code.
+---
+
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -515,11 +515,19 @@
+         // presentation, right at the lag, and the assertion goes off the
+         // moment streaming starts to force presents. The swap interval is
+         // how many vsyncs must pass before the next presentation, so
+-        // OPENNOW_SWAP_INTERVAL=N stretches that distance over the lag; one
+-        // is upstream's behaviour and the default. The stream window draws
+-        // through its own surface and is not affected.
+-        const int swapInterval = qEnvironmentVariableIntValue("OPENNOW_SWAP_INTERVAL");
+-        if (swapInterval > 1) {
++        // OPENNOW_SWAP_INTERVAL=N asks for N vsyncs between presentations,
++        // and unset or 0 mean two on this board, because the reuse
++        // distance of a swapchain image has to exceed weston's release lag
++        // before the VeriSilicon egl-wayland client will accept the next
++        // present at all. Two at 60 Hz puts the reuse at about 100 ms
++        // against a 45 ms lag, and the run that had no throttle at all died
++        // with that assertion on the very first presented frame. The stream
++        // window draws through its own surface and is not affected.
++        int swapInterval = qEnvironmentVariableIntValue("OPENNOW_SWAP_INTERVAL");
++        if (swapInterval <= 0) {
++            swapInterval = 2;
++        }
++        if (swapInterval >= 1) {
+             auto interfaceFormat = rootWindow->format();
+             interfaceFormat.setSwapInterval(swapInterval);
+             QSurfaceFormat::setDefaultFormat(interfaceFormat);

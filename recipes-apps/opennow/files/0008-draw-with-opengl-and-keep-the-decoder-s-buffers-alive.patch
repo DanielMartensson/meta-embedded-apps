@@ -1,0 +1,451 @@
+Subject: [PATCH 0008/0012] draw with OpenGL and keep the decoder's buffers alive
+
+The interface draws with OpenGL, which leaves the video without a Qt Vulkan
+device to borrow, so the streamer builds its own buffer-export device (first
+graphics queue family, no decode profiles) and Qt never adopts it. The frame
+producer then keeps the decoder frame whose descriptor went to the compositor
+alive over a one-entry ring: the export already owns its own duplicate of the
+handle, and one entry is enough to keep the surface alive until the queued
+import and the CPU copy have read it, while leaving the decoder's capture pool
+free to recycle. A wider ring pins the pool, which makes the decoder name a
+fresh DMA-BUF every frame until the driver refuses one and the immediate buffer
+request closes the stream window.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index 5a768228..f8dc01e6 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -21,6 +21,43 @@ const DRM_FORMAT_GR1616: u32 = u32::from_le_bytes(*b"GR32");
+ const DRM_FORMAT_R8: u32 = u32::from_le_bytes(*b"R8  ");
+ const DRM_FORMAT_GR88: u32 = u32::from_le_bytes(*b"GR88");
+ const DECODE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
++/// How many compositor handoffs keep their decoder frame alive.
++///
++/// A compositor handoff exports a descriptor: the plane offsets, the strides
++/// and the dma-buf fds the decoder opened for them. The export owns its own
++/// `F_DUPFD_CLOEXEC` duplicate of the decoder's handle and the presenter keeps
++/// that duplicate open until the flush which carries the descriptor succeeds,
++/// so the compositor has its own reference to the dma-buf and the import does
++/// not need this crate to hold the decoder's frame at all.
++///
++/// Holding it anyway costs the decoder a capture buffer for as long as the
++/// ring keeps it, and this board's decoder has very few. `hantro-vpu` allocates
++/// the capture buffers from contiguous memory and fails the next
++/// `VIDIOC_CREATE_BUFS` with `Cannot allocate memory (12)` once a handful are
++/// outstanding: the stream then stops at the frames already presented while
++/// FFmpeg retries `Failed setup for format drm_prime` forever, and the frames
++/// that were in flight when the decoder re-initialised name closed descriptors
++/// (`fstat on DMA-BUF failed: Bad file descriptor (os error 9)`). The default
++/// is therefore no retention: the duplicate in [`export_dmabuf`] is what keeps
++/// the buffer alive for the compositor, exactly as the r0.41 series did when it
++/// presented this board at 55 fps.
++///
++/// `OPENNOW_HANDOFF_RETAINED=N` still asks for a ring of N frames for the A/B
++/// runs, clamped to 0..=24, so the measurement that established this default
++/// can be repeated without a rebuild.
++const COMPOSITOR_HANDOFF_RETAINED: usize = 0;
++
++/// The handoff window in force: [`COMPOSITOR_HANDOFF_RETAINED`] unless
++/// `OPENNOW_HANDOFF_RETAINED=N` asks for another one for the measurement.
++fn compositor_handoff_retained() -> usize {
++    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *WINDOW.get_or_init(|| {
++        let requested = std::env::var("OPENNOW_HANDOFF_RETAINED")
++            .ok()
++            .and_then(|value| value.trim().parse::<usize>().ok());
++        requested.unwrap_or(COMPOSITOR_HANDOFF_RETAINED).min(24)
++    })
++}
+ const NV12_VERTEX_SHADER: &[u8] = include_bytes!("../shaders/nv12.vert.spv");
+ const NV12_FRAGMENT_SHADER: &[u8] = include_bytes!("../shaders/embedded_yuv.frag.spv");
+ const DEFAULT_FRAME_SLOTS: u32 = 3;
+@@ -769,9 +806,18 @@ pub struct LinuxFrameProducer {
+     device: ash::Device,
+     render: VulkanRenderDevice,
+     imported: HashMap<DmaBufKey, Weak<ImportedNv12Frame>>,
++    /// Whether the linear NV12 DMA-BUF buffer import route was tried on the
++    /// adopted device: `Some(true)` means the device imported the decoder's
++    /// DMA-BUF as a VkBuffer, `Some(false)` means it could not and every frame
++    /// keeps taking the CPU copy; see [`Self::prepare`].
++    buffer_import_probe: Option<bool>,
+     buffer_imports: sand::BufferImports,
+     renderers: HashMap<GpuTextureFormat, RendererResources>,
+     slots: Vec<Option<FrameSlotResources>>,
++    /// Decoder frames whose DMA-BUF went to the compositor instead of the GPU,
++    /// oldest-next-to-be-retired first; see [`Self::retain_handoff_frame`].
++    handoff_frames: Vec<Option<Arc<DmaBufFrame>>>,
++    handoff_slot: usize,
+     generation: u64,
+     device_lost: bool,
+ }
+@@ -881,14 +927,38 @@ impl LinuxFrameProducer {
+             device,
+             render,
+             imported: HashMap::new(),
++            buffer_import_probe: None,
+             buffer_imports: sand::BufferImports::default(),
+             renderers: HashMap::new(),
+             slots: (0..slot_count).map(|_| None).collect(),
++            handoff_frames: (0..compositor_handoff_retained()).map(|_| None).collect(),
++            handoff_slot: 0,
+             generation: 0,
+             device_lost: false,
+         })
+     }
+ 
++    /// Keeps the decoder frame whose DMA-BUF went to a compositor alive.
++    ///
++    /// [`export_dmabuf`] duplicates the descriptor the kernel exported, and
++    /// the duplicate is what keeps the buffer alive for the compositor; the
++    /// frame itself is not needed once the call returns. A non-empty ring
++    /// additionally pins the newest N frames, which costs the decoder one
++    /// capture buffer per entry; see [`COMPOSITOR_HANDOFF_RETAINED`] for why
++    /// the default ring is empty on this board.
++    fn retain_handoff_frame(&mut self, frame: &DecodedVideoFrame) {
++        // No ring means the export's own descriptor duplicate is the only
++        // reference the handoff needs; see `COMPOSITOR_HANDOFF_RETAINED`.
++        if self.handoff_frames.is_empty() {
++            return;
++        }
++        let Some(dmabuf) = frame.dmabuf.as_ref() else {
++            return;
++        };
++        self.handoff_frames[self.handoff_slot] = Some(Arc::clone(dmabuf));
++        self.handoff_slot = (self.handoff_slot + 1) % self.handoff_frames.len();
++    }
++
+     /// Encodes NV12-to-RGBA into Qt's current Vulkan command buffer.
+     ///
+     /// The command buffer must be recording but outside a render pass. This
+@@ -923,6 +993,28 @@ impl LinuxFrameProducer {
+             // either: this path also runs when the interface renders with a
+             // backend that has no Vulkan device to borrow.
+             if let Some(dmabuf) = export_dmabuf(&frame) {
++                // The descriptor names fds this call does not keep: the token
++                // carrying it is released when the render pass ends, which
++                // drops the decoded frame and lets v4l2-request retire the
++                // output surface it decoded into. Weston imports the queued
++                // planes only when its message arrives, and this crate's CPU
++                // copy maps the same fds when it runs behind the decoder, so a
++                // retired surface fails the import (`Failed to import plane 0
++                // as R8`) and closes the stream window with a protocol error.
++                // Holding the frame itself over the handoff ring keeps the
++                // surface, and the fds it named, alive until both have read
++                // them; nothing here closes or duplicates a descriptor.
++                self.retain_handoff_frame(&frame);
++                {
++                    use std::sync::atomic::{AtomicBool, Ordering};
++                    static RETAINED_LOGGED: AtomicBool = AtomicBool::new(false);
++                    if !RETAINED_LOGGED.swap(true, Ordering::Relaxed) {
++                        let retained = compositor_handoff_retained();
++                        eprintln!(
++                            "opennow-diag: dma-buf export handles kept alive at handoff: retained={retained}"
++                        );
++                    }
++                }
+                 return Ok(RecordedGpuFrame {
+                     slot,
+                     generation: self.generation,
+@@ -1041,7 +1133,28 @@ impl LinuxFrameProducer {
+                 source: frame,
+             }));
+         }
+-        match dmabuf_import_route(&frame, self.render)? {
++        // `enabled_capabilities` describes the import contract the *interface*
++        // enabled, and an interface that adopts a device this crate created
++        // reports nothing at all even when that device can import. Taking that
++        // report alone sends every DMA-BUF frame through the CPU copy: the
++        // producer memcpy's three megabytes of NV12 per present and the board
++        // presents at a fifth of the rate the decoder produced. Ask the device
++        // instead. The first linear NV12 frame attempts the VkBuffer import,
++        // whose own probe of the device's external-buffer properties is already
++        // in `sand::import_linear`, and the answer decides the rest of the run:
++        // a device that cannot import keeps taking the copy it took before, and
++        // one that can keeps the decoded NV12 on the GPU.
++        let mut render = self.render;
++        if !render.dmabuf_buffer_import_enabled
++            && self.buffer_import_probe != Some(false)
++            && matches!(
++                frame.dmabuf.as_ref(),
++                Some(dmabuf) if sand::is_linear(dmabuf),
++            )
++        {
++            render.dmabuf_buffer_import_enabled = true;
++        }
++        match dmabuf_import_route(&frame, render)? {
+             DmaBufImportRoute::Sand => {
+                 sand::import(&self.instance, self.physical_device, &self.device, frame)
+                     .map(PreparedLinuxFrame::Sand)
+@@ -1053,8 +1166,23 @@ impl LinuxFrameProducer {
+                 Arc::clone(&frame),
+                 &mut self.buffer_imports,
+             ) {
+-                Ok(imported) => Ok(PreparedLinuxFrame::Sand(imported)),
++                Ok(imported) => {
++                    if self.buffer_import_probe.is_none() {
++                        self.buffer_import_probe = Some(true);
++                        {
++                            use std::sync::atomic::{AtomicBool, Ordering};
++                            static PROVEN: AtomicBool = AtomicBool::new(false);
++                            if !PROVEN.swap(true, Ordering::Relaxed) {
++                                eprintln!(
++                                    "opennow-diag: linear NV12 DMA-BUF buffer import route chosen by the device, not the interface report"
++                                );
++                            }
++                        }
++                    }
++                    Ok(PreparedLinuxFrame::Sand(imported))
++                },
+                 Err(error) => {
++                    self.buffer_import_probe = Some(false);
+                     use std::sync::atomic::{AtomicBool, Ordering};
+                     static REPORTED: AtomicBool = AtomicBool::new(false);
+                     if !REPORTED.swap(true, Ordering::Relaxed) {
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
+index 288a3259..9833a41f 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/vulkan_device.rs
+@@ -333,15 +333,30 @@ mod implementation {
+     use super::*;
+     use ash::{vk, vk::Handle};
+     use ffmpeg_next::ffi;
+-    use std::{ffi::CStr, ptr};
++    use std::{
++        ffi::{CStr, CString},
++        ptr,
++    };
+ 
+     fn build_options(hdr_colorspace: bool) -> *mut ffi::AVDictionary {
+         let mut options = ptr::null_mut();
+-        let instance_extensions = if hdr_colorspace {
+-            c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_xcb_surface+VK_KHR_wayland_surface+VK_EXT_swapchain_colorspace"
+-        } else {
+-            c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_xcb_surface+VK_KHR_wayland_surface"
+-        };
++        // FFmpeg reports every instance extension it was asked for and could
++        // not find ("instance extension VK_KHR_xlib_surface not found,
++        // excluding"). Ask only for the window systems this session can have: a
++        // Wayland-only board has no X11 surface, and a headless one has none.
++        let mut surfaces = String::from("VK_KHR_surface");
++        if std::env::var_os("WAYLAND_DISPLAY").is_some()
++            || std::env::var_os("WAYLAND_SOCKET").is_some()
++        {
++            surfaces.push_str("+VK_KHR_wayland_surface");
++        }
++        if std::env::var_os("DISPLAY").is_some() {
++            surfaces.push_str("+VK_KHR_xlib_surface+VK_KHR_xcb_surface");
++        }
++        if hdr_colorspace {
++            surfaces.push_str("+VK_EXT_swapchain_colorspace");
++        }
++        let instance_extensions = CString::new(surfaces).unwrap_or_default();
+         unsafe {
+             ffi::av_dict_set(
+                 &mut options,
+@@ -523,17 +538,6 @@ mod implementation {
+             vk::api_version_patch(properties.api_version)
+         );
+         let mut families = vulkan.qf[..usize::try_from(vulkan.nb_qf).unwrap_or(0).min(64)].to_vec();
+-        let (family, reserved, copy_family) = reserve_graphics_queue(&mut families)?;
+-        vulkan.nb_qf = families.len() as i32;
+-        vulkan.qf[..families.len()].copy_from_slice(&families);
+-        eprintln!(
+-            "embedded Vulkan Qt queue={family}:{reserved}, native copy queue={copy_family}:0, native families={:?}",
+-            families
+-                .iter()
+-                .map(|family| (family.idx, family.num, family.flags, family.video_caps))
+-                .collect::<Vec<_>>()
+-        );
+-        let queue = unsafe { logical.get_device_queue(family, reserved) };
+         let extensions = if vulkan.nb_enabled_dev_extensions > 0 {
+             unsafe {
+                 std::slice::from_raw_parts(
+@@ -549,13 +553,58 @@ mod implementation {
+                 .iter()
+                 .any(|extension| unsafe { CStr::from_ptr(*extension) == name })
+         };
+-        if !enabled(ash::khr::swapchain::NAME)
+-            || !enabled(ash::khr::video_queue::NAME)
+-            || !enabled(ash::khr::video_decode_queue::NAME)
+-        {
++        let video_decode_enabled = enabled(ash::khr::video_queue::NAME)
++            && enabled(ash::khr::video_decode_queue::NAME);
++        let swapchain_enabled = enabled(ash::khr::swapchain::NAME);
++        if !video_decode_enabled {
++            // The board decodes through V4L2 Request or VA-API, so this shared
++            // device never runs a Vulkan Video decoder. It still has to give the
++            // interface a live instance, physical device, logical device and
++            // graphics queue: the Wayland presenter adopts those handles to
++            // export the decoder's DMA-BUFs. Requiring an isolated Qt queue or a
++            // video profile here would reject every such board before the
++            // compositor path could start.
++            let (family, reserved) = export_graphics_queue(&families)?;
++            let queue = unsafe { logical.get_device_queue(family, reserved) };
++            eprintln!(
++                "embedded Vulkan buffer-export device (no video decode): queue={family}:{reserved}, families={:?}",
++                families
++                    .iter()
++                    .map(|family| (family.idx, family.num, family.flags, family.video_caps))
++                    .collect::<Vec<_>>()
++            );
++            let info = VulkanDeviceInfo {
++                instance: vulkan.inst as usize,
++                physical_device: vulkan.phys_dev as usize,
++                device: vulkan.act_dev as usize,
++                graphics_queue: queue.as_raw() as usize,
++                graphics_queue_family_index: family,
++                graphics_queue_index: reserved,
++                api_version: vk::API_VERSION_1_3,
++            };
++            return Ok(SharedVulkanDevice {
++                device,
++                info,
++                profiles: [None; 12],
++                failed: AtomicBool::new(false),
++                copy_queue: (family, reserved),
++            });
++        }
++        let (family, reserved, copy_family) = reserve_graphics_queue(&mut families)?;
++        vulkan.nb_qf = families.len() as i32;
++        vulkan.qf[..families.len()].copy_from_slice(&families);
++        eprintln!(
++            "embedded Vulkan Qt queue={family}:{reserved}, native copy queue={copy_family}:0, native families={:?}",
++            families
++                .iter()
++                .map(|family| (family.idx, family.num, family.flags, family.video_caps))
++                .collect::<Vec<_>>()
++        );
++        let queue = unsafe { logical.get_device_queue(family, reserved) };
++        if !swapchain_enabled {
+             return Err(Error::unavailable(
+                 Subsystem::Vulkan,
+-                "shared Vulkan device lacks enabled swapchain/video decode extensions",
++                "shared Vulkan device lacks the enabled swapchain extension",
+             ));
+         }
+         let video = ash::khr::video_queue::Instance::new(&entry, &instance);
+@@ -639,6 +688,29 @@ mod implementation {
+         })
+     }
+ 
++    /// Picks the graphics queue the interface can adopt when the shared device
++    /// has no Vulkan Video decoder. V4L2/VA-API boards expose a single graphics
++    /// family, so the interface takes queue 0 of the first graphics family
++    /// instead of reserving an isolated queue the driver does not have.
++    fn export_graphics_queue(
++        families: &[ffi::AVVulkanDeviceQueueFamily],
++    ) -> Result<(u32, u32)> {
++        families
++            .iter()
++            .find(|family| {
++                family.idx >= 0
++                    && family.num > 0
++                    && family.flags & vk::QueueFlags::GRAPHICS.as_raw() != 0
++            })
++            .map(|family| (family.idx as u32, 0))
++            .ok_or_else(|| {
++                Error::unavailable(
++                    Subsystem::Vulkan,
++                    "shared Vulkan device has no graphics queue for DMA-BUF export",
++                )
++            })
++    }
++
+     fn reserve_graphics_queue(
+         families: &mut Vec<ffi::AVVulkanDeviceQueueFamily>,
+     ) -> Result<(u32, u32, u32)> {
+diff --git a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+index b15f2ea1..e37cce1e 100644
+--- a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
++++ b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+@@ -135,7 +135,10 @@ Item {
+                 Image {
+                     required property int index
+                     objectName: "desktopGameFeature-" + root.features[index]
+-                    anchors.verticalCenter: parent.verticalCenter
++                    // Anchor to the row by id: a delegate is briefly parentless
++                    // while the model is rebuilt, and parent.verticalCenter then
++                    // logs a TypeError for every icon of every rebuild.
++                    anchors.verticalCenter: featureRow.verticalCenter
+                     width: root.glyphSize
+                     height: root.glyphSize
+                     source: DesktopTokens.featureIconUrl(root.features[index])
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index 99fc92dd..f1a3e30a 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -323,10 +323,20 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+ #ifdef NO_SOFT_RENDERING
+     bool graphicsValidationRequired = true;
+ #endif
+-    if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
+-            && LinuxVulkanGraphics::hasVulkanVideoDecode()
+-            && !vulkanDevice.initialize())
+-        qWarning("Embedded Vulkan Video is unavailable: %s Qt will use its default graphics device.",
++    // The compositor path hands the decoder's DMA-BUF to the stream window
++    // without recording a single GPU command, so the streamer's own Vulkan
++    // device is all the video needs: it is created even when the interface
++    // draws with OpenGL, where there is no Qt Vulkan device to borrow.
++    const bool needsOwnVulkanDevice = QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
++        || WaylandVideoSurface::environmentEnabled();
++    // A board that decodes through V4L2 Request or VA-API has no Vulkan Video
++    // extension, but the compositor path still needs a live Vulkan device and
++    // graphics queue to export the decoder's DMA-BUFs. The native side creates
++    // that buffer-export device even without Vulkan Video, so try it on every
++    // board that needs its own device instead of probing for decode support
++    // first.
++    if (needsOwnVulkanDevice && !vulkanDevice.initialize())
++        qWarning("Embedded Vulkan device is unavailable: %s Qt will use its default graphics device.",
+                  qUtf8Printable(vulkanDevice.lastError()));
+ #endif
+ #ifdef OPENNOW_EMBEDDED_STREAMER
+@@ -503,7 +513,10 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+         qFatal("NO_SOFT_RENDERING Qt scene-graph initialization failed: %s", qUtf8Printable(message));
+     }, Qt::DirectConnection);
+ #endif
+-    if (vulkanDevice.handle() && !vulkanDevice.adopt(rootWindow)) {
++    // The device is only adopted by a Vulkan scene graph; with OpenGL it stays
++    // the streamer's own device and Qt never sees it.
++    if (vulkanDevice.handle() && QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
++            && !vulkanDevice.adopt(rootWindow)) {
+         qWarning("Could not adopt the embedded Vulkan device: %s",
+                  qUtf8Printable(vulkanDevice.lastError()));
+         return EXIT_FAILURE;
+diff --git a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
+index 07a1087b..487bfa70 100644
+--- a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
++++ b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.cpp
+@@ -119,15 +119,22 @@ bool Device::initialize()
+         reset();
+         return false;
+     }
+-    m_instance.setApiVersion(QVersionNumber(VK_API_VERSION_MAJOR(m_info.api_version),
+-                                           VK_API_VERSION_MINOR(m_info.api_version),
+-                                           VK_API_VERSION_PATCH(m_info.api_version)));
+-    m_instance.setVkInstance(reinterpret_cast<VkInstance>(m_info.instance));
+-    if (!m_instance.create()) {
+-        m_lastError = QStringLiteral("Qt could not adopt the native Vulkan instance (status %1).")
+-                          .arg(int(m_instance.errorCode()));
+-        reset();
+-        return false;
++    // Only a Vulkan scene graph adopts the instance. With OpenGL the streamer
++    // keeps the device to itself and Qt never touches it, so wrapping the
++    // instance in a QVulkanInstance would ask Qt to take over an instance it
++    // has no use for - and, on a board whose driver exposes no Vulkan Video,
++    // fail the only device the video path has.
++    if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan) {
++        m_instance.setApiVersion(QVersionNumber(VK_API_VERSION_MAJOR(m_info.api_version),
++                                               VK_API_VERSION_MINOR(m_info.api_version),
++                                               VK_API_VERSION_PATCH(m_info.api_version)));
++        m_instance.setVkInstance(reinterpret_cast<VkInstance>(m_info.instance));
++        if (!m_instance.create()) {
++            m_lastError = QStringLiteral("Qt could not adopt the native Vulkan instance (status %1).")
++                              .arg(int(m_instance.errorCode()));
++            reset();
++            return false;
++        }
+     }
+     m_lastError.clear();
+     return true;

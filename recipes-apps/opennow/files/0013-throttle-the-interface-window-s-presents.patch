@@ -1,0 +1,96 @@
+From e7bc8fe7bcaa9fe19f80583470ad36a9f5896dcd Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Wed, 28 Oct 2026 22:38:40 +0100
+Subject: [PATCH] throttle the interface window's presents so a released image
+ cannot be reused too soon
+
+The crash that ends the game the moment the stream starts is not in the
+presenter: it is an assertion inside the VeriSilicon EGL driver, which
+carries weston's egl-wayland client and is the only file on the board
+that holds api/gc_egl_wayland.c:
+
+  opennow-qt: api/gc_egl_wayland.c:2699: buffer_fenced_release:
+  Assertion `buffer->release_fence_fd == -1' failed.
+
+gdb on the run says where: QRhi::endFrame on the QSGRenderThread, through
+QWaylandGLContext::swapBuffers, into vendor libEGL, which is inside
+wl_display_dispatch_queue_pending when weston's release callback arrives,
+and libffi's trampoline runs the client's release right away. The driver
+objects to a fenced release of a buffer whose previous release fence has
+not been answered yet, i.e. an image presented again too soon after it
+was released. weston reports the lag itself:
+
+  event processing lagging behind by 45ms, your system is too slow
+
+So the reuse distance of a swapchain image has to exceed that lag. The
+window's swap interval is the app-side knob for it: it is the number of
+vsyncs that have to pass before the next presentation. With three images
+at 60 Hz an image comes back after about 50 ms, which is why the run
+dies the moment streaming makes the interface window present at all
+(opennow-present fps=0.0 swapped=0 until then, and this is the last
+point where the format is still settled before the scene graph exists).
+OPENNOW_SWAP_INTERVAL=N asks for N vsyncs between presentations, one is
+upstream's behaviour and the default; the stream window draws through
+its own surface and keeps its own present rate.
+---
+ opennow-qt/src/app/ApplicationStartup.cpp | 37 +++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index f1a3e30a..a150080b 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -27,6 +27,7 @@
+ #include <QIcon>
+ #include <QImage>
+ #include <QQuickWindow>
++#include <QSurfaceFormat>
+ #include <QWindow>
+ #include <QElapsedTimer>
+ #include <QTimer>
+@@ -491,6 +492,42 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+         qCritical("Could not select the graphics adapter before scene-graph initialization");
+         return EXIT_FAILURE;
+     }
++#ifdef Q_OS_LINUX
++    if (rootWindow) {
++        // The interface window is the only window whose presents can be
++        // throttled, and this is the last point before its scene graph is
++        // initialized, so the swap interval has to be settled here. weston
++        // answers a buffer release about 45 ms after the presentation that
++        // asked for it, and it says so itself:
++        //
++        //   event processing lagging behind by 45ms, your system is too slow
++        //
++        // The VeriSilicon EGL driver carries weston's egl-wayland client
++        // (/vendor/lib/libEGL.so.1.5.0 holds api/gc_egl_wayland.c), and that
++        // client insists the release of an image came in before the image is
++        // presented again:
++        //
++        //   opennow-qt: api/gc_egl_wayland.c:2699: buffer_fenced_release:
++        //   Assertion `buffer->release_fence_fd == -1' failed.
++        //
++        // A swapchain image is reused after one presentation per image, so
++        // with three images at 60 Hz the reuse lands about 50 ms after the
++        // presentation, right at the lag, and the assertion goes off the
++        // moment streaming starts to force presents. The swap interval is
++        // how many vsyncs must pass before the next presentation, so
++        // OPENNOW_SWAP_INTERVAL=N stretches that distance over the lag; one
++        // is upstream's behaviour and the default. The stream window draws
++        // through its own surface and is not affected.
++        const int swapInterval = qEnvironmentVariableIntValue("OPENNOW_SWAP_INTERVAL");
++        if (swapInterval > 1) {
++            auto interfaceFormat = rootWindow->format();
++            interfaceFormat.setSwapInterval(swapInterval);
++            QSurfaceFormat::setDefaultFormat(interfaceFormat);
++            rootWindow->setFormat(interfaceFormat);
++            qInfo("opennow-present: interface window swap interval %d requested", swapInterval);
++        }
++    }
++#endif
+     hdrOutput.attach(rootWindow);
+ #if defined(Q_OS_LINUX) && QT_CONFIG(vulkan) && __has_include(<vulkan/vulkan.h>)
+ #ifdef NO_SOFT_RENDERING
+-- 
+2.43.0
+

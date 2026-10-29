@@ -1,0 +1,171 @@
+Subject: [PATCH 0009/0012] take the seat's pointer only when the seat says it has one
+
+Weston creates a seat's pointer on the first pointer event, not when the seat
+appears, and wl_seat.get_pointer before that hands out an inert object whose
+server-side user data is NULL. This build asked for a relative pointer on that
+object unconditionally, and Weston 13.0.1 dereferences the NULL weston_pointer
+in relative_pointer_manager_get_relative_pointer, so the compositor died with
+SIGSEGV the moment the stream window opened, before the first frame could be
+presented.
+
+Listen for wl_seat.capabilities and create the keyboard, the pointer, the
+relative pointer and the pointer lock only when the matching capability is
+advertised; the pointer then appears with the first mouse event and the seat's
+next capabilities event creates it. A withdrawn capability tears the same
+objects down in reverse order.
+
+The keyboard listener needs a name callback even though the name is unused:
+libwayland stops demarshalling a connection at a NULL listener entry.
+---
+ .../rendering/WaylandVideoSurface.cpp         | 71 +++++++++++++++++--
+ .../streaming/rendering/WaylandVideoSurface.h |  6 ++
+ 2 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index b0c701e3..f13c5353 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -119,6 +119,13 @@ void WaylandVideoSurface::handleGlobal(void *data, wl_registry *registry, quint3
+     } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
+         self->m_seat = static_cast<wl_seat *>(
+             wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 5u)));
++        static const wl_seat_listener seatListener = [] {
++            wl_seat_listener listener{};
++            listener.capabilities = handleSeatCapabilities;
++            listener.name = handleSeatName;
++            return listener;
++        }();
++        wl_seat_add_listener(self->m_seat, &seatListener, self);
+     } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+         self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
+             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+@@ -138,6 +145,44 @@ void WaylandVideoSurface::handleGlobalRemove(void *, wl_registry *, quint32)
+ {
+ }
+ 
++void WaylandVideoSurface::handleSeatName(void *, wl_seat *, const char *)
++{
++    // The seat's name is not used: this application only ever talks to the
++    // default seat the compositor gives it.
++}
++
++void WaylandVideoSurface::handleSeatCapabilities(void *data, wl_seat *, quint32 capabilities)
++{
++    auto *self = static_cast<WaylandVideoSurface *>(data);
++    if (!self) return;
++    const bool hadPointer = (self->m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER) != 0;
++    const bool hasPointer = (capabilities & WL_SEAT_CAPABILITY_POINTER) != 0;
++    self->m_seatCapabilities = capabilities;
++    if (hadPointer && !hasPointer) {
++        // Everything created from the pointer is only valid for as long as the
++        // seat advertises it, so let go of it in the reverse order it was made.
++        if (self->m_lockedPointer) {
++            zwp_locked_pointer_v1_destroy(self->m_lockedPointer);
++            self->m_lockedPointer = nullptr;
++        }
++        if (self->m_relativePointer) {
++            zwp_relative_pointer_v1_destroy(self->m_relativePointer);
++            self->m_relativePointer = nullptr;
++        }
++        if (self->m_pointer) {
++            wl_pointer_release(self->m_pointer);
++            self->m_pointer = nullptr;
++        }
++        self->m_pointerInside = false;
++        self->m_lockActive = false;
++        self->m_capturePointer = false;
++    }
++    if (hasPointer && !hadPointer && qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: the seat now has a pointer");
++    self->ensureSeatInput();
++    self->updatePointerConstraint();
++}
++
+ void WaylandVideoSurface::handlePing(void *, xdg_wm_base *shell, quint32 serial)
+ {
+     xdg_wm_base_pong(shell, serial);
+@@ -647,6 +692,7 @@ bool WaylandVideoSurface::ensureConnection()
+         m_viewporter = nullptr;
+         m_dmabuf = nullptr;
+         m_seat = nullptr;
++        m_seatCapabilities = 0;
+         m_keyboard = nullptr;
+         m_pointer = nullptr;
+         m_pointerConstraints = nullptr;
+@@ -771,7 +817,25 @@ bool WaylandVideoSurface::ensureSurface()
+         destroySurface();
+         return false;
+     }
+-    if (m_seat && !m_keyboard) {
++    ensureSeatInput();
++    updatePointerConstraint();
++    qInfo("wayland-video: stream window created");
++    return true;
++}
++
++void WaylandVideoSurface::ensureSeatInput()
++{
++    if (!m_seat) return;
++    // Weston creates a seat's pointer on the first pointer event, not when the
++    // seat appears. Until that happens the seat advertises the keyboard only
++    // and wl_seat.get_pointer hands out an inert object whose server-side user
++    // data is NULL. Asking the compositor for a relative pointer on that inert
++    // object makes it dereference the NULL weston_pointer and take the whole
++    // session down, so nothing that hangs off the pointer is created until the
++    // seat says it has one. The capability arrives with the first mouse event,
++    // so a game started before the mouse ever moved still gets its pointer,
++    // just a little later.
++    if ((m_seatCapabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !m_keyboard) {
+         m_keyboard = wl_seat_get_keyboard(m_seat);
+         // Every callback has to be present: libwayland stops demarshalling the
+         // event stream at a NULL one, and the connection then desynchronises
+@@ -788,7 +852,7 @@ bool WaylandVideoSurface::ensureSurface()
+         }();
+         wl_keyboard_add_listener(m_keyboard, &keyboardListener, this);
+     }
+-    if (m_seat && !m_pointer) {
++    if ((m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER) && !m_pointer) {
+         m_pointer = wl_seat_get_pointer(m_seat);
+         static const wl_pointer_listener pointerListener = [] {
+             wl_pointer_listener listener{};
+@@ -819,9 +883,6 @@ bool WaylandVideoSurface::ensureSurface()
+         }();
+         zwp_relative_pointer_v1_add_listener(m_relativePointer, &relativeListener, this);
+     }
+-    updatePointerConstraint();
+-    qInfo("wayland-video: stream window created");
+-    return true;
+ }
+ 
+ void WaylandVideoSurface::destroySurface()
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 838c8d02..5d4a8615 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -140,6 +140,8 @@ private:
+     static void handleGlobal(void *data, wl_registry *registry, quint32 name,
+                              const char *interface, quint32 version);
+     static void handleGlobalRemove(void *data, wl_registry *registry, quint32 name);
++    static void handleSeatCapabilities(void *data, wl_seat *seat, quint32 capabilities);
++    static void handleSeatName(void *data, wl_seat *seat, const char *name);
+     static void handlePing(void *data, xdg_wm_base *shell, quint32 serial);
+     static void handleConfigure(void *data, xdg_surface *surface, quint32 serial);
+     static void handleToplevelConfigure(void *data, xdg_toplevel *toplevel,
+@@ -187,6 +189,9 @@ private:
+     // pointer is locked to it and only the deltas travel to the host.
+     void updatePointerConstraint();
+     void submitRelative(double dx, double dy);
++    // Takes the seat's capabilities into account: the pointer is only created
++    // when the compositor says the seat has one.
++    void ensureSeatInput();
+ 
+     // The stream window is the one the user is looking at, so it is also the
+     // one that has to feed the host: the compositor cannot hand the pointer or
+@@ -205,6 +210,7 @@ private:
+     xdg_wm_base *m_shell = nullptr;
+     zwp_linux_dmabuf_v1 *m_dmabuf = nullptr;
+     wl_seat *m_seat = nullptr;
++    quint32 m_seatCapabilities = 0;
+     wl_keyboard *m_keyboard = nullptr;
+     wl_pointer *m_pointer = nullptr;
+     zwp_pointer_constraints_v1 *m_pointerConstraints = nullptr;

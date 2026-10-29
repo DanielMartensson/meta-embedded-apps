@@ -1,0 +1,81 @@
+Subject: [PATCH 0010/0012] hand the streamer its own device whatever Qt draws with
+
+The stream window presents the decoder's DMA-BUF itself, so the video needs
+no Qt graphics device at all - only the Vulkan device the streamer creates for
+the buffer export. The handover sat inside the QRhi Vulkan case, so an
+interface drawn with OpenGL fell into the default branch and reported 'This
+graphics backend cannot present native video', which is exactly the backend
+this board has to use: the VeriSilicon Vulkan WSI asserts in
+buffer_fenced_release and takes the process with it.
+
+Move the handover in front of the switch over rhi->backend(), as the r0.44
+series had it, so the streamer gets its own device and the interface may draw
+with OpenGL.
+---
+ .../rendering/NativeStreamRenderCallback.cpp  | 46 +++++++++++++------
+ 1 file changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index ac313197..5e0113ab 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -153,6 +153,39 @@ public:
+             // graphics device. QRhi requires every external native command to be bracketed so it
+             // can invalidate and restore its internal backend state.
+             ExternalCommandScope externalCommands(commandBuffer);
++#if defined(Q_OS_LINUX)
++            if (m_runtime && WaylandVideoSurface::environmentEnabled()) {
++                // Nothing is recorded into Qt's frame on this path: the streamer
++                // only needs the Vulkan device it created for the decoder's
++                // DMA-BUF export, so the interface may draw with any backend -
++                // OpenGL included - without changing what the video does.
++                const auto *device = m_runtime->vulkanDevice();
++                OpenNowStreamerVulkanDeviceInfo info{};
++                info.version = OPENNOW_STREAMER_VULKAN_DEVICE_INFO_VERSION;
++                info.struct_size = sizeof(info);
++                if (!device
++                        || opennow_streamer_vulkan_device_info(device, &info)
++                            != OPENNOW_STREAMER_OK) {
++                    reportFailure(QStringLiteral("The streamer has no Vulkan device for the video. Check native-streamer.log for the device error."));
++                    return;
++                }
++                context.graphics_api = OPENNOW_STREAMER_GRAPHICS_API_VULKAN;
++                context.instance = info.instance;
++                context.physical_device = info.physical_device;
++                context.device = info.device;
++                context.queue = info.graphics_queue;
++                context.queue_family_index = info.graphics_queue_family_index;
++                // The native side binds whichever thread hands it the device,
++                // and the frames are pulled from the interface thread, so hand
++                // it over there.
++                auto *runtime = m_runtime;
++                QMetaObject::invokeMethod(runtime, [runtime, context] {
++                    runtime->setGraphicsContext(context);
++                }, Qt::QueuedConnection);
++                m_graphicsReady = true;
++                return;
++            }
++#endif
+             switch (rhi->backend()) {
+ #if defined(Q_OS_WIN)
+             case QRhi::D3D11: {
+@@ -212,19 +245,6 @@ public:
+                 reportFailure(QStringLiteral("This graphics backend cannot present native video. Use Auto in Stream settings."));
+                 return;
+             }
+-#if defined(Q_OS_LINUX)
+-            if (m_runtime && WaylandVideoSurface::environmentEnabled()) {
+-                // No frame touches the GPU in this mode, and the interface must
+-                // not decide when the video advances, so the frames are pulled
+-                // from the interface thread. The native side binds whichever
+-                // thread hands it the device, so hand it over there.
+-                auto *runtime = m_runtime;
+-                QMetaObject::invokeMethod(runtime, [runtime, context] {
+-                    runtime->setGraphicsContext(context);
+-                }, Qt::QueuedConnection);
+-                status = OPENNOW_STREAMER_OK;
+-            } else
+-#endif
+             status = m_runtime ? m_runtime->setGraphicsContext(context)
+                                : OPENNOW_STREAMER_CLOSED;
+         }

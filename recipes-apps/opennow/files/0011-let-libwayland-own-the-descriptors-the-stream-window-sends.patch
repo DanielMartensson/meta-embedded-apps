@@ -1,0 +1,226 @@
+Subject: [PATCH 0011/0012] let libwayland own the descriptors the stream window sends
+
+
+The stream window kept every frame descriptor in a list and closed the list
+after a flush reported success, because libwayland only copies a descriptor
+into the socket when the request that carries it is written. But libwayland
+closes each descriptor itself as soon as the request goes out, so that close
+was a second close of a number that had been free for a moment already. The
+decoder opens a fresh dma-buf descriptor for every frame it exports and this
+board's capture pool churns through them at frame rate, so it regularly took
+the number back between the two closes: the export then failed with EBADF and
+a number the decoder had reused for something else was handed to the
+compositor, which refused the import ("Failed to import plane 0 as R8") and
+closed the stream window with a protocol error.
+
+The list now only tracks what is still queued; a successful flush forgets the
+entries, and a descriptor that never went into a request (a cached wl_buffer,
+a frame dropped before the surface) is closed by present() itself.
+---
+ .../rendering/WaylandVideoSurface.cpp         | 63 ++++++++++++++-----
+ .../streaming/rendering/WaylandVideoSurface.h | 17 ++---
+ 2 files changed, 56 insertions(+), 24 deletions(-)
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index f13c5353..8432cd9b 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -64,7 +64,7 @@ WaylandVideoSurface::~WaylandVideoSurface()
+     if (m_shell) xdg_wm_base_destroy(m_shell);
+     if (m_compositor) wl_compositor_destroy(m_compositor);
+     if (m_registry) wl_registry_destroy(m_registry);
+-    closeDeferredFds();
++    forgetDeferredFds();
+     // The connection belongs to this surface, so it goes away with it.
+     if (m_display) wl_display_disconnect(m_display);
+     m_dmabuf = nullptr;
+@@ -935,9 +935,21 @@ bool WaylandVideoSurface::ensureDmabuf()
+     return m_dmabuf != nullptr;
+ }
+ 
+-void WaylandVideoSurface::closeDeferredFds()
++void WaylandVideoSurface::forgetDeferredFds()
+ {
+-    for (int fd : m_deferredFds) ::close(fd);
++    // These descriptors are not ours to close any more. libwayland takes
++    // ownership of the descriptor in a request that carries one and closes it
++    // itself as soon as the request is written out (close_fds() in wayland's
++    // connection.c). Closing them here as well is a double close, and the
++    // window between the two is enough for the decoder to reuse the number: it
++    // opens a fresh dma-buf descriptor for every frame it exports, and this
++    // board's capture pool churns through them at frame rate. Closing that
++    // descriptor makes the next export fail with EBADF, and a number that the
++    // decoder reused for something else entirely is handed to the compositor,
++    // which refuses the import ("Failed to import plane 0 as R8") and takes
++    // the connection down with a protocol error. Forgetting the entry is all a
++    // flush needs; whatever libwayland still holds is closed when it sends it
++    // or when the connection goes away.
+     m_deferredFds.clear();
+ }
+ 
+@@ -945,9 +957,9 @@ void WaylandVideoSurface::flushDisplay()
+ {
+     if (!m_display) return;
+     if (wl_display_flush(m_display) == 0) {
+-        // Everything queued so far reached the compositor, so the fd numbers
+-        // libwayland kept for those requests are no longer needed.
+-        closeDeferredFds();
++        // Everything queued so far reached the compositor, so libwayland has
++        // already closed the descriptors those requests carried.
++        forgetDeferredFds();
+         return;
+     }
+     const int error = errno;
+@@ -958,13 +970,13 @@ void WaylandVideoSurface::flushDisplay()
+                      std::strerror(error), wl_display_get_error(m_display));
+     }
+     // The descriptors are still named by requests libwayland has not written
+-    // yet, so they must stay open; closing one here is what made a full socket
+-    // a fatal error for the connection. A compositor that stays behind for
+-    // seconds is gone, and the stream is over either way.
++    // yet, so they must stay open; libwayland closes each one when the request
++    // carrying it finally goes out. A compositor that stays behind for seconds
++    // is gone, and the stream is over either way.
+     if (m_deferredFds.size() > 240) {
+         qWarning("wayland-video: the compositor stopped reading the stream");
+         m_connectionFailed = true;
+-        closeDeferredFds();
++        forgetDeferredFds();
+     }
+ }
+ 
+@@ -977,18 +989,26 @@ void WaylandVideoSurface::present(Frame frame)
+         if (frame.fd >= 0) ::close(frame.fd);
+         return;
+     }
++    // Whether the descriptor went into a request: only then does libwayland
++    // own it. A frame that reuses a cached wl_buffer, or that is dropped
++    // before it reaches the surface, keeps its descriptor here.
++    bool handedOver = false;
+     if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
+             && frame.size.height() > 0) {
+         // Pointer positions are reported in surface pixels; the video size is
+         // what they have to be expressed in.
+         m_videoSize = frame.size;
+         if (ensureSurface() && ensureDmabuf() && m_configured) {
+-            attachFrame(frame);
++            handedOver = attachFrame(frame);
+         } else {
+             ++m_dropped;
+         }
+     }
+-    if (frame.fd >= 0) m_deferredFds.append(frame.fd);
++    if (frame.fd >= 0) {
++        // A descriptor that went into a request belongs to libwayland now and
++        // is tracked by bufferFor(); one that never got there is ours to close.
++        if (!handedOver) ::close(frame.fd);
++    }
+ 
+     const quint64 now = monotonicNs();
+     if (m_sampleStart == 0) {
+@@ -1004,8 +1024,9 @@ void WaylandVideoSurface::present(Frame frame)
+     }
+ }
+ 
+-wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame)
++wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame, bool *queued)
+ {
++    if (queued) *queued = false;
+     struct stat info {};
+     if (::fstat(frame.fd, &info) != 0) return nullptr;
+     const quint64 device = quint64(info.st_dev);
+@@ -1033,6 +1054,12 @@ wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame)
+ 
+     zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
+     if (!params) return nullptr;
++    // The add requests carry the descriptor, so libwayland owns it from here
++    // on and closes it once they are written; the surface must not close it
++    // again (see forgetDeferredFds()). Tracking it before the flush keeps the
++    // list honest even when that flush is the one that sends it.
++    if (queued) *queued = true;
++    m_deferredFds.append(frame.fd);
+     for (quint32 plane = 0; plane < planeCount; ++plane) {
+         zwp_linux_buffer_params_v1_add(params, frame.fd, int(plane), frame.offsets[plane],
+                                        frame.strides[plane],
+@@ -1099,12 +1126,13 @@ void WaylandVideoSurface::destroyBuffers()
+     m_bufferClock = 0;
+ }
+ 
+-void WaylandVideoSurface::attachFrame(const Frame &frame)
++bool WaylandVideoSurface::attachFrame(const Frame &frame)
+ {
+-    wl_buffer *buffer = bufferFor(frame);
++    bool queued = false;
++    wl_buffer *buffer = bufferFor(frame, &queued);
+     if (!buffer) {
+         ++m_dropped;
+-        return;
++        return queued;
+     }
+     wl_surface_attach(m_surface, buffer, 0, 0);
+     if (wl_proxy_get_version(reinterpret_cast<wl_proxy *>(m_surface)) >= 4)
+@@ -1120,6 +1148,7 @@ void WaylandVideoSurface::attachFrame(const Frame &frame)
+     evictBuffers();
+     ++m_committed;
+     ++m_sampleCount;
++    return queued;
+ }
+ 
+ void WaylandVideoSurface::toggleWindowed()
+@@ -1191,7 +1220,7 @@ void WaylandVideoSurface::dismiss()
+     wl_surface_commit(m_surface);
+     flushDisplay();
+     if (m_display) wl_display_flush(m_display);
+-    closeDeferredFds();
++    forgetDeferredFds();
+     destroySurface();
+     m_committed = 0;
+     m_sampleStart = 0;
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+index 5d4a8615..f74e9151 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -61,7 +61,9 @@ public:
+     static WaylandVideoSurface *instance();
+     static bool environmentEnabled();
+ 
+-    // Takes ownership of frame.fd and closes it whatever happens.
++    // Takes ownership of frame.fd. The descriptor is closed here unless it
++    // went into a Wayland request, in which case libwayland closes it once the
++    // request has been written (see forgetDeferredFds()).
+     void present(Frame frame);
+     void dismiss();
+ 
+@@ -133,9 +135,9 @@ private:
+     void reportConnectionError();
+     void destroySurface();
+     bool ensureDmabuf();
+-    void attachFrame(const Frame &frame);
++    bool attachFrame(const Frame &frame);
+     void flushDisplay();
+-    void closeDeferredFds();
++    void forgetDeferredFds();
+ 
+     static void handleGlobal(void *data, wl_registry *registry, quint32 name,
+                              const char *interface, quint32 version);
+@@ -256,15 +258,16 @@ private:
+         bool inFlight = false;
+         quint64 lastUsed = 0;
+     };
+-    [[nodiscard]] wl_buffer *bufferFor(const Frame &frame);
++    [[nodiscard]] wl_buffer *bufferFor(const Frame &frame, bool *queued);
+     void evictBuffers();
+     void destroyBuffers();
+     QVector<CachedBuffer> m_buffers;
+     quint64 m_bufferClock = 0;
+     quint64 m_flushFailures = 0;
+-    // Frame fds are handed to libwayland, which only duplicates them into the
+-    // socket when the request is actually written. A frame can be dropped by a
+-    // full socket, so the fd stays open until a later flush reports success.
++    // Descriptors that went into a request libwayland has not written yet. It
++    // owns them and closes each one when the request goes out; the list only
++    // bounds how many a stalled compositor can hold. A descriptor that never
++    // went into a request is closed by present() itself.
+     QList<int> m_deferredFds;
+     wp_viewporter *m_viewporter = nullptr;
+     wp_viewport *m_viewport = nullptr;

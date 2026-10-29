@@ -1,0 +1,500 @@
+Subject: [PATCH 0001/0012] settle the interface on this board
+
+The image runs one VeriSilicon GPU behind weston with no Vulkan Video, no
+desktop session and a launcher that expects the application to die with its
+event loop. This patch is the bring-up set the later video work stands on:
+
+* ask FFmpeg only for the decoders and surface extensions this machine
+  actually has, instead of failing on the ones it does not;
+* drop the VeriSilicon driver's "queue destroyed while proxies still attached"
+  report, which it prints on every start and every exit from a connection it
+  opened itself, and leave every other libwayland diagnostic alone;
+* let the renderer be selected at run time so the interface can draw with
+  OpenGL while the video keeps its own Vulkan device;
+* let SIGTERM stop the application and leave the process when the event loop
+  ends, so a systemd stop does not have to kill it;
+* keep the sign-in card out of the layer path, do not let one slow region
+  block a launch, print the native error message when a session fails, and
+  quiet the Vulkan and locale lines that only repeat what the log already
+  says.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/native/opennow-core/src/cloudmatch.rs b/native/opennow-core/src/cloudmatch.rs
+index ca5cb0c8..c4c66fa3 100644
+--- a/native/opennow-core/src/cloudmatch.rs
++++ b/native/opennow-core/src/cloudmatch.rs
+@@ -17,8 +17,14 @@ const LCARS_CLIENT_ID: &str = "ec7e38d4-03af-4b58-b131-cfb0495903ab";
+ const GFN_CLIENT_VERSION: &str = "2.0.87.131";
+ const DEFAULT_STREAMING_BASE: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
+ const DEFAULT_STUN_SERVER: &str = "stun:s1.stun.gamestream.nvidia.com:19308";
+-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+-const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
++// A region front end occasionally takes five seconds or more to answer a
++// cold /v2/session request, and the TLS handshake on the STM32MP257F adds to
++// that. The old three second budget marked the lookup incomplete and blocked
++// every launch with "session_discovery_failed" even when the game was not
++// running anywhere, so give each region room and let the overall deadline
++// absorb one slow answer.
++const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
++const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+ const NETWORK_TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+ const MAXIMUM_NETWORK_TEST_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+ const MAX_DISCOVERY_REGIONS: usize = 32;
+@@ -2925,9 +2931,11 @@ fn discover_sessions_with_status(
+     cancellation.check()?;
+     results.sort_by_key(|(index, _)| *index);
+     let mut sessions = Vec::new();
++    let mut answered = false;
+     for (_, result) in results {
+         match result {
+             Ok(found) => {
++                answered = true;
+                 for session in found {
+                     if !sessions
+                         .iter()
+@@ -2943,7 +2951,10 @@ fn discover_sessions_with_status(
+             Err(_) => incomplete = true,
+         }
+     }
+-    if sessions.is_empty() && (incomplete || bases.is_empty()) {
++    // Only fail when no region answered at all. One slow or unreachable
++    // region used to abort the whole lookup; an account can hold a session in
++    // a single region, and the service rejects a second launch anyway.
++    if sessions.is_empty() && !answered && incomplete {
+         return Err(discovery_failed());
+     }
+     Ok((sessions, !incomplete && !bases.is_empty()))
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+index 1c9a72be..3d1d88a7 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/video/ffmpeg.rs
+@@ -243,6 +243,13 @@ impl FfmpegDecoder {
+         let device_path = vaapi_device
+             .as_ref()
+             .map_or(ptr::null(), |path| path.as_ptr());
++        if mode == FfmpegMode::Cuda && !cuda_device_present() {
++            return Err(Error::unavailable(
++                Subsystem::Ffmpeg,
++                "no NVIDIA device node (/dev/nvidiactl), so CUDA decoding cannot be offered"
++                    .to_owned(),
++            ));
++        }
+         if let Some(device_type) = mode.device_type() {
+             let pixel_format =
+                 hardware_pixel_format(decoder_definition, device_type).ok_or_else(|| {
+@@ -258,11 +265,26 @@ impl FfmpegDecoder {
+             let mut device = ptr::null_mut();
+             let mut options = ptr::null_mut();
+             if mode == FfmpegMode::Vulkan {
++                // FFmpeg reports every instance extension it was asked for and
++                // could not find ("instance extension VK_KHR_xlib_surface not
++                // found, excluding"). Ask only for the window-system extensions
++                // this session can have: a Wayland-only board has no X11
++                // surface.
++                let mut surfaces = String::from("VK_KHR_surface");
++                if std::env::var_os("WAYLAND_DISPLAY").is_some()
++                    || std::env::var_os("WAYLAND_SOCKET").is_some()
++                {
++                    surfaces.push_str("+VK_KHR_wayland_surface");
++                }
++                if std::env::var_os("DISPLAY").is_some() {
++                    surfaces.push_str("+VK_KHR_xlib_surface");
++                }
++                let surfaces = std::ffi::CString::new(surfaces).unwrap_or_default();
+                 unsafe {
+                     ffi::av_dict_set(
+                         &mut options,
+                         c"instance_extensions".as_ptr(),
+-                        c"VK_KHR_surface+VK_KHR_xlib_surface+VK_KHR_wayland_surface".as_ptr(),
++                        surfaces.as_ptr(),
+                         0,
+                     );
+                     ffi::av_dict_set(
+@@ -1321,6 +1343,14 @@ impl VideoDecoder for FfmpegDecoder {
+     }
+ }
+ 
++/// FFmpeg's CUDA device tries to load libcuda.so.1 and logs an error when it is
++/// not there, which is the normal case on every board without an NVIDIA GPU.
++/// Ask the kernel first, so a missing driver is a plain "not available" instead
++/// of an error on the console.
++fn cuda_device_present() -> bool {
++    std::path::Path::new("/dev/nvidiactl").exists()
++}
++
+ fn initialize_ffmpeg() -> Result<()> {
+     static INITIALIZED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+     INITIALIZED
+diff --git a/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs b/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
+index 301393de..d0e02bdb 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-protocol/src/log.rs
+@@ -278,6 +278,16 @@ pub fn message_summary(value: &serde_json::Value) -> String {
+             }
+         }
+     }
++    if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
++        let clean: String = message
++            .chars()
++            .map(|c| if c.is_control() { ' ' } else { c })
++            .take(300)
++            .collect();
++        if !clean.trim().is_empty() {
++            fields.push(format!("message={}", clean.trim()));
++        }
++    }
+     fields.join(" ")
+ }
+ 
+diff --git a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+index 00957791..dad3df51 100644
+--- a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
++++ b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+@@ -108,14 +108,8 @@ FocusScope {
+             border.width: action.activeFocus ? 2 : action.primary || action.quiet ? 0 : 1
+             border.color: action.activeFocus ? DesktopTokens.focus : root.cardSeam
+             opacity: action.enabled ? 1 : 0.5
+-            layer.enabled: action.primary
+-            layer.effect: MultiEffect {
+-                shadowEnabled: true
+-                shadowColor: "#2E6EE7B7"
+-                shadowBlur: 0.6
+-                shadowVerticalOffset: DesktopTokens.px(8)
+-                shadowHorizontalOffset: 0
+-            }
++            // Drawn directly: the layered shadow below crashed the Vulkan
++            // driver on the STM32MP257F, see the sign-in card.
+         }
+     }
+ 
+@@ -248,14 +242,11 @@ FocusScope {
+                 color: Theme.lightMode ? Qt.rgba(Theme.shell.r, Theme.shell.g, Theme.shell.b, 0.92) : "#D10B0F1A"
+                 border.width: 1
+                 border.color: root.cardSeam
+-                layer.enabled: true
+-                layer.effect: MultiEffect {
+-                    shadowEnabled: true
+-                    shadowColor: "#8C000000"
+-                    shadowBlur: 1
+-                    shadowVerticalOffset: DesktopTokens.px(24)
+-                    shadowHorizontalOffset: 0
+-                }
++                // The card used to be a QML layer with a MultiEffect drop
++                // shadow. On the STM32MP257F the VeriSilicon Vulkan driver
++                // segfaults in QSGRhiLayer::grab() when the card re-renders
++                // while the QR panel appears, so it is drawn directly now. The
++                // button above lost its layer for the same reason.
+ 
+                 Column {
+                     id: cardColumn
+diff --git a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+index 2a10c195..b15f2ea1 100644
+--- a/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
++++ b/opennow-qt/qml/desktop/components/DesktopGameLabels.qml
+@@ -69,7 +69,11 @@ Item {
+                     required property int index
+                     readonly property var launcher: root.launchers[index]
+                     objectName: "desktopGameLauncher" + index
+-                    anchors.verticalCenter: parent.verticalCenter
++                    // Anchor to the row by id: the delegate is briefly
++                    // parentless while the model is rebuilt, and
++                    // parent.verticalCenter then logs a TypeError for every
++                    // delegate, every rebuild.
++                    anchors.verticalCenter: launcherRow.verticalCenter
+                     width: root.glyphSize
+                     height: root.glyphSize
+                     opacity: launcher.owned ? 1 : 0.5
+diff --git a/opennow-qt/src/app/ApplicationStartup.cpp b/opennow-qt/src/app/ApplicationStartup.cpp
+index cda00eb0..8b9b6d24 100644
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -36,11 +36,18 @@
+ #include <QProcess>
+ #include <QPointer>
+ 
++#include <algorithm>
+ #include <chrono>
++#include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
++#include <string_view>
+ #include <thread>
+ 
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++#include <wayland-client.h>
++#endif
++
+ #ifdef Q_OS_WIN
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -56,6 +63,40 @@ using namespace Qt::StringLiterals;
+ namespace {
+ constexpr auto TeardownDeadline = std::chrono::seconds(10);
+ 
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++// The VeriSilicon Vulkan driver opens its own connection to the compositor to
++// allocate buffers (wl_viv) and drops that connection when a swapchain goes
++// away, while its wl_compositor proxy is still attached. libwayland reports it
++// on every start and every exit:
++//
++//   warning: queue 0xffff... destroyed while proxies still attached:
++//     wl_compositor@35 still attached
++//
++// The queue belongs to a connection the driver made, so no client-side change
++// prevents it. Drop exactly that report and leave every other libwayland
++// diagnostic on stderr.
++bool g_suppressOrphanedQueueReport = false;
++
++void waylandLogHandler(const char *format, va_list arguments)
++{
++    char line[512];
++    const int length = std::vsnprintf(line, sizeof line, format, arguments);
++    if (length <= 0) return;
++    const auto text = std::string_view(line, std::min<size_t>(size_t(length), sizeof line - 1));
++    if (text.starts_with("warning: queue ")
++        && text.find("destroyed while proxies still attached") != std::string_view::npos) {
++        g_suppressOrphanedQueueReport = true;
++        return;
++    }
++    if (g_suppressOrphanedQueueReport && text.starts_with("  ")
++        && text.find("still attached") != std::string_view::npos) {
++        return;
++    }
++    g_suppressOrphanedQueueReport = false;
++    std::fwrite(line, 1, size_t(length), stderr);
++}
++#endif
++
+ void armTeardownDeadline(int exitCode)
+ {
+     std::thread([exitCode] {
+@@ -98,6 +139,17 @@ private:
+ 
+ static int runApplicationSession(int argc, char *argv[], QString &restartExecutable)
+ {
++#ifdef OPENNOW_WAYLAND_DECORATIONS
++    wl_log_set_handler_client(waylandLogHandler);
++#endif
++#ifdef Q_OS_LINUX
++    // SDL3 installs SIGINT/SIGTERM handlers by default and turns the signals
++    // into SDL events, which nothing in this Qt application pumps: kill and
++    // systemctl stop would then leave the process running forever. The Qt event
++    // loop owns the lifetime here, so keep SDL out of signal handling and let
++    // SIGTERM do what it does for every other application.
++    qputenv("SDL_NO_SIGNAL_HANDLERS", "1");
++#endif
+ #ifdef Q_OS_WIN
+     if (!qEnvironmentVariableIsSet("QT_D3D_NO_VBLANK_THREAD"))
+         qputenv("QT_D3D_NO_VBLANK_THREAD", "1");
+@@ -124,7 +176,16 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+ #elif defined(Q_OS_MACOS)
+     QQuickWindow::setGraphicsApi(QSGRendererInterface::Metal);
+ #elif defined(Q_OS_LINUX)
+-    QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
++    // Upstream forces Vulkan here, which stays the default: the streaming path
++    // hands its textures to Qt through the Vulkan device and cannot run on
++    // OpenGL. The Ui itself does not need Vulkan, though, and on the
++    // STM32MP25 it starts about five times faster on OpenGL (the same driver
++    // behaviour that YtGst and NanoBrowser see, see README.md), so
++    // OPENNOW_RENDERER=opengl selects it for a run. Anything else keeps Vulkan.
++    if (qgetenv("OPENNOW_RENDERER").toLower() == "opengl")
++        QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
++    else
++        QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+ #endif
+     QQuickStyle::setStyle(u"Basic"_s);
+ 
+@@ -204,6 +265,7 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     bool graphicsValidationRequired = true;
+ #endif
+     if (QQuickWindow::graphicsApi() == QSGRendererInterface::Vulkan
++            && LinuxVulkanGraphics::hasVulkanVideoDecode()
+             && !vulkanDevice.initialize())
+         qWarning("Embedded Vulkan Video is unavailable: %s Qt will use its default graphics device.",
+                  qUtf8Printable(vulkanDevice.lastError()));
+@@ -445,6 +507,23 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
+     armTeardownDeadline(exitCode);
+     coreClient.stop();
+ #ifdef OPENNOW_EMBEDDED_STREAMER
++    // On the STM32MP25 VeriSilicon Vulkan driver this teardown does not finish.
++    // The GUI thread waits in QWindowPrivate::destroy() for the render thread,
++    // while the render thread sits in libvulkan_VSI waiting for a Wayland
++    // roundtrip that only the blocked GUI thread can dispatch. The embedded
++    // streamer's scene-graph shutdown can also abort on a mutex at the same
++    // point. Both were observed on the STM32MP257F, and either one ends in the
++    // ten-second watchdog above or in SIGABRT with a core dump.
++    //
++    // Nothing after the event loop is needed once the core client has stopped:
++    // the window, the scene graph and the streamer are per-process resources
++    // and go away with the process. Leave without running Qt's teardown, unless
++    // a restart was requested; the updater path needs runApplication to start
++    // the replacement executable.
++    if (restartExecutable.isEmpty()) {
++        std::fflush(nullptr);
++        std::_Exit(exitCode);
++    }
+     const auto roots = engine.rootObjects();
+     for (auto *root : roots) delete root;
+     StreamVideoItem::setNativeStreamRuntime(nullptr);
+diff --git a/opennow-qt/src/main.cpp b/opennow-qt/src/main.cpp
+index a3d0bc68..8b790a70 100644
+--- a/opennow-qt/src/main.cpp
++++ b/opennow-qt/src/main.cpp
+@@ -1,6 +1,36 @@
+ #include "app/ApplicationStartup.h"
+ 
++#include <clocale>
++#include <langinfo.h>
++#include <QDebug>
++
++// ---------------------------------------------------------------------------
++// A UTF-8 character type
++// ---------------------------------------------------------------------------
++//
++// Embedded sessions often start with LANG=C, and Qt then warns once per process
++// that it depends on a UTF-8 locale. Qt's text handling really does want UTF-8:
++// with an ASCII character type, paths and titles converted with
++// QString::fromLocal8Bit() come out mangled.
++//
++// Only LC_CTYPE is changed. Number, date and collation formats keep following
++// whatever the session asks for, and LANG is left alone, so the language used
++// for the interface and for search results does not change.
++static void preferUtf8CharacterType()
++{
++    if (setlocale(LC_CTYPE, "") == nullptr)
++        return;
++    const QByteArray codeset = nl_langinfo(CODESET);
++    if (codeset == "UTF-8")
++        return;
++    if (setlocale(LC_CTYPE, "en_US.UTF-8") == nullptr)
++        return;   // no UTF-8 locale in the image; nothing to switch to
++    qputenv("LC_CTYPE", "en_US.UTF-8");
++    qInfo("OpenNOW: character type was %s, using en_US.UTF-8", codeset.constData());
++}
++
+ int main(int argc, char *argv[])
+ {
++    preferUtf8CharacterType();
+     return runApplication(argc, argv);
+ }
+diff --git a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
+index 25a65189..3669380a 100644
+--- a/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
++++ b/opennow-qt/src/streaming/rendering/LinuxVulkanGraphics.h
+@@ -67,13 +67,74 @@ inline QByteArrayList deviceExtensions()
+             "VK_KHR_maintenance1", "VK_EXT_queue_family_foreign"};
+ }
+ 
++// This Qt build exposes the VkInstance and its function table but no device
++// list, so enumerate the physical devices through Vulkan directly.
++inline QList<VkPhysicalDevice> physicalDevicesOf(QVulkanInstance *instance)
++{
++    QList<VkPhysicalDevice> devices;
++    if (!instance || !instance->functions() || instance->vkInstance() == VK_NULL_HANDLE)
++        return devices;
++    uint32_t count = 0;
++    if (instance->functions()->vkEnumeratePhysicalDevices(instance->vkInstance(), &count, nullptr)
++            != VK_SUCCESS || count == 0)
++        return devices;
++    devices.resize(count);
++    if (instance->functions()->vkEnumeratePhysicalDevices(instance->vkInstance(), &count, devices.data())
++            != VK_SUCCESS)
++        devices.clear();
++    else
++        devices.resize(count);
++    return devices;
++}
++
++// Extensions Qt is asked to enable on its device. A requested extension the
++// driver does not offer only produces a warning from Qt and is dropped there, so
++// ask for the intersection with what the physical device actually exposes: on a
++// board without VK_EXT_image_drm_format_modifier the import contract below
++// reports the gap anyway, and the console stays clean.
++inline QByteArrayList availableDeviceExtensions(QVulkanInstance *instance)
++{
++    QByteArrayList available;
++    if (!instance || !instance->functions()) return available;
++    for (VkPhysicalDevice device : physicalDevicesOf(instance)) {
++        uint32_t count = 0;
++        if (instance->functions()->vkEnumerateDeviceExtensionProperties(
++                device, nullptr, &count, nullptr) != VK_SUCCESS
++                || count == 0)
++            continue;
++        QList<VkExtensionProperties> properties(count);
++        if (instance->functions()->vkEnumerateDeviceExtensionProperties(
++                device, nullptr, &count, properties.data()) != VK_SUCCESS)
++            continue;
++        properties.resize(count);
++        for (const auto &property : properties) {
++            const QByteArray name(property.extensionName);
++            if (!available.contains(name)) available.append(name);
++        }
++    }
++    return available;
++}
++
++// Qt leaves VkApplicationInfo::apiVersion at 0 when nothing was requested, and
++// the loader rejects that (VUID-VkApplicationInfo-apiVersion). Ask for the
++// version the loader reports; these probes only enumerate, so any version works.
++inline void setSupportedApiVersion(QVulkanInstance &instance)
++{
++    const QVersionNumber supported = instance.supportedApiVersion();
++    if (!supported.isNull())
++        instance.setApiVersion(supported);
++}
++
+ inline void requestDeviceExtensions()
+ {
+     QVulkanInstance probe;
+-    if (probe.supportedApiVersion() < QVersionNumber(1, 1)) return;
++    setSupportedApiVersion(probe);
++    if (!probe.create()) return;
++    const auto available = availableDeviceExtensions(&probe);
+     auto requested = qgetenv("QT_VULKAN_DEVICE_EXTENSIONS").split(';');
+     for (const auto &extension : deviceExtensions()) {
+-        if (!requested.contains(extension)) requested.append(extension);
++        if (available.contains(extension) && !requested.contains(extension))
++            requested.append(extension);
+     }
+     qputenv("QT_VULKAN_DEVICE_EXTENSIONS", requested.join(';'));
+     extensionRequestInstalled.store(true, std::memory_order_release);
+@@ -127,6 +188,38 @@ inline bool hasDmabufBufferImportContract(const QVersionNumber &instanceVersion,
+     return true;
+ }
+ 
++// True when a physical device exposes a Vulkan Video decode extension. The
++// embedded streamer's shared device exists to decode with Vulkan Video, so on a
++// board that decodes through V4L2 Request or VA-API the probe has nothing to
++// build and only reports that the expected feature is missing. Asking first
++// keeps a normal configuration from looking like a broken one.
++inline bool hasVulkanVideoDecode()
++{
++    QVulkanInstance instance;
++    setSupportedApiVersion(instance);
++    if (!instance.create()) return false;
++    auto *functions = instance.functions();
++    if (!functions) return false;
++    const QByteArrayList decodeExtensions = {
++        "VK_KHR_video_decode_h264", "VK_KHR_video_decode_h265", "VK_KHR_video_decode_av1"};
++    for (VkPhysicalDevice device : physicalDevicesOf(&instance)) {
++        uint32_t count = 0;
++        if (functions->vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr)
++                != VK_SUCCESS || count == 0)
++            continue;
++        QList<VkExtensionProperties> available(count);
++        if (functions->vkEnumerateDeviceExtensionProperties(device, nullptr, &count,
++                                                            available.data()) != VK_SUCCESS)
++            continue;
++        available.resize(count);
++        for (const auto &property : available) {
++            if (decodeExtensions.contains(QByteArray(property.extensionName)))
++                return true;
++        }
++    }
++    return false;
++}
++
+ struct ImportContract {
+     uint32_t capabilities = 0;
+     QString summary;

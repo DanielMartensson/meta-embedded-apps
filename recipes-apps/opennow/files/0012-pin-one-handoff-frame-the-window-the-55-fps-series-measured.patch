@@ -1,0 +1,98 @@
+Subject: [PATCH 0012/0012] pin one handoff frame, the window the 55 fps series measured
+
+
+The compositor imports the planes only when the queued add/create_immed
+message reaches it, and by then the decoder has retired the frame and handed
+its capture buffer to the next decode, which makes the import fail with
+"Failed to import plane 0 as R8". The export's own duplicate keeps the
+dma-buf object alive but not the decoder's surface, so the handoff needs one
+pinned frame across the message.
+
+A ring of zero was a theory that the duplicate is enough; it is not. A ring of
+24 was measured to break the stream: it pins the whole capture pool, so the
+decoder names a fresh DMA-BUF for every frame, the presenter's cache misses
+every frame, the compositor EGL-imports a new image every frame and the driver
+eventually refuses one of them. One is what the r0.44 series ran at 55 fps and
+is what the knob now defaults to; OPENNOW_HANDOFF_RETAINED still overrides it
+over 0..=24 so both ends of the measurement can be repeated.
+---
+ .../src/frame_producer.rs                     | 56 ++++++++++---------
+ 1 file changed, 31 insertions(+), 25 deletions(-)
+
+diff --git a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+index f8dc01e6..211025db 100644
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -27,25 +27,29 @@ const DECODE_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+ /// and the dma-buf fds the decoder opened for them. The export owns its own
+ /// `F_DUPFD_CLOEXEC` duplicate of the decoder's handle and the presenter keeps
+ /// that duplicate open until the flush which carries the descriptor succeeds,
+-/// so the compositor has its own reference to the dma-buf and the import does
+-/// not need this crate to hold the decoder's frame at all.
++/// so the compositor has its own reference to the dma-buf. That reference
++/// keeps the object alive, but not the decoder's surface: the compositor
++/// imports the planes only when the queued `add`/`create_immed` message
++/// reaches it, and by then the decoder has already retired the frame and
++/// handed the capture buffer to the next decode. The import then fails with
++/// "Failed to import plane 0 as R8" and the protocol error closes the stream
++/// window.
+ ///
+-/// Holding it anyway costs the decoder a capture buffer for as long as the
+-/// ring keeps it, and this board's decoder has very few. `hantro-vpu` allocates
+-/// the capture buffers from contiguous memory and fails the next
+-/// `VIDIOC_CREATE_BUFS` with `Cannot allocate memory (12)` once a handful are
+-/// outstanding: the stream then stops at the frames already presented while
+-/// FFmpeg retries `Failed setup for format drm_prime` forever, and the frames
+-/// that were in flight when the decoder re-initialised name closed descriptors
+-/// (`fstat on DMA-BUF failed: Bad file descriptor (os error 9)`). The default
+-/// is therefore no retention: the duplicate in [`export_dmabuf`] is what keeps
+-/// the buffer alive for the compositor, exactly as the r0.41 series did when it
+-/// presented this board at 55 fps.
++/// One pinned frame is enough to keep the surface, and the fds it named, alive
++/// across that handoff, and it is what the r0.44 series measured: pinning a
++/// wide window instead pins the whole capture pool, so the decoder names a
++/// fresh DMA-BUF for every frame, the presenter's one-compositor-buffer-per-
++/// DMA-BUF cache misses every frame, the compositor EGL-imports a new image
++/// every frame, and the driver eventually refuses one of those imports (the
++/// same fatal "importing the supplied dmabufs failed"). `hantro-vpu` also
++/// allocates its capture buffers from contiguous memory and fails
++/// `VIDIOC_CREATE_BUFS` with `Cannot allocate memory (12)` once too many are
++/// outstanding. A ring of 24 was measured to break the stream that way.
+ ///
+-/// `OPENNOW_HANDOFF_RETAINED=N` still asks for a ring of N frames for the A/B
+-/// runs, clamped to 0..=24, so the measurement that established this default
+-/// can be repeated without a rebuild.
+-const COMPOSITOR_HANDOFF_RETAINED: usize = 0;
++/// `OPENNOW_HANDOFF_RETAINED=N` asks for another window for the A/B runs,
++/// clamped to 0..=24 so both the "no retention" and the "too much retention"
++/// ends of the measurement can be repeated without a rebuild.
++const COMPOSITOR_HANDOFF_RETAINED: usize = 1;
+ 
+ /// The handoff window in force: [`COMPOSITOR_HANDOFF_RETAINED`] unless
+ /// `OPENNOW_HANDOFF_RETAINED=N` asks for another one for the measurement.
+@@ -940,15 +944,17 @@ impl LinuxFrameProducer {
+ 
+     /// Keeps the decoder frame whose DMA-BUF went to a compositor alive.
+     ///
+-    /// [`export_dmabuf`] duplicates the descriptor the kernel exported, and
+-    /// the duplicate is what keeps the buffer alive for the compositor; the
+-    /// frame itself is not needed once the call returns. A non-empty ring
+-    /// additionally pins the newest N frames, which costs the decoder one
+-    /// capture buffer per entry; see [`COMPOSITOR_HANDOFF_RETAINED`] for why
+-    /// the default ring is empty on this board.
++    /// [`export_dmabuf`] duplicates the descriptor the kernel exported, which
++    /// keeps the dma-buf object alive for the compositor, but the compositor
++    /// imports the planes only when the queued request reaches it. By then the
++    /// decoder has retired this frame and handed its capture buffer to the
++    /// next decode, and the import fails. The ring pins the newest N frames so
++    /// the surface, and the fds it named, survive the handoff; it costs the
++    /// decoder one capture buffer per entry, which is why N is small. See
++    /// [`COMPOSITOR_HANDOFF_RETAINED`].
+     fn retain_handoff_frame(&mut self, frame: &DecodedVideoFrame) {
+-        // No ring means the export's own descriptor duplicate is the only
+-        // reference the handoff needs; see `COMPOSITOR_HANDOFF_RETAINED`.
++        // A zero-width ring is the A/B case that measures the failure mode:
++        // the export's duplicate is then the only reference the handoff has.
+         if self.handoff_frames.is_empty() {
+             return;
+         }
