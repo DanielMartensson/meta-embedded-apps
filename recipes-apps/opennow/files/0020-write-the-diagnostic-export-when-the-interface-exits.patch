@@ -1,0 +1,79 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 10:20:00 +0100
+Subject: [PATCH 20/20] write the diagnostic export when the interface exits
+
+The Export button is the only way to get the redacted .txt that carries
+the Qt log, the RPC log and the embedded streamer's native log, and it
+needs the user to press it while the application is still up. The run
+that is worth attaching to a report is usually the run that just ended,
+so the core now writes that same export when its stdin closes, which is
+the interface exiting, and prints the path on stderr where the launcher
+log already collects the core's output.
+
+The export is written on every exit, so the five newest files are kept
+and older ones are removed; the diagnostics directory does not grow
+without bound.
+
+Greppable markers: opennow-diagnostics-export
+---
+
+--- a/native/opennow-core/src/main.rs
++++ b/native/opennow-core/src/main.rs
+@@ -258,10 +258,57 @@
+             drop(permit);
+         }).map_err(|error| error.to_string())?;
+     }
++    // The interface has closed its end of the pipe and this process is about to
++    // exit, so the run that just ended is still in the log files. Write the same
++    // redacted export the Export button writes while there is still a core to
++    // write it, and name the file on stderr so the launcher log keeps the path.
++    let runtime = json!({
++        "schemaVersion": 1,
++        "kind": "opennow.exit-diagnostics",
++        "generatedAtMs": unix_time_millis().to_string(),
++        "applicationVersion": version::APPLICATION_VERSION,
++        "os": std::env::consts::OS,
++        "cpuArchitecture": std::env::consts::ARCH
++    });
++    match core.diagnostics.export_with_runtime(Some(&runtime)) {
++        Ok(export) => {
++            if let Some(path) = export["path"].as_str() {
++                eprintln!("opennow-diagnostics-export: {path}");
++                prune_diagnostics_exports(Path::new(path).parent());
++            }
++        }
++        Err(error) => eprintln!("opennow-diagnostics-export: failed: {error}"),
++    }
+     core.analytics.shutdown(&analytics_finished);
+     Ok(())
+ }
+ 
++// The export is written on every exit now, so keep the directory bounded: the
++// last five runs are enough to attach to a report.
++fn prune_diagnostics_exports(directory: Option<&Path>) {
++    let Some(directory) = directory else { return };
++    let Ok(entries) = std::fs::read_dir(directory) else { return };
++    let mut exports: Vec<_> = entries
++        .flatten()
++        .map(|entry| entry.path())
++        .filter(|path| {
++            path.file_name()
++                .and_then(|name| name.to_str())
++                .is_some_and(|name| {
++                    name.starts_with("opennow-diagnostics-") && name.ends_with(".txt")
++                })
++        })
++        .collect();
++    exports.sort();
++    let keep = 5;
++    if exports.len() <= keep {
++        return;
++    }
++    for path in &exports[..exports.len() - keep] {
++        let _ = std::fs::remove_file(path);
++    }
++}
++
+ type DispatchResult = Result<(Value, Option<(&'static str, Value)>), (String, String)>;
+ 
+ fn complete_session_create(

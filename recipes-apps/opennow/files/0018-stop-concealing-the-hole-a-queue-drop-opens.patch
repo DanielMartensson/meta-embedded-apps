@@ -1,0 +1,340 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 10:45:00 +0100
+Subject: [PATCH 18/20] stop concealing the hole a queue drop opens
+
+The play queue holds 12 packets of 5 ms, and push_latest evicts the
+oldest when a stall fills it. That is the wrong end: the packet it
+throws away is the one the worker is about to play, so every pop after
+the queue fills leaves an RTP hole, and OpusDecoder::conceal_before
+fills that hole with packet loss concealment, up to 100 ms of it.
+Writing concealment takes exactly as long as the audio it stands in
+for, so the worker falls further behind with every packet it takes.
+The measured r0.47 session is that fixed point: 186 of the 200 packets
+a second were dropped and the worker consumed 14, and 14 times 71 ms of
+concealment is one second of audio a second. The sink is never idle,
+the queue never drains, and 95 per cent of what the board played was
+concealment noise.
+
+A full queue now drops the packet that just arrived instead, so what
+the worker pops stays contiguous and the queue drains. The drop is
+reported as PushOutcome::DroppedNewest, which the platform counts under
+the same linux-audio drop as before.
+
+A self-inflicted hole is not loss either: the worker marks the decoder
+when the queue reports a drop, and the next hole that appears is played
+through instead of concealed. Holes longer than four packets are played
+through as well, which covers any other way the playout can fall behind.
+Holes of up to four packets are still concealed, which is what network
+loss needs.
+
+Greppable markers: opennow-audio-gap-skip
+---
+
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/audio.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/audio.rs
+@@ -16,6 +16,10 @@
+ const OPUS_MAX_FRAME_MS: usize = 120;
+ const OPUS_RESET_STATE: c_int = 4028;
+ const MAX_PLC_MS: usize = 100;
++// A hole longer than this many packets is the play queue catching up with
++// itself, not network loss: concealing it writes that much audio in real
++// time and drops as much again.
++const MAX_CONCEAL_PACKETS: usize = 4;
+ const PLC_CHUNK_TENTHS_MS: [usize; 6] = [600, 400, 200, 100, 50, 25];
+ const SND_PCM_STREAM_PLAYBACK: c_int = 0;
+ const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+@@ -172,6 +176,7 @@
+     last_ssrc: Option<u32>,
+     last_timestamp: Option<u32>,
+     last_frame_samples_per_channel: usize,
++    skip_gap: bool,
+ }
+ 
+ impl OpusDecoder {
+@@ -225,6 +230,7 @@
+                 last_ssrc: None,
+                 last_timestamp: None,
+                 last_frame_samples_per_channel: 0,
++                skip_gap: false,
+             })
+         }
+     }
+@@ -269,6 +275,14 @@
+         self.last_timestamp = Some(packet.rtp_timestamp.wrapping_sub(frame_ticks as u32));
+     }
+ 
++    /// The play queue dropped the packet that followed the last one decoded,
++    /// so the next hole this decoder sees is this process's own doing and not
++    /// network loss. Concealing it would write as much audio as the drop threw
++    /// away, so the next hole is played through instead.
++    pub fn skip_next_gap(&mut self) {
++        self.skip_gap = true;
++    }
++
+     pub fn conceal_before<'a>(&'a mut self, packet: &AudioPacket) -> Result<&'a [f32]> {
+         if self.source_changed(packet.ssrc) {
+             self.reset_decoder_state()?;
+@@ -290,6 +304,14 @@
+         if missing_samples == 0 {
+             return Ok(&self.pcm[..0]);
+         }
++        if self.skip_gap || missing_samples > frame_samples.saturating_mul(MAX_CONCEAL_PACKETS) {
++            self.skip_gap = false;
++            eprintln!(
++                "opennow-audio-gap-skip: {} ms missing, playing on",
++                missing_samples.saturating_mul(1000) / self.sample_rate as usize,
++            );
++            return Ok(&self.pcm[..0]);
++        }
+         let budget_samples = self.sample_rate as usize * MAX_PLC_MS / 1000;
+         let capacity = self.pcm.len() / self.channels;
+         let mut remaining = missing_samples.min(budget_samples).min(capacity);
+@@ -341,6 +363,7 @@
+         self.last_ssrc = None;
+         self.last_timestamp = None;
+         self.last_frame_samples_per_channel = 0;
++        self.skip_gap = false;
+         Ok(())
+     }
+ }
+@@ -1333,7 +1356,7 @@
+     }
+ 
+     #[test]
+-    fn concealment_is_bounded_by_the_configured_time_budget() {
++    fn a_hole_past_the_queue_drop_threshold_is_not_concealed() {
+         let (mut decoder, mut encoder) = decoder_and_encoder();
+         let first = audio_packet(encoded_frame(&mut encoder, 960, 440.0), 0);
+         decoder.decode(&first).expect("decode");
+@@ -1343,9 +1366,37 @@
+                 encoded_frame(&mut encoder, 960, 440.0),
+                 960_000,
+             ))
+-            .expect("concealment");
+-        let budget_frames = 48_000 * MAX_PLC_MS / 1000 / 960;
+-        assert_eq!(concealed.len(), budget_frames * 1_920);
++            .expect("skipped hole");
++        assert!(
++            concealed.is_empty(),
++            "a ten second hole is a stalled play queue, not network loss"
++        );
++    }
++
++    #[test]
++    fn a_queue_drop_forgets_the_timeline_once() {
++        let (mut decoder, mut encoder) = decoder_and_encoder();
++        let first = audio_packet(encoded_frame(&mut encoder, 960, 440.0), 0);
++        decoder.decode(&first).expect("decode");
++
++        decoder.skip_next_gap();
++        let skipped = decoder
++            .conceal_before(&audio_packet(
++                encoded_frame(&mut encoder, 960, 440.0),
++                1_920,
++            ))
++            .expect("skipped gap");
++        assert!(skipped.is_empty());
++        let next = audio_packet(encoded_frame(&mut encoder, 960, 440.0), 1_920);
++        decoder.decode(&next).expect("decode");
++
++        let concealed = decoder
++            .conceal_before(&audio_packet(
++                encoded_frame(&mut encoder, 960, 440.0),
++                3_840,
++            ))
++            .expect("network gap");
++        assert_eq!(concealed.len(), 1_920);
+     }
+ 
+     #[test]
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/session.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/session.rs
+@@ -141,6 +141,7 @@
+ pub enum PushOutcome {
+     Queued,
+     DroppedOldest,
++    DroppedNewest,
+     Paused,
+     AudioDisabled,
+ }
+@@ -210,6 +211,7 @@
+     decoded_frames: Arc<BoundedQueue<DecodedVideoFrame>>,
+     audio_packets: Option<Arc<BoundedQueue<AudioPacket>>>,
+     audio_unavailable: Arc<AtomicBool>,
++    audio_dropped_newest: Arc<AtomicBool>,
+     events: EventQueue,
+     video_generation: AtomicU64,
+     video_needs_keyframe: AtomicBool,
+@@ -280,6 +282,7 @@
+         }
+ 
+         let audio_unavailable = Arc::new(AtomicBool::new(false));
++        let audio_dropped_newest = Arc::new(AtomicBool::new(false));
+         let (audio_packets, audio_worker) = if let Some(audio_config) = config.audio.clone() {
+             let queue = Arc::new(BoundedQueue::new(audio_config.queue_depth));
+             let (audio_start_tx, audio_start_rx) = mpsc::sync_channel(1);
+@@ -287,10 +290,18 @@
+                 let queue = Arc::clone(&queue);
+                 let events = Arc::clone(&events);
+                 let unavailable = Arc::clone(&audio_unavailable);
++                let dropped = Arc::clone(&audio_dropped_newest);
+                 match thread::Builder::new()
+                     .name("opennow-linux-audio".to_owned())
+                     .spawn(move || {
+-                        run_audio_worker(audio_config, queue, events, unavailable, audio_start_tx)
++                        run_audio_worker(
++                            audio_config,
++                            queue,
++                            events,
++                            unavailable,
++                            dropped,
++                            audio_start_tx,
++                        )
+                     }) {
+                     Ok(worker) => worker,
+                     Err(error) => {
+@@ -331,6 +342,7 @@
+             decoded_frames,
+             audio_packets,
+             audio_unavailable,
++            audio_dropped_newest,
+             events,
+             video_generation: AtomicU64::new(0),
+             video_needs_keyframe: AtomicBool::new(false),
+@@ -389,7 +401,13 @@
+         let queue = self.audio_packets.as_ref().ok_or_else(|| {
+             Error::unavailable(Subsystem::Session, "audio is disabled for this session")
+         })?;
+-        submit_audio_packet(queue, &self.audio_unavailable, &self.events, packet)
++        submit_audio_packet(
++            queue,
++            &self.audio_unavailable,
++            &self.audio_dropped_newest,
++            &self.events,
++            packet,
++        )
+     }
+ 
+     pub fn reconfigure(&self, format: StreamFormat) -> Result<()> {
+@@ -947,19 +965,25 @@
+ fn submit_audio_packet(
+     queue: &BoundedQueue<AudioPacket>,
+     unavailable: &AtomicBool,
++    dropped: &AtomicBool,
+     events: &EventQueue,
+     packet: AudioPacket,
+ ) -> Result<PushOutcome> {
+     if unavailable.load(Ordering::Acquire) {
+         return Ok(PushOutcome::AudioDisabled);
+     }
+-    match queue.push_latest(packet) {
++    // Drop the packet that just arrived rather than the oldest one. The oldest
++    // packet is the one the worker is about to play, so evicting it opens an
++    // RTP hole on every pop once the queue is full, and the concealment that
++    // fills the hole costs as much wall time as the audio it replaces.
++    match queue.push(packet) {
+         QueuePush::Added => Ok(PushOutcome::Queued),
+-        QueuePush::DroppedOldest => {
++        QueuePush::Full => {
++            dropped.store(true, Ordering::Release);
+             emit(events, BackendEvent::QueueOverflow { media: "audio" });
+-            Ok(PushOutcome::DroppedOldest)
++            Ok(PushOutcome::DroppedNewest)
+         }
+-        QueuePush::Full => unreachable!(),
++        QueuePush::DroppedOldest => unreachable!(),
+         QueuePush::Closed => {
+             if unavailable.load(Ordering::Acquire) {
+                 Ok(PushOutcome::AudioDisabled)
+@@ -975,6 +999,7 @@
+     packets: Arc<BoundedQueue<AudioPacket>>,
+     events: EventQueue,
+     unavailable: Arc<AtomicBool>,
++    dropped: Arc<AtomicBool>,
+     startup: mpsc::SyncSender<Result<AudioBackend>>,
+ ) {
+     let mut opus = match OpusDecoder::open(&config) {
+@@ -1026,6 +1051,11 @@
+             QueuePop::TimedOut => continue,
+             QueuePop::Closed => break,
+         };
++        if dropped.swap(false, Ordering::AcqRel) {
++            // The queue threw away a newer packet, so the hole this packet
++            // will leave is this process's own doing, not network loss.
++            opus.skip_next_gap();
++        }
+         let cancelled = || packets.is_closed();
+         let concealed = match opus.conceal_before(&packet) {
+             Ok(pcm) => pcm,
+@@ -2248,6 +2278,7 @@
+             super::submit_audio_packet(
+                 &queue,
+                 &unavailable,
++                &AtomicBool::new(false),
+                 &events,
+                 audio_packet(&VALID_OPUS_PACKET, 0),
+             )
+@@ -2263,6 +2294,7 @@
+             super::submit_audio_packet(
+                 &queue,
+                 &unavailable,
++                &AtomicBool::new(false),
+                 &events,
+                 audio_packet(&VALID_OPUS_PACKET, 0),
+             )
+@@ -2276,6 +2308,7 @@
+             super::submit_audio_packet(
+                 &queue,
+                 &unavailable,
++                &AtomicBool::new(false),
+                 &events,
+                 audio_packet(&VALID_OPUS_PACKET, 0),
+             )
+@@ -2303,6 +2336,7 @@
+             outcomes.push(super::submit_audio_packet(
+                 &queue,
+                 &unavailable,
++                &AtomicBool::new(false),
+                 &events,
+                 audio_packet(&VALID_OPUS_PACKET, 0),
+             ));
+@@ -2313,6 +2347,7 @@
+             outcomes.push(super::submit_audio_packet(
+                 &queue,
+                 &unavailable,
++                &AtomicBool::new(false),
+                 &events,
+                 audio_packet(&VALID_OPUS_PACKET, 0),
+             ));
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/media.rs
+@@ -3268,6 +3268,9 @@
+                     shared.video_desynced.store(true, Ordering::Release);
+                 }
+             }
++            Ok(opennow_streamer_platform_linux::PushOutcome::DroppedNewest) => {
++                unreachable!("video submission never drops the newest packet")
++            }
+             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+             Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                 unreachable!("audio-disabled outcomes are not produced by video submission")
+@@ -3329,6 +3332,9 @@
+                 shared.video_desynced.store(true, Ordering::Release);
+                 request_linux_keyframe(&shared, "embedded Linux decoder queue overflow");
+             }
++            Ok(opennow_streamer_platform_linux::PushOutcome::DroppedNewest) => {
++                unreachable!("video submission never drops the newest packet")
++            }
+             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+             Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                 unreachable!("audio-disabled outcomes are not produced by video submission")
+@@ -3396,7 +3402,8 @@
+                     .map_err(|error| error.to_string())
+             });
+         match result {
+-            Ok(opennow_streamer_platform_linux::PushOutcome::DroppedOldest) => {
++            Ok(opennow_streamer_platform_linux::PushOutcome::DroppedOldest)
++            | Ok(opennow_streamer_platform_linux::PushOutcome::DroppedNewest) => {
+                 let _ = shared.feedback.send(MediaFeedback::QueueDropped {
+                     media: "linux-audio",
+                     count: 1,

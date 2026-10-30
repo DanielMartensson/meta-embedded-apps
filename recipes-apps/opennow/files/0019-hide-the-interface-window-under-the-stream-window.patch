@@ -1,0 +1,55 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 10:05:00 +0100
+Subject: [PATCH 19/20] hide the interface window under the stream window
+
+The stream window is a separate xdg_toplevel that covers the interface
+completely, so the interface draws into a buffer the compositor never
+takes: the measured run reports opennow-present render=22.5-26.6 with
+fps=0.0 swapped=0 for the whole session. That is a render thread, a
+scene graph and a present timer running at 25 Hz on two cores to show
+nothing, next to a decoder and a 48 kHz audio sink that have to share
+those cores.
+
+The interface window is hidden once WaylandVideoSurface has committed a
+frame, which is the first moment the stream really owns the screen, and
+the visibility it had is put back when the surface goes away. The stream
+window is not a child of the interface window, so hiding the interface
+does not touch it.
+
+Greppable markers: opennow-interface-hidden, opennow-interface-shown
+---
+
+--- a/opennow-qt/src/app/ApplicationStartup.cpp
++++ b/opennow-qt/src/app/ApplicationStartup.cpp
+@@ -576,6 +576,31 @@
+     if (acceptance.prepareWindow() != EXIT_SUCCESS) return EXIT_FAILURE;
+     if (rootWindow && arguments.contains(u"--fullscreen"_s)) rootWindow->showFullScreen();
+     else if (rootWindow && !rootWindow->isVisible()) rootWindow->show();
++#ifdef Q_OS_LINUX
++    // The stream window is a separate xdg_toplevel that covers the interface
++    // completely, and a covered QQuickWindow still runs its render thread: the
++    // measured run drew 22-26 interface frames a second while the compositor
++    // swapped none of them. Hide the interface as soon as the stream window has
++    // a frame on screen so the scene graph idles while the game is playing, and
++    // put it back when that window goes away.
++    if (rootWindow) {
++        auto *videoWindow = WaylandVideoSurface::instance();
++        QObject::connect(
++            videoWindow, &WaylandVideoSurface::mappedChanged, rootWindow,
++            [rootWindow, videoWindow, saved = QWindow::Windowed]() mutable {
++                if (videoWindow->isMapped()) {
++                    if (!rootWindow->isVisible()) return;
++                    saved = rootWindow->visibility();
++                    qInfo("opennow-interface-hidden: the stream window has a frame");
++                    rootWindow->hide();
++                    return;
++                }
++                if (rootWindow->isVisible()) return;
++                qInfo("opennow-interface-shown: the stream window is gone");
++                rootWindow->setVisibility(saved);
++            });
++    }
++#endif
+     const auto qmlReadyMs = startupTimer.elapsed();
+     controller.handleArguments(arguments);
+     QObject::connect(&controller, &AppController::activationRequested,
