@@ -1,0 +1,144 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 12:40:00 +0100
+Subject: [PATCH 21/21] measure the two halves of the frame handoff on the pull clock
+
+The measured r0.50 run reads native=60.0/s delivered=55.0/s while the surface
+presents 54.8/s (`wayland-video fps=54.2..54.8` with `dropped=0`), so the
+present path keeps up with the frames the server sends and what is left on the
+table is the few-millisecond stall the user hears as occasional laggy frames,
+not lost frames. Nothing in
+the log carries a per-frame timing, so it cannot say which half of the hand-
+off pays it: the call into the Rust streamer (acquire the newest decoded
+frame, export its DMA-BUF, duplicate the descriptor) or the surface's
+attach/damage/commit and the flush that carries them to the compositor.
+
+This counts what each pull got - presented, stale (the Rust side refused it
+with OPENNOW_STREAMER_STALE_FRAME: the picture already on the screen), no-
+frame, other - and sums and maxima of both halves over 5 s windows of the
+pull clock. pulls= is the pull clock's own rate: it is the stream window's
+8 ms timer, not the interface's render loop, so it also shows whether that
+clock still runs at its intended 125/s while 0019 leaves the interface idle.
+Marker: opennow-present cost. Built as r0.51, and measured there: over a 5 s
+window the Rust half sums to 16.8-21.4 ms across 566-589 pulls (29-38 us each) and
+the commit half to 55-82 ms across that window's ~289 commits (190-284 us each), so
+a frame spends a quarter of a millisecond of its 16.7 ms on the present path. The
+3.7/s lost between native=59.92/s and delivered=56.21/s is not spent there.
+
+Greppable markers: opennow-present cost
+---
+
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -301,13 +301,25 @@
+         // null handle before it looks at the frame, so hand it a marker that is
+         // never dereferenced.
+         command.command_buffer = reinterpret_cast<void *>(quintptr(1));
+         OpenNowStreamerFrameInfo info{};
+         OpenNowStreamerRecordedFrame recorded{};
+         OpenNowStreamerFrame *frame = nullptr;
++        unsigned long long commitUs = 0;
++        // The handoff has two halves on this thread: the call into the Rust
++        // streamer (acquire the newest decoded frame, export its DMA-BUF,
++        // duplicate the descriptor) and the surface's attach/damage/commit plus
++        // the flush that carries them. The measured r0.50 run presents 54.8/s
++        // against 60 notifications and 55 drains a second, so no frame is lost
++        // between those rates and the complaint is a few-millisecond stall; this
++        // says which half pays it.
++        const auto handoffBegin = std::chrono::steady_clock::now();
+         const auto status = m_runtime->recordLatestFrame(command, &info, &recorded, &frame);
++        const unsigned long long handoffUs = static_cast<unsigned long long>(
++            std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now() - handoffBegin).count());
+         const bool usable = status == OPENNOW_STREAMER_OK && frame && recorded.dmabuf_fd >= 0
+             && m_presentationGeneration == m_runtime->presentationGeneration()
+             && m_runtime->presentationAllowed();
+         if (usable) {
+             WaylandVideoSurface::Frame videoFrame;
+             videoFrame.fd = recorded.dmabuf_fd;
+@@ -319,15 +331,19 @@
+                 videoFrame.offsets[plane] = recorded.dmabuf_plane_offset[plane];
+                 videoFrame.strides[plane] = recorded.dmabuf_plane_stride[plane];
+             }
+             auto *surface = WaylandVideoSurface::instance();
+             // AutoConnection: a direct call from the pull clock, a queued one if
+             // this ever runs in a render pass again.
++            const auto commitBegin = std::chrono::steady_clock::now();
+             QMetaObject::invokeMethod(surface, [surface, videoFrame] {
+                 surface->present(videoFrame);
+             }, Qt::AutoConnection);
++            commitUs = static_cast<unsigned long long>(
++                std::chrono::duration_cast<std::chrono::microseconds>(
++                    std::chrono::steady_clock::now() - commitBegin).count());
+             m_waylandVideo = true;
+             m_outputKind = 0;
+             m_outputDirty = false;
+             m_droppedFrames = 0;
+         } else if (status == OPENNOW_STREAMER_OK && recorded.dmabuf_fd < 0) {
+             dropUnpresentableFrame("the decoder handed over no DMA-BUF frame");
+@@ -347,13 +363,66 @@
+         // receiver owns that descriptor. A frame that never reaches the surface
+         // must be closed here, otherwise a stream that keeps producing frames
+         // while presentation is refused runs the process out of descriptors.
+         if (!usable && recorded.dmabuf_fd >= 0) ::close(recorded.dmabuf_fd);
+         // Keep the interface asking for frames: it drives the pull while the
+         // stream window owns the picture.
++        reportHandoffCost(status, usable, handoffUs, commitUs);
+         m_needsFrame.store(true);
++    }
++
++    // Temporary instrumentation (OPENNOW_LOG_PRESENT): per 5 s of the pull clock
++    // what the pulls got and how long each half of the handoff took. The pull
++    // clock is the surface's own 8 ms timer, so pulls= also says whether that
++    // clock still runs at its intended 125/s now that 0019 leaves the interface
++    // render loop idle; stale= counts the pulls the Rust side refused with
++    // OPENNOW_STREAMER_STALE_FRAME, i.e. the picture already on the screen.
++    void reportHandoffCost(OpenNowStreamerStatus status, bool usable,
++                           unsigned long long handoffUs, unsigned long long commitUs)
++    {
++        if (!qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT")) return;
++        static thread_local unsigned long long pulls = 0, presented = 0, stale = 0,
++            noFrame = 0, other = 0, handoffSum = 0, commitSum = 0,
++            maxHandoff = 0, maxCommit = 0, maxGap = 0, windowBegin = 0, lastPull = 0;
++        const unsigned long long now = static_cast<unsigned long long>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count());
++        ++pulls;
++        handoffSum += handoffUs;
++        commitSum += commitUs;
++        if (handoffUs > maxHandoff) maxHandoff = handoffUs;
++        if (commitUs > maxCommit) maxCommit = commitUs;
++        if (lastPull && now > lastPull) {
++            const unsigned long long gap = (now - lastPull) / 1000ull;
++            if (gap > maxGap) maxGap = gap;
++        }
++        lastPull = now;
++        if (usable) ++presented;
++        else if (status == OPENNOW_STREAMER_STALE_FRAME) ++stale;
++        else if (status == OPENNOW_STREAMER_NO_FRAME) ++noFrame;
++        else ++other;
++        if (windowBegin == 0) {
++            windowBegin = now;
++            return;
++        }
++        if (now - windowBegin < 5'000'000'000ull) return;
++        qInfo("opennow-present cost: pulls=%llu presented=%llu stale=%llu noframe=%llu other=%llu"
++              " handoff-us=%llu max-handoff-us=%llu commit-us=%llu max-commit-us=%llu max-gap-ms=%llu",
++              pulls, presented, stale, noFrame, other, handoffSum, maxHandoff, commitSum, maxCommit,
++              maxGap / 1000ull);
++        windowBegin = now;
++        pulls = 0;
++        presented = 0;
++        stale = 0;
++        noFrame = 0;
++        other = 0;
++        handoffSum = 0;
++        commitSum = 0;
++        maxHandoff = 0;
++        maxCommit = 0;
++        maxGap = 0;
+     }
+ #endif
+ 
+     // A single frame that cannot reach the compositor is a dropped frame, not a
+     // broken stream. The decoder produces a few frames that expose no
+     // exportable buffer (the first ones after a stream starts, a repeated

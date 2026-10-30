@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 20, `recipes-apps/opennow/files/0001`…`0020` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.50` |
+| Patches applied | 21, `recipes-apps/opennow/files/0001`…`0021` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.51` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -219,7 +219,7 @@ is `1.0.4+git…` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0020` in `recipes-apps/opennow/files/` are the only changes to the
+`0001`-`0021` in `recipes-apps/opennow/files/` are the only changes to the
 upstream tree at `b3fe7102`. They are one curated series: each step is the
 smallest change that made a measured symptom go away, and the later steps
 stand on the earlier ones.
@@ -246,6 +246,7 @@ stand on the earlier ones.
 | `0018` | **Stop concealing the hole a queue drop opens.** The play queue holds 12 packets of 5 ms and `push_latest` evicts the oldest when a stall fills it - the packet the worker is about to play. Every pop after the queue fills therefore leaves an RTP hole, `conceal_before` filled it with up to 100 ms of packet loss concealment, and writing concealment takes exactly as long as the audio it stands in for. The r0.47 session is that fixed point: 186 of the 200 packets a second were dropped and the worker consumed 14, and 14 x 71 ms of concealment is one second of audio a second, so the sink never idles, the queue never drains, and ~95 per cent of what the board played was concealment noise. A full queue now drops the arriving packet (`PushOutcome::DroppedNewest`), so the packets the worker pops stay contiguous and the queue drains; the worker marks the decoder when the queue reports a drop and the next hole is played through instead of concealed, and any hole longer than four packets is played through as well. Holes of up to four packets are still concealed, which is what network loss needs. Built as r0.50 and heard correct: the stream held 193.5 audio packets a second against ~2.5 dropped, the jitter buffer stopped growing, and 60 holes totalling 2.94 s were played through. Marker: `opennow-audio-gap-skip`. |
 | `0019` | **Hide the interface window under the stream window.** The stream window is a separate xdg_toplevel that covers the interface completely, yet a covered `QQuickWindow` keeps its render thread: the r0.47 session logs `opennow-present render=22.5-26.6 fps=0.0 swapped=0` for the whole run, i.e. a scene graph and a 25 Hz present timer drawing a buffer the compositor never takes, on the same two cores as the decoder and the audio sink. The interface is hidden when `WaylandVideoSurface` commits its first frame and the visibility it had is put back when the surface goes away; the stream window is not its child, so it is untouched. Measured on r0.50: `opennow-interface-hidden` fires with the first presented frame and the interface's render thread then consumes 0 CPU ticks over a 122 s window against 22.5-26.6 frames a second before, while the stream window keeps presenting at 54 fps. Markers: `opennow-interface-hidden`, `opennow-interface-shown`. |
 | `0020` | **Write the diagnostic export when the interface exits.** The redacted `.txt` that carries the Qt log, the RPC log and the embedded streamer's native log could only be produced by pressing Export while the application was still up, and the run worth attaching to a report is the one that just ended. The core now writes that same export when its stdin closes (the interface exiting), prints `opennow-diagnostics-export: <path>` on stderr, and keeps the five newest files so the diagnostics directory does not grow without bound. Measured on r0.50: closing the session wrote a 245 KiB export 2 s after the interface closed. |
+| `0021` | **Measure the two halves of the frame handoff.** Nothing in the series says where the frames a run loses between the streamer's notification and the surface's delivery go, so `presentWaylandFrame` and `pullWaylandFrame` count both halves per 5 s and print one line: `pulls= presented= stale= noframe= handoff-us= max-handoff-us= commit-us= max-commit-us= max-gap-ms=`. `handoff-us` is the Rust call that hands a DMA-BUF frame over, `commit-us` is attach/damage/commit plus the flush the compositor answers. The counters sit next to `0012`'s pinned handoff frame and print only under `OPENNOW_LOG_PRESENT`, so the patch adds counters and no work on a path that is not already logging. Marker: `opennow-present cost`. Measured on the r0.51 session that held ten 20 s windows (`c53.log`): `pulls=566-589` a second against `presented=273-287` and `noframe=290-304` with `stale=0`, `handoff-us=16.8-21.4k us` summed over the pulls of a 5 s window (29-38 us per pull, max 0.18-3.8 ms on one) and `commit-us=55k-82k us` summed over its ~289 commits (190-284 us per commit, max 0.5-6.2 ms). The two halves together are ~0.22-0.32 ms of the 16.7 ms a 60 Hz frame has, so the present path is not where the dip is. What the run lost is 3.7 frames a second between the notification (`native avg 59.92`) and the drain (`delivered avg 56.21`), against 11 564 commits at ~57.8/s and ingress of 1197-1201 video packets per 20 s (~60/s), and the longest gap between pulls was 77-130 ms. |
 
 #### The stream window
 
@@ -628,6 +629,43 @@ Recorded here so the next reader does not mistake them for fixed:
    while the stream window kept presenting at 54 fps. What has not been seen yet is
    `opennow-interface-shown`, the restore when the stream window closes: the session
    was ended by killing the interface, so no close event went through the surface.
+
+5. **The stream is not as fast as the video decoder.** Measured on r0.51 with `0021`'s
+   counters, the present path is cheap: over a 5 s window the Rust handoff sums to 16.8-21.4 ms
+   across 566-589 pulls (29-38 us each, max 0.18-3.8 ms on one) and the compositor commit sums
+   to 55-82 ms across the ~289 commits of the same window (190-284 us each, max 0.5-6.2 ms). The
+   two halves together use a quarter of a millisecond of the 16.7 ms a 60 Hz frame has, so
+   neither of them can pay the 77-130 ms `max-gap-ms` a window showed.
+   What the run lost is between the notification and the drain: `native avg 59.92/s` against
+   `delivered avg 56.21/s` while the surface committed at ~57.8/s and ingress held ~60 video
+   packets a second, with `stale=0` throughout. Still open, and the remaining suspect is the
+   input path: the observation is that a session the keyboard and mouse cannot drive looks
+   perfectly smooth and one they can drive dips, so the same window was measured with a sustained
+   ydotool sweep (one invocation per 20 s window, since a process per event would itself steal the
+   two cores) beside the `wayland-video input:` markers and the `NVST cursor` control-channel
+   traffic they generate. That run has not produced a number yet: at 17:37, 17:47 and 17:55 the
+   app reached `opennow-autolaunch: waiting 1000ms of 90000ms` and then logged nothing for 7 1/2
+   min per attempt, because the grid's discovery endpoint was unreachable
+   (`provider: DIG discovery endpoint is unreachable; using fallback
+   https://latam-west.dig.geforcenow.nvidiagrid.net/`) and `wget` to that fallback returns a bad
+   response while `https://example.com` answers 200, so the board's network is fine and the
+   endpoint is not.
+6. **The picture reads dark next to the TV's own copy of the game.** Measured, and it is not the
+   board darkening it: with `OPENNOW_FRAME_DUMP` the decoded 1920x1080 frame's PPM spans bytes
+   0..255 with luma percentiles `min=0 p1=0 p10=1 p50=27 p90=89 p99=126 max=235 mean=37.2`, 53.2
+   per cent of samples below luma 32 and 0.0 per cent above 223, so the frame is already dark
+   before Qt, weston or the TV touch it. weston 13.0.1 (`backend=drm`) applies plain Rec.709
+   offset-range coefficients - its `gl-renderer.so` carries the 1.164 (= 255/219) and 1.596
+   constants and has zero hits for `pow`, `mix` or `2.2` - so there is no tone map on the board to
+   tune, and the surface sends NV12 through legacy `zwp_linux_buffer_params_v1_add` with no
+   pixfmt/modifier/transfer arguments, which is all that call carries: libweston-13 has no
+   `wl_surface_set_colorspace` and no `trc` to set one. HDR cannot be raised either: negotiation
+   reports `nvst-color color=8bit_420 hdr=false`, `settings.json` reads `"colorQuality":"8bit_420",
+   "enableHdr": false`, and the HDR path is gated on `HdrOutput.supported` plus a ten-bit
+   membership tier the compositor cannot offer. What is left is the TV receiving an SDR signal and
+   applying its own HDR/auto picture processing to it; the only lever left on this side is the
+   device-side post-process `videoShader` block, which is `enabled: false` with `brightness: 100`
+   and `contrast: 100`.
 
 Caveats on the numbers above: single runs per phase, not an average of many
 sessions; `presents/s` is only available for sessions launched with
