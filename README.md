@@ -243,9 +243,9 @@ stand on the earlier ones.
 | `0015` | **Press the Start button on a clock of its own.** A session can only be started by tapping the Start button, and the pointer that carries that tap is the thing the stream window fights over, so an armed run that is left alone starts nothing and nothing about the audio or the present rate can be measured hands-free. The clock waits `--auto-launch-ms=<ms>` of home screen and then calls root.startHero(), the very function the button's TapHandler calls, so the launch path, its guards and their order are upstream's unchanged. `0` is the default and is upstream's behaviour; the 60 s that was measured here as the shortest settle for a catalog-loaded, signed-in seat is what the clock was set to in the run that worked. Measured: 60 `opennow-autolaunch` lines ending in `opennow-autolaunch: "pressing Start on Dark and Darker"`, then a fresh session in `native-streamer.log`. |
 | `0016` | **Open the audio sink on a device and a format the card has.** The measured r0.46 session threw 190 of the 197 arriving audio packets out of the low-latency play queue every second, which says the sink behind that queue took almost none of them; probing `libasound.so.2` on the board said why: `snd_pcm_open("default")` answers `-112` ("Host is down") for the NONBLOCK mode the sink asked for, `hw:0,0` refuses `FLOAT_LE` with `-22`, and a NONBLOCK stream that was never started answers `-EIO` after 0.1 s of audio. So the sink now tries the configured name, then `sysdefault`, `default` and the raw card, in **BLOCK** mode, and asks each one for the first sample format it accepts (`FLOAT_LE`, `S32_LE`, `S16_LE`), converting the f32 stream into whatever the card answers (float to integer casts saturate, which is what a stream louder than 1.0 needs rather than a wrapped sample). Measured in r0.47: the session prints `opennow-alsa-sink: opened default as FLOAT_LE` and the same session logs **no** `queue-dropped` event at all, against ~190/s before. |
 | `0017` | **Answer the Escape key in the stream window.** `WaylandVideoSurface::virtualKeyFor` translates the key codes the compositor reports into the virtual keys the host speaks, and it had no entry for evdev code 1, so Escape translated to 0 and `submitKey` returns at once when the virtual key is 0 - the press never went out, which is the open item the game's menus show. Escape is `VK_ESCAPE = 0x1b`, one line in the table the rest of the physical keys are already in. Not yet verified on a screen: the run that would show it needs a fresh boot. |
-| `0018` | **Stop concealing the hole a queue drop opens.** The play queue holds 12 packets of 5 ms and `push_latest` evicts the oldest when a stall fills it - the packet the worker is about to play. Every pop after the queue fills therefore leaves an RTP hole, `conceal_before` filled it with up to 100 ms of packet loss concealment, and writing concealment takes exactly as long as the audio it stands in for. The r0.47 session is that fixed point: 186 of the 200 packets a second were dropped and the worker consumed 14, and 14 x 71 ms of concealment is one second of audio a second, so the sink never idles, the queue never drains, and ~95 per cent of what the board played was concealment noise. A full queue now drops the arriving packet (`PushOutcome::DroppedNewest`), so the packets the worker pops stay contiguous and the queue drains; the worker marks the decoder when the queue reports a drop and the next hole is played through instead of concealed, and any hole longer than four packets is played through as well. Holes of up to four packets are still concealed, which is what network loss needs. Built as r0.50; the audible check is still owed (see the open items). Marker: `opennow-audio-gap-skip`. |
-| `0019` | **Hide the interface window under the stream window.** The stream window is a separate xdg_toplevel that covers the interface completely, yet a covered `QQuickWindow` keeps its render thread: the r0.47 session logs `opennow-present render=22.5-26.6 fps=0.0 swapped=0` for the whole run, i.e. a scene graph and a 25 Hz present timer drawing a buffer the compositor never takes, on the same two cores as the decoder and the audio sink. The interface is hidden when `WaylandVideoSurface` commits its first frame and the visibility it had is put back when the surface goes away; the stream window is not its child, so it is untouched. Markers: `opennow-interface-hidden`, `opennow-interface-shown`. |
-| `0020` | **Write the diagnostic export when the interface exits.** The redacted `.txt` that carries the Qt log, the RPC log and the embedded streamer's native log could only be produced by pressing Export while the application was still up, and the run worth attaching to a report is the one that just ended. The core now writes that same export when its stdin closes (the interface exiting), prints `opennow-diagnostics-export: <path>` on stderr, and keeps the five newest files so the diagnostics directory does not grow without bound. |
+| `0018` | **Stop concealing the hole a queue drop opens.** The play queue holds 12 packets of 5 ms and `push_latest` evicts the oldest when a stall fills it - the packet the worker is about to play. Every pop after the queue fills therefore leaves an RTP hole, `conceal_before` filled it with up to 100 ms of packet loss concealment, and writing concealment takes exactly as long as the audio it stands in for. The r0.47 session is that fixed point: 186 of the 200 packets a second were dropped and the worker consumed 14, and 14 x 71 ms of concealment is one second of audio a second, so the sink never idles, the queue never drains, and ~95 per cent of what the board played was concealment noise. A full queue now drops the arriving packet (`PushOutcome::DroppedNewest`), so the packets the worker pops stay contiguous and the queue drains; the worker marks the decoder when the queue reports a drop and the next hole is played through instead of concealed, and any hole longer than four packets is played through as well. Holes of up to four packets are still concealed, which is what network loss needs. Built as r0.50 and heard correct: the stream held 193.5 audio packets a second against ~2.5 dropped, the jitter buffer stopped growing, and 60 holes totalling 2.94 s were played through. Marker: `opennow-audio-gap-skip`. |
+| `0019` | **Hide the interface window under the stream window.** The stream window is a separate xdg_toplevel that covers the interface completely, yet a covered `QQuickWindow` keeps its render thread: the r0.47 session logs `opennow-present render=22.5-26.6 fps=0.0 swapped=0` for the whole run, i.e. a scene graph and a 25 Hz present timer drawing a buffer the compositor never takes, on the same two cores as the decoder and the audio sink. The interface is hidden when `WaylandVideoSurface` commits its first frame and the visibility it had is put back when the surface goes away; the stream window is not its child, so it is untouched. Measured on r0.50: `opennow-interface-hidden` fires with the first presented frame and the interface's render thread then consumes 0 CPU ticks over a 122 s window against 22.5-26.6 frames a second before, while the stream window keeps presenting at 54 fps. Markers: `opennow-interface-hidden`, `opennow-interface-shown`. |
+| `0020` | **Write the diagnostic export when the interface exits.** The redacted `.txt` that carries the Qt log, the RPC log and the embedded streamer's native log could only be produced by pressing Export while the application was still up, and the run worth attaching to a report is the one that just ended. The core now writes that same export when its stdin closes (the interface exiting), prints `opennow-diagnostics-export: <path>` on stderr, and keeps the five newest files so the diagnostics directory does not grow without bound. Measured on r0.50: closing the session wrote a 245 KiB export 2 s after the interface closed. |
 
 #### The stream window
 
@@ -606,19 +606,28 @@ Recorded here so the next reader does not mistake them for fixed:
    concealment. Patch `0018` fixes both halves: a full queue now drops the arriving
    packet instead of the oldest, so what the worker pops stays contiguous and the
    queue drains, and the worker marks the decoder when the queue reports a drop so
-   the hole that drop opens is played through instead of concealed. It is built as
-   r0.50, but the session after the r0.47 measurement hit the post-crash V4L2 state
-   below and could not decode, so the audible result and the drop count still have
-   to be measured on the next boot.
-4. **The interface hide still needs a stream; the exit export is verified.**
-   Patch `0020` was checked on the board without one: closing the interface leaves
-   `opennow-diagnostics-<ms>.txt` in the diagnostics directory, and
-   `/usr/bin/opennow-core` with a closed stdin prints
+   the hole that drop opens is played through instead of concealed. Measured on r0.50,
+   in a session three hours later in the same boot that *did* decode: `media-ingress`
+   ends at `elapsed_ms=130187 video=7372 audio=25187`, so 193.5 audio packets a second
+   arrived and the log holds 651 stale packets reported over 35 drop events - each
+   audio drop is reported twice (`media=audio` and `media=linux-audio` at the same
+   instant), so ~2.5 a second were lost against 186 a second on r0.47. The transport
+   jitter buffer now reads `target_ms=85 queued=0` with `underflows=2` against
+   `target_ms` climbing 45→125 and `queued=26` before, and the log holds 60
+   `opennow-audio-gap-skip` lines totalling 2.94 s of holes played through, the
+   largest 445 ms. The stream itself presented at 54 fps with `dropped=0`, and the
+   game's audio was heard to be correct.
+4. **The interface hide and the exit export are verified in a real session.**
+   Patch `0020` wrote `opennow-diagnostics-<ms>.txt` (245 KiB) 2 s after the interface
+   of the r0.50 session closed, and `/usr/bin/opennow-core` with a closed stdin prints
    `opennow-diagnostics-export: <path>` after 439 ms, inside the 1.5 s the Qt side
-   waits before it escalates. Patch `0019` needs a real session:
-   `opennow-interface-hidden` should appear when the stream window gets its first
-   frame, `opennow-present` should stop, and the interface should come back when
-   the stream ends.
+   waits before it escalates; the five newest exports are kept. Patch `0019` logged
+   `opennow-interface-hidden: the stream window has a frame` with the first presented
+   frame, `opennow-present fps=0.0 render=0.0 swapped=0` for the whole session, and
+   the interface's render thread advanced 0 CPU ticks over the 122 s sampled window
+   while the stream window kept presenting at 54 fps. What has not been seen yet is
+   `opennow-interface-shown`, the restore when the stream window closes: the session
+   was ended by killing the interface, so no close event went through the surface.
 
 Caveats on the numbers above: single runs per phase, not an average of many
 sessions; `presents/s` is only available for sessions launched with
@@ -626,8 +635,8 @@ sessions; `presents/s` is only available for sessions launched with
 only ~432 MB free on the rootfs, so headroom, not spill, is the limit.
 
 One more caveat, and it is the reason the r0.47 numbers are not a full table yet,
-and the reason r0.48-r0.50 have not been heard: a session that has been started and
-crashed several times in one boot leaves the
+and the reason the r0.48 session was never heard: a session that has been started and
+crashed several times in one boot can leave the
 V4L2 capture pool and the DMA-BUF allocator holding what the crashed sessions took,
 and the next session then fails at *decode* rather than at present:
 
@@ -638,9 +647,10 @@ and the next session then fails at *decode* rather than at present:
 ```
 
 which is what `opennow-linux-video` panics over (`unexpected error during closedir:
-Bad file descriptor`) and why no frame reaches the surface. The first session of a
-boot decodes; the ones after it do not. The fix is a fresh boot rather than a patch,
-and it is why a full r0.47 measurement - present rate, `queue-dropped`, the memory
-tally and the thread CPU - had to wait for one, and why the r0.50 audio fix and the
-`0019`/`0020` interface and export patches are deployed but not yet measured (the
-export was verified on its own, see the open items).
+Bad file descriptor`) and why no frame reaches the surface. That state is not
+permanent: the r0.48 session at 08:07 failed to decode, while the r0.50 session at
+11:04, three hours later in the same boot, decoded and presented at 54 fps with 0
+decode failures and 0 dropped frames. What a reboot is still needed for is the
+ethernet PHY the board leaves un-armed, not this decoder state, and it is why a
+full r0.47 measurement - present rate, `queue-dropped`, the memory tally and the
+thread CPU - had to wait for one session.
