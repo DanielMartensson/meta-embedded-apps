@@ -1,0 +1,134 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 11:20:00 +0100
+Subject: [PATCH 15/15] press the Start button on a clock of its own
+
+A session can only be started by tapping the Start button, and the pointer
+that has to carry that tap is the thing the stream window fights over: the
+window owns the pointer while a stream runs, and the seat's own pointer only
+appears with the first mouse event (patch 0009), so arming a run and leaving
+it alone starts nothing. This patch puts a clock on the same button so a
+session can be started without a pointer at all, which is what makes the
+audio and the present rate measurable by themselves: the clock waits 60 s of
+home screen and then calls root.startHero(), the very function the button's
+TapHandler calls, so the launch path, its guards and its guards' order are
+upstream's unchanged.
+
+The wait is the app's start-up cost: the catalog must be loaded (ShellStore
+ready) and the seat signed in before a launch does anything, and the same
+60 s was the shortest settle measured here. --auto-launch-ms=<ms> sets the
+wait and --auto-launch-ms=0 means nothing is armed, which is the default:
+autoLaunchMs is 0, the Timer's running binding is false and the run is
+upstream's, so no behaviour of r0.44 changes until the flag is passed.
+
+AppController::reportAutoLaunch is the clock's only trace. QML logs nothing
+in this application, and a clock that has not fired has no other symptom, so
+an armed run that never launched would otherwise look identical to a run that
+was never armed; the line says which, and the launch itself shows up as a
+fresh session in native-streamer.log.
+
+Greppable markers: opennow-autolaunch
+---
+
+--- a/opennow-qt/src/app/AppController.h
++++ b/opennow-qt/src/app/AppController.h
+@@ -71,6 +71,7 @@
+                                                         const QList<QRect> &screens);
+     Q_INVOKABLE void quitApplication();
+     Q_INVOKABLE void restartApplication();
++    Q_INVOKABLE void reportAutoLaunch(const QString &phase) const;
+     Q_INVOKABLE bool handleArguments(const QStringList &arguments);
+ 
+     void setOverlayTransitionGuard(std::function<bool(bool)> guard);
+--- a/opennow-qt/src/app/AppController.cpp
++++ b/opennow-qt/src/app/AppController.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <QCoreApplication>
++#include <QLoggingCategory>
+ #include <QClipboard>
+ #include <QDesktopServices>
+ #include <QDateTime>
+@@ -571,6 +572,18 @@
+     return true;
+ }
+ 
++void AppController::reportAutoLaunch(const QString &phase) const
++{
++    // The auto-launch clock itself lives in the home screen's QML, and this
++    // is the line that makes every one of its decisions greppable in the
++    // run's log: QML logs nothing in this application, and a clock that has
++    // not fired yet has no other trace, so an armed run that never launched
++    // would otherwise look identical to a run that was never armed. The
++    // observable end of a fired clock is a new session in native-streamer.log,
++    // and this says which of the two states the run was in.
++    qWarning() << "opennow-autolaunch:" << phase;
++}
++
+ void AppController::setReducedMotion(bool reducedMotion)
+ {
+     if (m_reducedMotion == reducedMotion) {
+--- a/opennow-qt/qml/desktop/home/DesktopHomeScreen.qml
++++ b/opennow-qt/qml/desktop/home/DesktopHomeScreen.qml
+@@ -24,6 +24,61 @@
+         onTriggered: root.lastPlayedNowMs = Date.now()
+     }
+ 
++    // TEMPORARY, this era only: a clock for the Start button, so a session
++    // can be started without a pointer. The home screen's own button is
++    // Rectangle { id: startButton; ... TapHandler { id: startTap; onTapped:
++    // root.startHero() } }, and this Timer calls exactly what that tap calls:
++    // no launch path is added, and startHero keeps its own guards (it sets
++    // ShellStore.selectedGame to root.heroGame, the game the seat put first at
++    // start-up, and ShellStore.launchSelectedGame returns unless the run is
++    // signed in, the catalog is ready and no stream is already up). Started
++    // with --auto-launch-ms=<ms> the Timer presses that button <ms> ms after
++    // the home screen became active; with no flag autoLaunchMs is 0, the
++    // Timer never runs and the run is upstream's.
++    readonly property int autoLaunchMs: {
++        const arguments = Qt.application.arguments
++        for (let i = 0; i < arguments.length; ++i) {
++            if (arguments[i].indexOf("--auto-launch-ms") === 0) {
++                const parts = arguments[i].split("=")
++                if (parts.length === 2)
++                    return Math.max(1000, parseInt(parts[1], 10))
++            }
++        }
++        return 0
++    }
++    property int autoLaunchSeconds: 0
++    property bool autoLaunchFired: false
++
++    Timer {
++        id: autoLaunchClock
++        interval: 1000
++        repeat: true
++        running: root.autoLaunchMs > 0 && !root.autoLaunchFired
++            && root.visible && root.active && AppController.route === "home"
++            && Qt.application.state === Qt.ApplicationActive
++        triggeredOnStart: true
++        onTriggered: {
++            if (root.autoLaunchMs <= 0 || root.autoLaunchFired)
++                return
++            root.autoLaunchSeconds += 1
++            const waited = root.autoLaunchSeconds * 1000
++            if (waited < root.autoLaunchMs) {
++                AppController.reportAutoLaunch("waiting " + waited + "ms of "
++                    + root.autoLaunchMs + "ms, hero="
++                    + (root.heroGame ? String(root.heroGame.id) : "none"))
++                return
++            }
++            root.autoLaunchFired = true
++            if (!root.heroGame) {
++                AppController.reportAutoLaunch("no hero game to start")
++                return
++            }
++            AppController.reportAutoLaunch("pressing Start on "
++                + String(root.heroGame.title))
++            root.startHero()
++        }
++    }
++
+     signal routeRequested(string route)
+     signal gameRequested(var game)
+     signal playRequested(var game)

@@ -1,0 +1,340 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 03:15:00 +0100
+Subject: [PATCH 16/17] open the audio sink on a device and a format the card has
+
+The arriving audio is 197 packets a second and the measured run dropped 190
+of them out of the play queue every second, which says the sink at the end
+of that queue took almost none of it. Two things are at fault and both say
+so:
+
+  snd_pcm_open("default")              = -112 ("Host is down")
+  snd_pcm_set_params("hw:0,0", float)  = -22
+
+"default" is the UCM alias, and the alias wants a sound card with a saved
+asound state; the card here is an STM32MP25-DK I2S HiFi that answers to
+"sysdefault" and to "hw:0,0". The first carries FLOAT_LE and S32_LE, the
+second refuses float and S32_LE with -22 and carries S16_LE. So the sink
+now takes the configured name first and then the names the card does
+answer, and it asks every one of them for the first sample format it
+accepts. The samples are f32 and a card usually is not, so what is not
+already in the card's format is converted on the way out; float to
+integer casts saturate, which is what a stream louder than 1.0 needs
+rather than a wrapped sample.
+
+The mode is BLOCK rather than NONBLOCK. A NONBLOCK stream that was never
+started answers -EIO, and the measured NONBLOCK stream wrote 0.1 s of
+audio and then ended in -EIO, which is the queue drop the diagnostics
+show. BLOCK drains 100.5 per cent of real time on both of the names this
+board does answer, which is what the arriving audio needs to lose nothing.
+
+Greppable markers: opennow-alsa-sink
+---
+
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/audio.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/audio.rs
+@@ -21,6 +21,9 @@
+ const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
+ const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
+ const SND_PCM_NONBLOCK: c_int = 1;
++const SND_PCM_FORMAT_S16_LE: c_int = 2;
++const SND_PCM_FORMAT_S32_LE: c_int = 10;
++const SND_PCM_BLOCK: c_int = 0;
+ const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+ const PIPEWIRE_RESTART_INTERVAL: Duration = Duration::from_secs(5);
+ const PIPEWIRE_LEAD_MS: usize = 40;
+@@ -471,6 +474,9 @@
+ struct AlsaSink {
+     muted: Arc<std::sync::atomic::AtomicBool>,
+     silence: Vec<f32>,
++    // The card's own format is not f32 on the boards this runs on, so the
++    // samples are converted into it here rather than refused at open().
++    encoded: Vec<u8>,
+     _library: Library,
+     handle: NonNull<c_void>,
+     writei: SndPcmWriteI,
+@@ -479,13 +485,28 @@
+     close: SndPcmClose,
+     strerror: SndStrError,
+     channels: usize,
++    format: c_int,
++    sample_bytes: usize,
+ }
+ 
+ unsafe impl Send for AlsaSink {}
+ 
+ impl AlsaSink {
++    // Two things decide whether any of the arriving audio reaches the card,
++    // and both were wrong here. The name: snd_pcm_open("default") answers
++    // -112 ("Host is down") because the UCM behind that name wants a sound
++    // card with a saved state, while the card this is does answer to
++    // "sysdefault" and to "hw:0,0". The format: that first name carries
++    // FLOAT_LE and S32_LE, and the raw card refuses both with -22 and
++    // carries S16_LE. So the sink takes the configured name first and then
++    // the names the card does answer, and it asks every one of them for the
++    // first sample format it accepts, which is what decides whether the f32
++    // stream has to be converted on the way out.
++    // The mode is BLOCK rather than NONBLOCK because a NONBLOCK stream that
++    // was never started answers -EIO, which is what the measured run did:
++    // its play queue dropped 190 of the 197 arriving packets every second.
+     fn open(config: &AudioConfig) -> Result<Self> {
+-        let device = if let Some(name) = config.output_device.strip_prefix("alsa:") {
++        let configured = if let Some(name) = config.output_device.strip_prefix("alsa:") {
+             crate::audio_devices::require_device(
+                 &config.output_device,
+                 &crate::audio_devices::alsa_devices()?,
+@@ -494,6 +515,23 @@
+         } else {
+             &config.alsa_device
+         };
++        let candidates: Vec<String> = {
++            let wanted = [
++                configured.to_owned(),
++                "sysdefault".to_owned(),
++                "default".to_owned(),
++                "hw:0,0".to_owned(),
++                "hw:0".to_owned(),
++            ].to_vec();
++            let mut unique: Vec<String> = Vec::new();
++            for candidate in wanted {
++                if candidate.is_empty() || candidate == "null" || unique.contains(&candidate) {
++                    continue;
++                }
++                unique.push(candidate);
++            }
++            unique
++        };
+         unsafe {
+             let library = Library::new("libasound.so.2")
+                 .or_else(|_| Library::new("libasound.so"))
+@@ -505,51 +543,88 @@
+             let drop_pcm: SndPcmDrop = *load_symbol(&library, b"snd_pcm_drop\0")?;
+             let close: SndPcmClose = *load_symbol(&library, b"snd_pcm_close\0")?;
+             let strerror: SndStrError = *load_symbol(&library, b"snd_strerror\0")?;
+-            let name = CString::new(device).map_err(|_| {
+-                Error::InvalidFormat("ALSA device contains an embedded NUL".to_owned())
+-            })?;
+-            let mut raw = std::ptr::null_mut();
+-            let status = open(
+-                &mut raw,
+-                name.as_ptr(),
+-                SND_PCM_STREAM_PLAYBACK,
+-                SND_PCM_NONBLOCK,
+-            );
+-            if status < 0 {
+-                return Err(Error::unavailable(
+-                    Subsystem::Alsa,
+-                    alsa_error(strerror, status),
+-                ));
++            let formats: [(c_int, usize); 3] = [
++                (SND_PCM_FORMAT_FLOAT_LE, 4),
++                (SND_PCM_FORMAT_S32_LE, 4),
++                (SND_PCM_FORMAT_S16_LE, 2),
++            ];
++            let mut refusals: Vec<String> = Vec::new();
++            let mut opened: Option<(NonNull<c_void>, c_int, usize, String)> = None;
++            for candidate in candidates {
++                let named = CString::new(candidate.as_str()).map_err(|_| {
++                    Error::InvalidFormat("ALSA device name contains an embedded NUL".to_owned())
++                })?;
++                let mut raw = std::ptr::null_mut();
++                let status = open(
++                    &mut raw,
++                    named.as_ptr(),
++                    SND_PCM_STREAM_PLAYBACK,
++                    SND_PCM_BLOCK,
++                );
++                if status < 0 {
++                    refusals.push(
++                        format!(
++                            "{} could not open: {}",
++                            candidate,
++                            alsa_error(strerror, status),
++                        )
++                    );
++                    continue;
++                }
++                let handle = NonNull::new(raw).ok_or_else(|| {
++                    Error::backend(Subsystem::Alsa, "ALSA returned a null PCM handle")
++                })?;
++                let mut accepted: Option<(c_int, usize)> = None;
++                for (format, sample_bytes) in formats {
++                    let status = set_params(
++                        handle.as_ptr(),
++                        format,
++                        SND_PCM_ACCESS_RW_INTERLEAVED,
++                        config.channels as c_uint,
++                        config.sample_rate,
++                        1,
++                        50_000,
++                    );
++                    if status >= 0 {
++                        accepted = Some((format, sample_bytes));
++                        break;
++                    }
++                    refusals.push(
++                        format!(
++                            "{} as {} refused: {}",
++                            candidate,
++                            alsa_format_name(format),
++                            alsa_error(strerror, status),
++                        )
++                    );
++                }
++                if let Some((accepted_format, accepted_bytes)) = accepted {
++                    opened = Some((handle, accepted_format, accepted_bytes, candidate));
++                    break;
++                }
++                (close)(handle.as_ptr());
+             }
+-            let handle = NonNull::new(raw).ok_or_else(|| {
+-                Error::backend(Subsystem::Alsa, "ALSA returned a null PCM handle")
++            let (handle, format, sample_bytes, device) = opened.ok_or_else(|| {
++                Error::unavailable(Subsystem::Alsa, refusals.join("; ").to_owned())
+             })?;
+-            let status = set_params(
+-                handle.as_ptr(),
+-                SND_PCM_FORMAT_FLOAT_LE,
+-                SND_PCM_ACCESS_RW_INTERLEAVED,
+-                config.channels as c_uint,
+-                config.sample_rate,
+-                1,
+-                50_000,
++            eprintln!(
++                "opennow-alsa-sink: opened {} as {}",
++                device,
++                alsa_format_name(format),
+             );
+-            if status < 0 {
+-                close(handle.as_ptr());
+-                return Err(Error::unavailable(
+-                    Subsystem::Alsa,
+-                    alsa_error(strerror, status),
+-                ));
+-            }
++            let samples =
++                config.sample_rate as usize * config.channels as usize * OPUS_MAX_FRAME_MS / 1000;
++            let encoded: Vec<u8> =
++                if format == SND_PCM_FORMAT_FLOAT_LE {
++                    Vec::new()
++                } else {
++                    vec![0; samples * sample_bytes]
++                };
+             Ok(Self {
+                 _library: library,
+                 muted: Arc::clone(&config.muted),
+-                silence: vec![
+-                    0.0;
+-                    config.sample_rate as usize
+-                        * config.channels as usize
+-                        * OPUS_MAX_FRAME_MS
+-                        / 1000
+-                ],
++                silence: vec![0.0; samples],
++                encoded,
+                 handle,
+                 writei,
+                 recover,
+@@ -557,9 +632,46 @@
+                 close,
+                 strerror,
+                 channels: config.channels as usize,
++                format,
++                sample_bytes,
+             })
+         }
+     }
++
++    // float to integer casts saturate, which is what a stream that is louder
++    // than 1.0 needs rather than a wrapped sample.
++    fn encode(&mut self, pcm: &[f32], muted: bool) {
++        self.encoded.clear();
++        if muted {
++            self.encoded.resize(pcm.len() * self.sample_bytes, 0);
++            return;
++        }
++        if self.format == SND_PCM_FORMAT_S16_LE {
++            for sample in pcm {
++                for byte in ((sample * 32767.0) as i16).to_le_bytes() {
++                    self.encoded.push(byte);
++                }
++            }
++            return;
++        }
++        for sample in pcm {
++            for byte in ((sample * 2147483647.0) as i32).to_le_bytes() {
++                self.encoded.push(byte);
++            }
++        }
++    }
++}
++
++fn alsa_format_name(format: c_int) -> String {
++    if format == SND_PCM_FORMAT_FLOAT_LE {
++        "FLOAT_LE".to_owned()
++    } else if format == SND_PCM_FORMAT_S32_LE {
++        "S32_LE".to_owned()
++    } else if format == SND_PCM_FORMAT_S16_LE {
++        "S16_LE".to_owned()
++    } else {
++        "an accepted format".to_owned()
++    }
+ }
+ 
+ impl AudioSink for AlsaSink {
+@@ -567,10 +679,20 @@
+         AudioBackend::Alsa
+     }
+ 
++    // The arriving audio is f32 and the card usually is not, so the samples
++    // that are not already in the card's format are converted first; only a
++    // card that speaks FLOAT_LE gets the stream untouched.
+     fn write(&mut self, pcm: &[f32], cancelled: &dyn Fn() -> bool) -> Result<()> {
+-        let mut offset = 0;
++        let muted = self.muted.load(std::sync::atomic::Ordering::Acquire);
++        let direct = !muted && self.format == SND_PCM_FORMAT_FLOAT_LE;
++        if !direct {
++            self.encode(pcm, muted);
++        }
++        let total_frames = pcm.len() / self.channels;
++        let chunk_frames = (self.silence.len() / self.channels).max(1);
+         let deadline = Instant::now() + AUDIO_WRITE_TIMEOUT;
+-        while offset < pcm.len() {
++        let mut written_frames = 0;
++        while written_frames < total_frames {
+             if cancelled() {
+                 return Err(Error::QueueClosed);
+             }
+@@ -580,19 +702,14 @@
+                     reason: "PCM output did not complete within 250 ms".to_owned(),
+                 });
+             }
+-            let samples = &pcm[offset..pcm.len().min(offset + self.silence.len())];
+-            let samples = if self.muted.load(std::sync::atomic::Ordering::Acquire) {
+-                &self.silence[..samples.len()]
++            let taken = chunk_frames.min(total_frames - written_frames);
++            let payload: *const c_void = if direct {
++                pcm[written_frames * self.channels..].as_ptr().cast()
+             } else {
+-                samples
++                self.encoded[written_frames * self.channels * self.sample_bytes..].as_ptr().cast()
+             };
+-            let frames = samples.len() / self.channels;
+             let written = unsafe {
+-                (self.writei)(
+-                    self.handle.as_ptr(),
+-                    samples.as_ptr().cast(),
+-                    frames as libc::c_ulong,
+-                )
++                (self.writei)(self.handle.as_ptr(), payload, taken as libc::c_ulong)
+             };
+             if written < 0 {
+                 if written as c_int == -libc::EAGAIN {
+@@ -618,7 +735,7 @@
+             if written == 0 {
+                 return Err(Error::backend(Subsystem::Alsa, "zero-length PCM write"));
+             }
+-            offset += written as usize * self.channels;
++            written_frames += written as usize;
+         }
+         Ok(())
+     }

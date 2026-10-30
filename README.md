@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 14, `recipes-apps/opennow/files/0001`…`0014` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.45` |
+| Patches applied | 17, `recipes-apps/opennow/files/0001`…`0017` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.47` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -219,7 +219,7 @@ is `1.0.4+git…` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0014` in `recipes-apps/opennow/files/` are the only changes to the
+`0001`-`0017` in `recipes-apps/opennow/files/` are the only changes to the
 upstream tree at `b3fe7102`. They are one curated series: each step is the
 smallest change that made a measured symptom go away, and the later steps
 stand on the earlier ones.
@@ -240,6 +240,9 @@ stand on the earlier ones.
 | `0012` | **Pin one handoff frame — the window the 55 fps series measured.** The compositor imports the planes only when the queued `add`/`create_immed` pair reaches it, and by then the decoder has retired the frame and handed its capture buffer to the next decode, which makes the import fail with "Failed to import plane 0 as R8". The export's own duplicate keeps the dma-buf *object* alive but not the decoder's *surface*, so the handoff needs one pinned frame across the message. A ring of zero was the theory that the duplicate is enough; it is not. A ring of 24 was measured to break the stream: it pins the whole capture pool, so the decoder names a fresh DMA-BUF every frame, the presenter's cache misses every frame, the compositor EGL-imports a new image every frame and the driver eventually refuses one of them. **One** is what the r0.44 series ran at 55 fps, and that is the value this series keeps. |
 | `0013` | **Throttle the interface window's presents so a released image cannot be reused too soon.** The crash that ends the game the moment the stream starts is not in the presenter: it is an assertion inside the VeriSilicon EGL driver, the only file on the board that holds `api/gc_egl_wayland.c`:<br>`opennow-qt: api/gc_egl_wayland.c:2699: buffer_fenced_release:`<br>`Assertion 'buffer->release_fence_fd == -1' failed.`<br>gdb says where: `QRhi::endFrame` on the `QSGRenderThread`, through `QWaylandGLContext::swapBuffers`, into vendor libEGL, inside `wl_display_dispatch_queue_pending` when weston's release callback arrives. The driver objects to a fenced release of a buffer whose previous release fence has not been answered yet — an image presented again too soon after it was released. weston reports the lag itself: `event processing lagging behind by 45ms, your system is too slow`. So the reuse distance of a swapchain image has to exceed that lag, and the window's swap interval is the app-side knob for it. |
 | `0014` | **Default the interface window's present throttle on.** The throttle in `0013` was opt-in, and the run that never asked for one died the moment the stream window started presenting — the assert above, with weston 45 ms away from answering a buffer release while three images at 60 Hz return an image after about 50 ms. Making **2** the default costs nothing on the picture: the stream window draws through its own DMA-BUF surface and keeps its own 60 Hz present rate (measured `wayland-video fps=58.6..60`), and the interface window paints at 30 Hz, which is the seat UI, not the game. `OPENNOW_SWAP_INTERVAL=1` still selects upstream's every-vsync behaviour for the A/B run, and that is the setting that reproduces the assert. The companion memory change lives on the OS side in `meta-watermelon-wine` (`transparent_hugepage=madvise` in the machine conf). |
+| `0015` | **Press the Start button on a clock of its own.** A session can only be started by tapping the Start button, and the pointer that carries that tap is the thing the stream window fights over, so an armed run that is left alone starts nothing and nothing about the audio or the present rate can be measured hands-free. The clock waits `--auto-launch-ms=<ms>` of home screen and then calls root.startHero(), the very function the button's TapHandler calls, so the launch path, its guards and their order are upstream's unchanged. `0` is the default and is upstream's behaviour; the 60 s that was measured here as the shortest settle for a catalog-loaded, signed-in seat is what the clock was set to in the run that worked. Measured: 60 `opennow-autolaunch` lines ending in `opennow-autolaunch: "pressing Start on Dark and Darker"`, then a fresh session in `native-streamer.log`. |
+| `0016` | **Open the audio sink on a device and a format the card has.** The measured r0.46 session threw 190 of the 197 arriving audio packets out of the low-latency play queue every second, which says the sink behind that queue took almost none of them; probing `libasound.so.2` on the board said why: `snd_pcm_open("default")` answers `-112` ("Host is down") for the NONBLOCK mode the sink asked for, `hw:0,0` refuses `FLOAT_LE` with `-22`, and a NONBLOCK stream that was never started answers `-EIO` after 0.1 s of audio. So the sink now tries the configured name, then `sysdefault`, `default` and the raw card, in **BLOCK** mode, and asks each one for the first sample format it accepts (`FLOAT_LE`, `S32_LE`, `S16_LE`), converting the f32 stream into whatever the card answers (float to integer casts saturate, which is what a stream louder than 1.0 needs rather than a wrapped sample). Measured in r0.47: the session prints `opennow-alsa-sink: opened default as FLOAT_LE` and the same session logs **no** `queue-dropped` event at all, against ~190/s before. |
+| `0017` | **Answer the Escape key in the stream window.** `WaylandVideoSurface::virtualKeyFor` translates the key codes the compositor reports into the virtual keys the host speaks, and it had no entry for evdev code 1, so Escape translated to 0 and `submitKey` returns at once when the virtual key is 0 - the press never went out, which is the open item the game's menus show. Escape is `VK_ESCAPE = 0x1b`, one line in the table the rest of the physical keys are already in. Not yet verified on a screen: the run that would show it needs a fresh boot. |
 
 #### The stream window
 
@@ -432,6 +435,12 @@ So the fault is OpenNOW's play queue running behind, not the sink, not the
 renderer and not a background daemon: stopping `netdata.service` (4 processes,
 ~50 MB) changed nothing, `queue-dropped` still advanced 80 events in 40 s.
 
+The queue running behind is what patch `0016` removes: the sink behind the queue was
+opened on a name the card does not answer, in a mode that was never started, for a
+format the card refuses. r0.47's session prints the sink's own line and logs no
+`queue-dropped` event, so the arriving audio goes out as it arrives rather than being
+thrown away; the two lines below are the r0.45/r0.46 state, kept for the comparison.
+
 Errors and warnings seen in a session, verbatim, with what is known about each:
 
 | Line | Count | Assessment |
@@ -569,22 +578,40 @@ for audio output.
 
 Recorded here so the next reader does not mistake them for fixed:
 
-1. **`ESC` does not reach the game** in Dark and Darker. Every other key and the
-   mouse work, and `F11` reaches the app (it toggles the stream window), so the
-   key makes it to Qt and is consumed there rather than dropped on the floor.
-   Suspect the seat/key handling in `opennow-qt/src/app/ApplicationStartup.cpp`
-   and Qt's own Escape handling in the interface, which owns the key before the
-   stream window's keyboard seat gets it.
+1. **`ESC` does not reach the game** - answered, and patch `0017` is the fix: the
+   translation table in `WaylandVideoSurface::virtualKeyFor` had no entry for evdev
+   code 1, so Escape became virtual key 0 and `submitKey` drops a 0 key at once. The
+   patch puts `0x1b` in that table; it has not been seen on a screen yet, which is
+   why it stays an item rather than a measured fact.
 2. **`F11` during the stream still ends the session** in both renderers. The
    default swap-interval 2 throttle did not remove the vendor assert, so the
    `F11` path reaches the fence from somewhere other than the interface window's
    own present cycle.
-3. **Audio plays late** (`queue-dropped` ~2/s, `underflows` 3–5) in both renderers.
-   The wire is clean and PipeWire is not starved, so the decision is still open
-   between OpenNOW's play-queue policy (app side) and the interface repaint
-   clock that burns `QSGRenderThread`'s CPU (app side, patch `0013`/`0014`).
+3. **Audio plays late** - answered by patch `0016`: the ALSA sink behind the play
+   queue was opened on `default`, a UCM alias the card does not answer, in NONBLOCK
+   mode that was never started, for `FLOAT_LE` the raw card refuses. r0.47 opens a
+   name and a format the card does answer, in BLOCK mode, and its session logs no
+   `queue-dropped` event against ~190/s in r0.46. What has *not* been re-measured in
+   r0.47 is the sound itself, and the present rate below still belongs to r0.45.
 
 Caveats on the numbers above: single runs per phase, not an average of many
 sessions; `presents/s` is only available for sessions launched with
 `OPENNOW_LOG_PRESENT=1` and captured to a file; the board has no swap device and
 only ~432 MB free on the rootfs, so headroom, not spill, is the limit.
+
+One more caveat, and it is the reason the r0.47 numbers are not a full table yet:
+a session that has been started and crashed several times in one boot leaves the
+V4L2 capture pool and the DMA-BUF allocator holding what the crashed sessions took,
+and the next session then fails at *decode* rather than at present:
+
+```
+[AVHWFramesContext @ …] Failed to query buffer 0 of type 9: Bad file descriptor (9)
+[h264 @ …] Failed setup for format drm_prime: hwaccel initialisation returned error.
+[V4L2RequestContext @ …] Failed to allocate request for OUTPUT buffer 0: Inappropriate ioctl for device (25)
+```
+
+which is what `opennow-linux-video` panics over (`unexpected error during closedir:
+Bad file descriptor`) and why no frame reaches the surface. The first session of a
+boot decodes; the ones after it do not. The fix is a fresh boot rather than a patch,
+and it is why a full r0.47 measurement - present rate, `queue-dropped`, the memory
+tally and the thread CPU - has to wait for one.
