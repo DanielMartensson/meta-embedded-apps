@@ -638,18 +638,25 @@ Recorded here so the next reader does not mistake them for fixed:
    neither of them can pay the 77-130 ms `max-gap-ms` a window showed.
    What the run lost is between the notification and the drain: `native avg 59.92/s` against
    `delivered avg 56.21/s` while the surface committed at ~57.8/s and ingress held ~60 video
-   packets a second, with `stale=0` throughout. Still open, and the remaining suspect is the
-   input path: the observation is that a session the keyboard and mouse cannot drive looks
-   perfectly smooth and one they can drive dips, so the same window was measured with a sustained
-   ydotool sweep (one invocation per 20 s window, since a process per event would itself steal the
-   two cores) beside the `wayland-video input:` markers and the `NVST cursor` control-channel
-   traffic they generate. That run has not produced a number yet: at 17:37, 17:47 and 17:55 the
-   app reached `opennow-autolaunch: waiting 1000ms of 90000ms` and then logged nothing for 7 1/2
-   min per attempt, because the grid's discovery endpoint was unreachable
-   (`provider: DIG discovery endpoint is unreachable; using fallback
-   https://latam-west.dig.geforcenow.nvidiagrid.net/`) and `wget` to that fallback returns a bad
-   response while `https://example.com` answers 200, so the board's network is fine and the
-   endpoint is not.
+   packets a second, with `stale=0` throughout. Still open, and the claim left on the
+   table is that a session the keyboard and mouse drive dips while one they cannot drive looks
+   perfectly smooth. The logs already answer that for the density they contain: in `c53.log` the
+   23 seconds that carried 70 input events (up to 16 a second) averaged 55.03 fps against 55.54
+   fps in the 571 input-free seconds, and the eight worst seconds of each of `c50.log` (its worst
+   is 11.4 fps), `c53.log` (40.9 fps) and `s3.log` (11.9 fps) saw zero input events, so the dips
+   are not the input's and a few dozen events a second cost at most half a frame a second. What
+   has not been measured is a real mouse at its polling rate, where the code says the cost would
+   scale with the events: `send_captured_input` is `bundle.queue_input(bytes)`, one SCTP message
+   to the host per event and `captured_input_packet` allocates for each, `EmbeddedInputCapture::submit`
+   takes the gamepad mutex and the queue lock per event, and the session worker that drains up to
+   32 input samples per 250 us pass is the same thread that forwards the video's media feedback,
+   so a flooded input stream delays the frame progress the host needs to keep the picture coming.
+   That run has not produced a number yet: the attempts at 18:07, 18:13 and 18:25 reached
+   `opennow-autolaunch: waiting 1000ms of 90000ms` and logged nothing for the 12 1/2 min each was
+   waited, because the grid's discovery endpoint was unreachable (`provider: DIG discovery endpoint
+   is unreachable; using fallback https://latam-west.dig.geforcenow.nvidiagrid.net/`) and `wget` to
+   that fallback returns a bad response while `https://example.com` answers 200, so the board's
+   network is fine and the endpoint is not.
 6. **The picture reads dark next to the TV's own copy of the game.** Measured, and it is not the
    board darkening it: with `OPENNOW_FRAME_DUMP` the decoded 1920x1080 frame's PPM spans bytes
    0..255 with luma percentiles `min=0 p1=0 p10=1 p50=27 p90=89 p99=126 max=235 mean=37.2`, 53.2
