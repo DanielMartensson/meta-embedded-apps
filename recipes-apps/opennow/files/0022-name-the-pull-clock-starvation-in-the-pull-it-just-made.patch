@@ -1,0 +1,99 @@
+From: noname <noname@example.com>
+Date: Fri, 30 Oct 2026 19:30:00 +0100
+Subject: [PATCH 22/22] name the pull-clock starvation in the pull it just made
+
+r0.51's counters say the pull clock runs at 113-118/s against the 125/s its 8 ms
+timer asks for, and that each 5 s window holds one gap of 77-130 ms, while no single
+handoff took more than 3.8 ms and no single commit more than 6.2 ms. So the clock is
+starved for about a tenth of a second once a window and the starvation is not inside
+either half of the handoff: it is the pull thread being owned by something else, or
+the commit's flush waiting for the compositor's swap reply, which is the same reply
+that already answers flushFailed ~= committed and the buffer_fenced_release assert.
+This says which, by attributing every gap over 16 ms to what the pull before it got
+(after-presented=/after-stale=/after-noframe=/after-other=) and by printing a line of
+its own for every gap over 64 ms, so the instant sits in the log beside the present
+and input markers. Nothing is moved and no work is added: gaps16+= counts, and the
+64 ms line fires at most a few times a minute.
+
+Greppable markers: opennow-pull-gap, opennow-present cost
+---
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -375,14 +375,18 @@
+     // clock is the surface's own 8 ms timer, so pulls= also says whether that
+     // clock still runs at its intended 125/s now that 0019 leaves the interface
+     // render loop idle; stale= counts the pulls the Rust side refused with
+-    // OPENNOW_STREAMER_STALE_FRAME, i.e. the picture already on the screen.
++    // OPENNOW_STREAMER_STALE_FRAME, i.e. the picture already on the screen. Gaps over
++    // 16 ms are attributed to the pull that preceded them, and gaps over 64 ms get a
++    // line of their own so the instant can be found in the log next to the others.
+     void reportHandoffCost(OpenNowStreamerStatus status, bool usable,
+                            unsigned long long handoffUs, unsigned long long commitUs)
+     {
+         if (!qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT")) return;
+         static thread_local unsigned long long pulls = 0, presented = 0, stale = 0,
+             noFrame = 0, other = 0, handoffSum = 0, commitSum = 0,
+-            maxHandoff = 0, maxCommit = 0, maxGap = 0, windowBegin = 0, lastPull = 0;
++            maxHandoff = 0, maxCommit = 0, maxGap = 0, windowBegin = 0, lastPull = 0,
++            gapBig = 0, afterPresent = 0, afterStale = 0, afterNoFrame = 0,
++            afterOther = 0, lastKind = 0;
+         const unsigned long long now = static_cast<unsigned long long>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch()).count());
+@@ -394,8 +398,31 @@
+         if (lastPull && now > lastPull) {
+             const unsigned long long gap = (now - lastPull) / 1000ull;
+             if (gap > maxGap) maxGap = gap;
++            // A gap this long is not inside either half of the handoff, so ask
++            // what the pull before it got. Starvation right after a present means
++            // the commit's flush waits on the compositor's swap reply; starvation
++            // right after a pull that found no frame means this thread is owned by
++            // something else, and the pull clock is only its scheduler.
++            if (gap > 16'000ull) {
++                ++gapBig;
++                switch (lastKind) {
++                case 1: ++afterPresent; break;
++                case 2: ++afterStale; break;
++                case 3: ++afterNoFrame; break;
++                case 4: ++afterOther; break;
++                default: break;
++                }
++            }
++            if (gap > 64'000ull)
++                qInfo("opennow-pull-gap: gap-ms=%llu previous=%s", gap / 1000ull,
++                      lastKind == 1 ? "presented" : lastKind == 2 ? "stale"
++                      : lastKind == 3 ? "noframe"
++                      : lastKind == 4 ? "other" : "first");
+         }
+         lastPull = now;
++        lastKind = usable ? 1
++                   : status == OPENNOW_STREAMER_STALE_FRAME ? 2
++                   : status == OPENNOW_STREAMER_NO_FRAME ? 3 : 4;
+         if (usable) ++presented;
+         else if (status == OPENNOW_STREAMER_STALE_FRAME) ++stale;
+         else if (status == OPENNOW_STREAMER_NO_FRAME) ++noFrame;
+@@ -406,9 +433,10 @@
+         }
+         if (now - windowBegin < 5'000'000'000ull) return;
+         qInfo("opennow-present cost: pulls=%llu presented=%llu stale=%llu noframe=%llu other=%llu"
+-              " handoff-us=%llu max-handoff-us=%llu commit-us=%llu max-commit-us=%llu max-gap-ms=%llu",
++              " handoff-us=%llu max-handoff-us=%llu commit-us=%llu max-commit-us=%llu max-gap-ms=%llu"
++              " gaps16+=%llu after-presented=%llu after-stale=%llu after-noframe=%llu after-other=%llu",
+               pulls, presented, stale, noFrame, other, handoffSum, maxHandoff, commitSum, maxCommit,
+-              maxGap / 1000ull);
++              maxGap / 1000ull, gapBig, afterPresent, afterStale, afterNoFrame, afterOther);
+         windowBegin = now;
+         pulls = 0;
+         presented = 0;
+@@ -420,6 +448,11 @@
+         maxHandoff = 0;
+         maxCommit = 0;
+         maxGap = 0;
++        gapBig = 0;
++        afterPresent = 0;
++        afterStale = 0;
++        afterNoFrame = 0;
++        afterOther = 0;
+     }
+ #endif
+ 

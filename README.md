@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 21, `recipes-apps/opennow/files/0001`…`0021` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.51` |
+| Patches applied | 22, `recipes-apps/opennow/files/0001`…`0022` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.52` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -219,7 +219,7 @@ is `1.0.4+git…` even though the last stable release has a lower number.
 
 #### Patches on top of upstream
 
-`0001`-`0021` in `recipes-apps/opennow/files/` are the only changes to the
+`0001`-`0022` in `recipes-apps/opennow/files/` are the only changes to the
 upstream tree at `b3fe7102`. They are one curated series: each step is the
 smallest change that made a measured symptom go away, and the later steps
 stand on the earlier ones.
@@ -247,6 +247,7 @@ stand on the earlier ones.
 | `0019` | **Hide the interface window under the stream window.** The stream window is a separate xdg_toplevel that covers the interface completely, yet a covered `QQuickWindow` keeps its render thread: the r0.47 session logs `opennow-present render=22.5-26.6 fps=0.0 swapped=0` for the whole run, i.e. a scene graph and a 25 Hz present timer drawing a buffer the compositor never takes, on the same two cores as the decoder and the audio sink. The interface is hidden when `WaylandVideoSurface` commits its first frame and the visibility it had is put back when the surface goes away; the stream window is not its child, so it is untouched. Measured on r0.50: `opennow-interface-hidden` fires with the first presented frame and the interface's render thread then consumes 0 CPU ticks over a 122 s window against 22.5-26.6 frames a second before, while the stream window keeps presenting at 54 fps. Markers: `opennow-interface-hidden`, `opennow-interface-shown`. |
 | `0020` | **Write the diagnostic export when the interface exits.** The redacted `.txt` that carries the Qt log, the RPC log and the embedded streamer's native log could only be produced by pressing Export while the application was still up, and the run worth attaching to a report is the one that just ended. The core now writes that same export when its stdin closes (the interface exiting), prints `opennow-diagnostics-export: <path>` on stderr, and keeps the five newest files so the diagnostics directory does not grow without bound. Measured on r0.50: closing the session wrote a 245 KiB export 2 s after the interface closed. |
 | `0021` | **Measure the two halves of the frame handoff.** Nothing in the series says where the frames a run loses between the streamer's notification and the surface's delivery go, so `presentWaylandFrame` and `pullWaylandFrame` count both halves per 5 s and print one line: `pulls= presented= stale= noframe= handoff-us= max-handoff-us= commit-us= max-commit-us= max-gap-ms=`. `handoff-us` is the Rust call that hands a DMA-BUF frame over, `commit-us` is attach/damage/commit plus the flush the compositor answers. The counters sit next to `0012`'s pinned handoff frame and print only under `OPENNOW_LOG_PRESENT`, so the patch adds counters and no work on a path that is not already logging. Marker: `opennow-present cost`. Measured on the r0.51 session that held ten 20 s windows (`c53.log`): `pulls=566-589` a second against `presented=273-287` and `noframe=290-304` with `stale=0`, `handoff-us=16.8-21.4k us` summed over the pulls of a 5 s window (29-38 us per pull, max 0.18-3.8 ms on one) and `commit-us=55k-82k us` summed over its ~289 commits (190-284 us per commit, max 0.5-6.2 ms). The two halves together are ~0.22-0.32 ms of the 16.7 ms a 60 Hz frame has, so the present path is not where the dip is. What the run lost is 3.7 frames a second between the notification (`native avg 59.92`) and the drain (`delivered avg 56.21`), against 11 564 commits at ~57.8/s and ingress of 1197-1201 video packets per 20 s (~60/s), and the longest gap between pulls was 77-130 ms. |
+| `0022` | **Name the pull clock's starvation in the pull that just made it.** r0.51's counters put the pull clock at 113-118 pulls a second against the 125/s its own 8 ms timer asks for, and every 5 s window holds one gap of 77-130 ms, so the clock loses about a tenth of a second once a window - while no single handoff took more than 3.8 ms and no single commit more than 6.2 ms, that loss is not inside either half of the handoff. `reportHandoffCost` now attributes every gap over 16 ms to the outcome of the pull that preceded it (`gaps16+=`, `after-presented=`, `after-stale=`, `after-noframe=`, `after-other=`) and prints `opennow-pull-gap: gap-ms=... previous=...` for every gap over 64 ms, so the instant sits in the log beside the present and input markers. Starvation after a **present** means the commit's flush waits on the compositor's swap reply, the same reply that answers `flushFailed ~= committed` and the `buffer_fenced_release` assert; starvation after a pull that found **no frame** means this thread is owned by something else and the pull clock is only its scheduler. Counters only, gated on `OPENNOW_LOG_PRESENT`: five statics, a switch on the previous outcome and one line per rare gap. Markers: `opennow-present cost` (the extended line), `opennow-pull-gap`. Not measured yet - no session has run on r0.52. |
 
 #### The stream window
 
@@ -657,6 +658,12 @@ Recorded here so the next reader does not mistake them for fixed:
    is unreachable; using fallback https://latam-west.dig.geforcenow.nvidiagrid.net/`) and `wget` to
    that fallback returns a bad response while `https://example.com` answers 200, so the board's
    network is fine and the endpoint is not.
+   The clock's own numbers are on the table now too: it runs at 113-118 pulls a second against the
+   125/s its 8 ms timer asks for, and each 5 s window holds one gap of 77-130 ms, so about a tenth of
+   a second of the clock is lost once a window. Patch `0022` (built as r0.52, no session on it yet)
+   attributes each gap over 16 ms to what the pull before it got and logs the gaps over 64 ms by
+   themselves, which is what decides whether the fix belongs in the commit's flush or on the thread
+   that owns the clock.
 6. **The picture reads dark next to the TV's own copy of the game.** Measured, and it is not the
    board darkening it: with `OPENNOW_FRAME_DUMP` the decoded 1920x1080 frame's PPM spans bytes
    0..255 with luma percentiles `min=0 p1=0 p10=1 p50=27 p90=89 p99=126 max=235 mean=37.2`, 53.2
