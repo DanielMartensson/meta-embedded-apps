@@ -1,0 +1,77 @@
+From: noname <noname@example.com>
+Date: Sat, 31 Oct 2026 21:32:00 +0100
+Subject: [PATCH 26/26] close the descriptor of every frame no request carried
+
+This reverses 0023's placement of the close, and it is safe now because
+0025 stopped treating a dead descriptor as the device's verdict. 0023 was
+written against a sticky import probe: present() closed the descriptor of
+a frame whose wl_buffer was already cached, the next pull of that dma-buf
+answered "fstat on DMA-BUF failed: Bad file descriptor (os error 9)", and
+the streamer copied 3 MiB of NV12 per present for the rest of the run. So
+0023 stopped closing those descriptors - and then the descriptors and the
+capture objects behind them were never released at all. Measured on the
+r0.53 driven session at 1280x720: /proc/PID/fd grew from 39 to 1024 (the
+board's soft limit) in 901 presented frames, about 1.13 descriptors per
+present, and each run that died that way left ~900 capture objects (about
+1.2 GB at 720p) in the V4L2 pool, which is why dmesg's "dma alloc of
+size" failures went from 15 to 45 in one day and even the 1382400-byte
+720p request stopped being served. With 0025 in place, a descriptor that
+the window closes costs one CPU-copied frame instead of the whole run, so
+present() closes every frame that no request carried again - the frames
+that reuse a cached wl_buffer included - and the dma-bufs are released as
+the decoder drops them. The r0.51/r0.52 sessions that ran 577 s with zero
+capture failures are what that looks like when the pool stays healthy.
+
+Greppable markers: wayland-video fps, opennow-diag
+---
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -991,18 +991,15 @@
+         return;
+     }
+     // Whether the descriptor went into a request: only then does libwayland
+-    // own it. A frame that reuses a cached wl_buffer names the screen a second
+-    // time without sending a request, and attachFrame decides that descriptor's
+-    // fate itself, so only a frame that never reached the surface is closed here.
++    // own it. A frame that reuses a cached wl_buffer, or that is dropped
++    // before it reaches the surface, keeps its descriptor here.
+     bool handedOver = false;
+-    bool surfaceTookFrame = false;
+     if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
+             && frame.size.height() > 0) {
+         // Pointer positions are reported in surface pixels; the video size is
+         // what they have to be expressed in.
+         m_videoSize = frame.size;
+         if (ensureSurface() && ensureDmabuf() && m_configured) {
+-            surfaceTookFrame = true;
+             handedOver = attachFrame(frame);
+         } else {
+             ++m_dropped;
+@@ -1010,9 +1007,8 @@
+     }
+     if (frame.fd >= 0) {
+         // A descriptor that went into a request belongs to libwayland now and
+-        // is tracked by bufferFor(); one that never reached the surface at all
+-        // is ours to close.
+-        if (!surfaceTookFrame) ::close(frame.fd);
++        // is tracked by bufferFor(); one that never got there is ours to close.
++        if (!handedOver) ::close(frame.fd);
+     }
+ 
+     const quint64 now = monotonicNs();
+@@ -1137,14 +1133,6 @@
+     wl_buffer *buffer = bufferFor(frame, &queued);
+     if (!buffer) {
+         ++m_dropped;
+-        // The descriptor reached neither an add request nor the surface's cache,
+-        // so this process still owns it and nothing else will. Closing a frame
+-        // that the surface *did* accept would revoke the descriptor the decoder
+-        // holds for the same DMA-BUF: the next pull of that picture then answers
+-        // "fstat on DMA-BUF failed: Bad file descriptor (os error 9)", which is
+-        // how the device switches the whole run to copying three megabytes of
+-        // NV12 per present instead of importing the DMA-BUF it was given.
+-        if (frame.fd >= 0) ::close(frame.fd);
+         return queued;
+     }
+     wl_surface_attach(m_surface, buffer, 0, 0);
+

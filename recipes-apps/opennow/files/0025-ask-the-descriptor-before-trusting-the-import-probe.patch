@@ -1,0 +1,120 @@
+From: noname <noname@example.com>
+Date: Sat, 31 Oct 2026 21:30:00 +0100
+Subject: [PATCH 25/25] ask the descriptor before trusting the import probe
+
+The r0.53 sessions show what one dead descriptor costs: the streamer
+logs "opennow-diag: linear DMA-BUF buffer import failed: Vulkan operation
+failed: fstat on DMA-BUF failed: Bad file descriptor (os error 9); falling
+back to the CPU copy", sets buffer_import_probe = Some(false) and keeps
+that answer for the rest of the run, so every present afterwards copies
+3 MiB of NV12 on the CPU and no import is ever tried again - and the
+same Some(false) also closes the dmabuf_buffer_import_enabled gate.
+The descriptor is not the device's opinion: it is a per-frame export that
+the stream window may already have closed (patch 0023 stopped closing it
+precisely because that answer was sticky). Ask the descriptor first with
+fstat; if it is dead, take the CPU copy for this frame and leave the probe
+untouched. A descriptor that dies between that check and the import is
+treated the same way, so the probe now only records a real verdict about
+the graphics device.
+
+Greppable markers: opennow-diag
+---
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -1165,38 +1165,66 @@
+                 sand::import(&self.instance, self.physical_device, &self.device, frame)
+                     .map(PreparedLinuxFrame::Sand)
+             }
+-            DmaBufImportRoute::Linear => match sand::import_linear(
+-                &self.instance,
+-                self.physical_device,
+-                &self.device,
+-                Arc::clone(&frame),
+-                &mut self.buffer_imports,
+-            ) {
+-                Ok(imported) => {
+-                    if self.buffer_import_probe.is_none() {
+-                        self.buffer_import_probe = Some(true);
+-                        {
+-                            use std::sync::atomic::{AtomicBool, Ordering};
+-                            static PROVEN: AtomicBool = AtomicBool::new(false);
+-                            if !PROVEN.swap(true, Ordering::Relaxed) {
+-                                eprintln!(
+-                                    "opennow-diag: linear NV12 DMA-BUF buffer import route chosen by the device, not the interface report"
+-                                );
++            DmaBufImportRoute::Linear => {
++                // The descriptor a frame was exported with can already be dead
++                // when it arrives here: the stream window closes the descriptor
++                // of a present it does not send in a request, and the decoder's
++                // pool frames name the same dma-buf. Ask the descriptor first
++                // and treat a dead one as a per-frame fallback, never as the
++                // device's answer - keeping that answer sticky is what turned
++                // one EBADF into three megabytes of NV12 memcpy per present for
++                // the rest of the run.
++                let descriptor_alive = frame
++                    .dmabuf
++                    .as_ref()
++                    .and_then(|dmabuf| dmabuf.objects.first())
++                    .map(|object| {
++                        let mut info: libc::stat = unsafe { std::mem::zeroed() };
++                        unsafe { libc::fstat(object.fd, &mut info) == 0 }
++                    })
++                    .unwrap_or(false);
++                if !descriptor_alive {
++                    return self.prepare_cpu_copy(frame);
++                }
++                match sand::import_linear(
++                    &self.instance,
++                    self.physical_device,
++                    &self.device,
++                    Arc::clone(&frame),
++                    &mut self.buffer_imports,
++                ) {
++                    Ok(imported) => {
++                        if self.buffer_import_probe.is_none() {
++                            self.buffer_import_probe = Some(true);
++                            {
++                                use std::sync::atomic::{AtomicBool, Ordering};
++                                static PROVEN: AtomicBool = AtomicBool::new(false);
++                                if !PROVEN.swap(true, Ordering::Relaxed) {
++                                    eprintln!(
++                                        "opennow-diag: linear NV12 DMA-BUF buffer import route chosen by the device, not the interface report"
++                                    );
++                                }
+                             }
+                         }
++                        Ok(PreparedLinuxFrame::Sand(imported))
++                    },
++                    Err(error) => {
++                        // A descriptor that dies between the check above and the
++                        // import is the same per-frame condition, not a verdict
++                        // on the device: leave the route enabled so the next
++                        // frame's own export is tried again.
++                        if !error.to_string().contains("Bad file descriptor") {
++                            self.buffer_import_probe = Some(false);
++                        }
++                        use std::sync::atomic::{AtomicBool, Ordering};
++                        static REPORTED: AtomicBool = AtomicBool::new(false);
++                        if !REPORTED.swap(true, Ordering::Relaxed) {
++                            eprintln!(
++                                "opennow-diag: linear DMA-BUF buffer import failed: {error}; falling back to the CPU copy"
++                            );
++                        }
++                        self.prepare_cpu_copy(frame)
+                     }
+-                    Ok(PreparedLinuxFrame::Sand(imported))
+-                },
+-                Err(error) => {
+-                    self.buffer_import_probe = Some(false);
+-                    use std::sync::atomic::{AtomicBool, Ordering};
+-                    static REPORTED: AtomicBool = AtomicBool::new(false);
+-                    if !REPORTED.swap(true, Ordering::Relaxed) {
+-                        eprintln!(
+-                            "opennow-diag: linear DMA-BUF buffer import failed: {error}; falling back to the CPU copy"
+-                        );
+-                    }
+-                    self.prepare_cpu_copy(frame)
+                 }
+             },
+             DmaBufImportRoute::Image => self
+
