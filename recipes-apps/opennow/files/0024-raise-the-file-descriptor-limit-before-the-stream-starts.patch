@@ -1,0 +1,80 @@
+From: noname <noname@example.com>
+Date: Sat, 31 Oct 2026 06:40:00 +0100
+Subject: [PATCH 24/24] raise the file descriptor limit before the stream starts
+
+A driven r0.53 session at 1280x720 ended at committed=901 dropped=0 with
+"[AVHWFramesContext] Failed to export memory plane 0 (16): Too many open
+files (24)" and 1024 entries in /proc/PID/fd, the board's `sh -c "ulimit
+-n"` soft limit; the hard one is 524288. 0023 stopped closing the
+descriptor of a present the stream window already had a cached wl_buffer
+for, because closing it revoked the descriptor the decoder holds for that
+surface and the next pull answers "fstat on DMA-BUF failed: Bad file
+descriptor (os error 9)". So each of those presents leaves one descriptor
+open that nothing else will close. The dma-buf objects behind them are the
+ten-odd capture surfaces the V4L2 pool reuses, so VmRSS stayed at 188-238
+MB while the count climbed with frames: 1024 descriptors bought 900 frames,
+17 seconds of picture. Raising the soft limit to 65536 (legal below the
+hard 524288) buys about 20 minutes at 52 fps, the length of the held
+streams the README still marks as owed.
+
+Greppable markers: opennow-fd-limit, wayland-video fps
+---
+--- a/opennow-qt/src/main.cpp
++++ b/opennow-qt/src/main.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <clocale>
+ #include <langinfo.h>
++#include <sys/resource.h>
+ #include <QDebug>
+ 
+ // ---------------------------------------------------------------------------
+@@ -29,8 +30,47 @@
+     qInfo("OpenNOW: character type was %s, using en_US.UTF-8", codeset.constData());
+ }
+ 
++// ---------------------------------------------------------------------------
++// Enough open descriptors for a long stream
++// ---------------------------------------------------------------------------
++//
++// A frame whose DMA-BUF the stream window already cached is presented without
++// sending its descriptor in a request, and the streamer keeps the descriptors
++// of the decoder's own capture surfaces alive (opennow-diag: dma-buf export
++// handles kept alive at handoff), so neither side closes the descriptor such a
++// present arrives with and each of those presents leaves one more open. Measured
++// on r0.53 at 1280x720: the driven session ended at committed=901 dropped=0 with
++// "[AVHWFramesContext] Failed to export memory plane 0 (16): Too many open files
++// (24)" and 1024 entries in /proc/PID/fd, the board's `sh -c "ulimit -n"`. What
++// leaks is descriptor numbers, not capture memory: the V4L2/hantro pool reuses
++// the same ten-odd surfaces, so VmRSS stayed at 188-238 MB across the run, while
++// 1024 descriptors bought only 900 frames, about 17 seconds of picture. The
++// kernel's hard limit is 524288, so raising the soft one is legal; 65536 is
++// about 20 minutes of play at 52 fps, the length of the held streams this layer
++// still marks as owed to a session.
++static void widenDescriptorLimit()
++{
++    struct rlimit current {};
++    if (getrlimit(RLIMIT_NOFILE, &current) != 0)
++        return;
++    rlim_t wanted = 65536;
++    if (current.rlim_cur >= wanted)
++        return;
++    if (current.rlim_max != RLIM_INFINITY && current.rlim_max < wanted)
++        wanted = current.rlim_max;
++    if (wanted <= current.rlim_cur)
++        return;
++    struct rlimit raised { wanted, current.rlim_max };
++    if (setrlimit(RLIMIT_NOFILE, &raised) != 0)
++        return;
++    qInfo("opennow-fd-limit: the file descriptor limit was raised from %llu to %llu",
++          static_cast<unsigned long long>(current.rlim_cur),
++          static_cast<unsigned long long>(wanted));
++}
++
+ int main(int argc, char *argv[])
+ {
+     preferUtf8CharacterType();
++    widenDescriptorLimit();
+     return runApplication(argc, argv);
+ }
+
