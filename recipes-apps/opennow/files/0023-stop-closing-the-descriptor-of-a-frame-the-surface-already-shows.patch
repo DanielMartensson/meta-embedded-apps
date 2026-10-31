@@ -1,0 +1,85 @@
+From: noname <noname@example.com>
+Date: Sat, 31 Oct 2026 03:40:00 +0100
+Subject: [PATCH 23/23] stop closing the descriptor of a frame the surface already shows
+
+The Oct-31 runs say where a handed-off DMA-BUF goes wrong. The device reports
+"dma-buf export handles kept alive at handoff: retained=1", then
+"linear DMA-BUF buffer import failed: Vulkan operation failed: fstat on DMA-BUF
+failed: Bad file descriptor (os error 9); falling back to the CPU copy", then
+"cpu-copy frame 1920x1080 range=Limited matrix=Bt709 chroma=Center" for every
+frame of the rest of the session. frame_producer.rs keeps that answer for the
+whole run (buffer_import_probe = Some(false) once the probe fails), so one bad
+descriptor costs three megabytes of memcpy per present and not one import.
+The descriptor is fine when it is handed over: present() closed it when
+attachFrame returned false, and attachFrame returns false for a frame whose
+DMA-BUF was already in the surface's wl_buffer cache (dropped=0 in every run,
+so bufferFor never failed), where no request carried the descriptor. Closing it
+there revokes the descriptor the decoder holds for the same DMA-BUF in the same
+process, and the next pull of that picture is the EBADF above. So the close
+belongs to the frames that never reached the surface, and attachFrame is the
+only place that knows the difference.
+
+Greppable markers: wayland-video fps, opennow-diag
+---
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -988,30 +988,34 @@
+     pumpEvents();
+     if (m_connectionFailed) {
+         if (frame.fd >= 0) ::close(frame.fd);
+         return;
+     }
+     // Whether the descriptor went into a request: only then does libwayland
+-    // own it. A frame that reuses a cached wl_buffer, or that is dropped
+-    // before it reaches the surface, keeps its descriptor here.
++    // own it. A frame that reuses a cached wl_buffer names the screen a second
++    // time without sending a request, and attachFrame decides that descriptor's
++    // fate itself, so only a frame that never reached the surface is closed here.
+     bool handedOver = false;
++    bool surfaceTookFrame = false;
+     if (frame.fd >= 0 && frame.planeCount > 0 && frame.size.width() > 0
+             && frame.size.height() > 0) {
+         // Pointer positions are reported in surface pixels; the video size is
+         // what they have to be expressed in.
+         m_videoSize = frame.size;
+         if (ensureSurface() && ensureDmabuf() && m_configured) {
++            surfaceTookFrame = true;
+             handedOver = attachFrame(frame);
+         } else {
+             ++m_dropped;
+         }
+     }
+     if (frame.fd >= 0) {
+         // A descriptor that went into a request belongs to libwayland now and
+-        // is tracked by bufferFor(); one that never got there is ours to close.
+-        if (!handedOver) ::close(frame.fd);
++        // is tracked by bufferFor(); one that never reached the surface at all
++        // is ours to close.
++        if (!surfaceTookFrame) ::close(frame.fd);
+     }
+ 
+     const quint64 now = monotonicNs();
+     if (m_sampleStart == 0) {
+         m_sampleStart = now;
+         m_sampleCount = 0;
+@@ -1130,12 +1134,20 @@
+ bool WaylandVideoSurface::attachFrame(const Frame &frame)
+ {
+     bool queued = false;
+     wl_buffer *buffer = bufferFor(frame, &queued);
+     if (!buffer) {
+         ++m_dropped;
++        // The descriptor reached neither an add request nor the surface's cache,
++        // so this process still owns it and nothing else will. Closing a frame
++        // that the surface *did* accept would revoke the descriptor the decoder
++        // holds for the same DMA-BUF: the next pull of that picture then answers
++        // "fstat on DMA-BUF failed: Bad file descriptor (os error 9)", which is
++        // how the device switches the whole run to copying three megabytes of
++        // NV12 per present instead of importing the DMA-BUF it was given.
++        if (frame.fd >= 0) ::close(frame.fd);
+         return queued;
+     }
+     wl_surface_attach(m_surface, buffer, 0, 0);
+     if (wl_proxy_get_version(reinterpret_cast<wl_proxy *>(m_surface)) >= 4)
+         wl_surface_damage_buffer(m_surface, 0, 0, frame.size.width(), frame.size.height());
+     else
