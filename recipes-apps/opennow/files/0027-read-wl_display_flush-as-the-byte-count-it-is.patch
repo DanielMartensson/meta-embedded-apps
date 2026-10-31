@@ -1,0 +1,37 @@
+From: noname <noname@example.com>
+Date: Sat, 31 Oct 2026 22:40:00 +0100
+Subject: [PATCH 27/27] read wl_display_flush as the byte count it is
+
+flushDisplay() treated a zero return from wl_display_flush as the only
+success, but libwayland returns the number of bytes it sent: zero only
+when nothing was queued, a positive count when the commit went out, and
+-1 with errno on failure. Every present commits and flushes bytes, so
+the success arm was never taken: m_flushFailures climbed at the present
+rate (the logs read flushFailed=897 at committed=901), the deferred-fd
+list was never forgotten on a real flush, and the first warning reported
+whatever errno an unrelated call had left behind ("flush failed: File
+exists (display error 0)"). Test the sign instead, so a successful flush
+forgets the descriptors libwayland already closed and the 240-entry
+tripwire measures a compositor that really stopped reading.
+
+Greppable markers: wayland-video fps, flush failed
+---
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -957,7 +957,14 @@
+ void WaylandVideoSurface::flushDisplay()
+ {
+     if (!m_display) return;
+-    if (wl_display_flush(m_display) == 0) {
++    // wl_display_flush answers with the number of bytes it sent, so a
++    // successful flush is any value from zero up. Only -1 is a failure, and
++    // only -1 with EAGAIN means requests are still queued. Testing for zero
++    // read every present as a failure: the surface commits and flushes bytes
++    // on every frame, so the counter ran at the present rate and errno was
++    // whatever the last unrelated call had left there ("flush failed: File
++    // exists").
++    if (wl_display_flush(m_display) >= 0) {
+         // Everything queued so far reached the compositor, so libwayland has
+         // already closed the descriptors those requests carried.
+         forgetDeferredFds();
+
