@@ -566,9 +566,12 @@ The house lost voltage and both addresses moved with the reboot that followed it
 the board is `weston@192.168.1.33` and the build host is `ubuntu@192.168.1.35`,
 so the gateway-ping logs of the runs after that reboot have to target the new
 pair. `0028`/`0029` (built as `r0.57`) take the two crash classes this boot had
-been carrying; `0030` (built as `r0.58`) takes the artwork half-image behind the
-`QFile` warning the interface writes to stderr beside a stream that is still
-running.
+been carrying; `0030` (built as `r0.58`) closes the completeness gap in
+`download()`. It is measured as store-door hygiene only: the `QFile` warning it
+was aimed at turned out to be Qt's own JPEG plugin asking a `QFile` for one
+block more than a whole file has, and the `r0.58` session below measures
+`truncated-image` 0 with the warnings still in its log. Item 12 carries the
+corrected class.
 
 | Counter | Value |
 | --- | --- |
@@ -576,7 +579,9 @@ running.
 | manual `r0.57`, fresh boot, whole pool | `session.create 1793555252518` → `game_launch: title=Dark and Darker appId=102303211` → streamer stop at `1793556244503`: `server-terminated: The server ended the streaming session (0x80030007)`, `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` |
 | crash-class lines in that 805 s session | `buffer_fenced_release` 0, `Bad file descriptor` 0, `Protocol error` 0, `destroyed object` 0, `dmabuf-rejected` 0 - the first session on a whole pool that survived its own end |
 | `CmaFree` on that boot | 504864/524288 kB at boot, 465492 kB after: this boot's deaths cost ~39 MB each, against the ~55 MB the `r0.56` classes used to cost |
-| `0030` | queued, not yet measured: the marker `truncated-image` has no hit yet |
+| manual `r0.58` (`play-ab91.log`, PID 12246) | `session.create 1793565786618` -> `game_launch: title=Dark and Darker appId=102303211` -> `media-ingress consumer stopped elapsed_ms=663688 video=39334 audio=132049 keyframes=5 dropped=5`, 647 present samples, `committed=24677 dropped=4735`, `flushFailed=0` in all 647, `fps` p1 31.9 / p50 **37.7** / p90 39.9 (min 16.5, max 43.0) |
+| crash classes in that `r0.58` session | 0 of every class; `dmabuf-rejected` **19** refusals (`opennow-diag: dmabuf-rejected: fd 92 covers 0 bytes, the planes need 2073600/3125760 at stride 1920/1920 height 1080/540, 1 of them so far; not sending the add`) inside 4275 `dropping a frame (the frame could not be exported as a DMA-BUF); continuing` lines |
+| the artwork class in that `r0.58` session | `QFile::at: Cannot set file position 180224` / `147456` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment`, 2 pairs at 20:57:17.379 and 20:57:19.151 in the middle of the stream; `truncated-image` **0**, `Cannot open` 0 - so `0030` had no measured hit and does not answer these two lines, while all 167 `index.json` sizes matched their files on disk and every object ended `FF D9` |
 
 #### The r0.56 held-stream measurement (1080p, driven)
 
@@ -639,7 +644,7 @@ for audio output.
 | OpenNOW does not start at all | The launcher's `QT_QPA_PLATFORM=wayland-egl` is what this board needs; Qt's default wayland plugin cannot create a Vulkan instance |
 | A stream dies at the first presented frame with `buffer_fenced_release` | The VeriSilicon egl-wayland client rejects a swapchain image whose previous release fence is still unanswered. Patch `0014` makes the interface window's swap interval default to 2 vsyncs for exactly this; `OPENNOW_SWAP_INTERVAL=1` selects upstream's behaviour and reproduces the crash |
 | The picture is smooth but `flushFailed` is nearly `committed` | Fixed by patch `0027`. `wl_display_flush` returns the number of bytes it sent, so testing `== 0` read every present as a failure. On `r0.56` `flushFailed` stays at 0 for 31019 presents; if it moves again, read it as a real flush failure |
-| `QFile::at: Cannot set file position N` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment` | Fixed in kind by patch `0030`. The interface decodes a cached artwork object through a `QFile` and its JPEG decoder restart-scans forward for the next segment, so the seek that failed asked for an offset the file does not have: the cached object is shorter than its image. `download()` stored that body as a finished object; `holds_whole_image` now refuses it (marker `truncated-image`). The stream keeps its rate through these warnings - they belong to the artwork, not to the video |
+| `QFile::at: Cannot set file position N` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment` | Cosmetic, artwork only, and no layer fix is needed: the stream keeps its rate through them (2 pairs at 20:57:17.379 and 20:57:19.151 inside an `r0.58` session still streaming at p50 37.7 fps with `flushFailed=0`; 7 pairs inside one second in `c53` at 53.0 fps). The positions are Qt's own JPEG-plugin blocks past the end of a **whole** file - `180224 = 44 x 4096`, `147456 = 36 x 4096`, and `src/plugins/imageformats/jpeg/qjpeghandler.cpp` reads the device in `max_buf = 4096` blocks - so libjpeg's entropy stream reached EOF before its own EOI (that is the notice), `resync_to_restart = jpeg_resync_to_restart` asked the `QFile` for the next restart marker, the block-boundary seek landed past EOF, `QFile` refused it and warned, and the plugin installed its fake EOI and finished the decode. The objects there are baseline JPEGs ending `FF D9` (145090 and 175462 bytes) with `index.json` sizes matching disk, so there is no short object and nothing to avoid. The file the interface cannot open at all prints `Cannot open: <url>` instead, which the app already avoids through the empty `resolvedUrl` in `ArtworkSource.qml`; this boot logged 0 of those |
 | The picture stops and the streamer's last line is `server-terminated: The server ended the streaming session (0x80030007)` | Not an app-side end and not a layer's fix: the provider closed the session. `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` says the stream carried its frames up to that verdict, and the app answers with `qt-to-native id=qt-4 type=stop`, `engine-command end id=qt-4 type=stop success=true` and `session.ended: outcome=ok`, so nothing crashes and the last frame simply stays on screen. The answer is a new session, and `--auto-launch-ms=90000` presses Start for you |
 | `Failed to import plane 0 as R8`, then the stream window closes |
  The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
@@ -864,37 +869,52 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     picture with 47803 video and 160359 audio packets in and `dropped=5`, and
     0 of either class in the run.
 
-12. **The `QFile` warning and the corrupt JPEG are the artwork cache's half-image,
-    and `0030` answers it.** The terminal of this boot's runs carries a warning
-    none of the diagnostics logs has, because Qt writes it to stderr:
+12. **The `QFile` warning and the corrupt JPEG are Qt's own JPEG plugin asking a
+    `QFile` for one block more than a whole file has, and the class is cosmetic.**
+    The terminal of this boot's runs carries a warning none of the diagnostics logs
+    has, because Qt writes it to stderr:
 
     ```
     qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment
-    QFile::at: Cannot set file position 49152
-    QFile::at: Cannot set file position 163840
-    QFile::at: Cannot set file position 327680
+    QFile::at: Cannot set file position 180224
+    QFile::at: Cannot set file position 147456
     ```
 
-    `c53` logged that pair seven times inside one second (17:28:00.150..17:28:01.094)
-    while the stream around it presented at 53.0 fps, and the offsets it asked for -
-    16384, 49152, 163840, 212992, 272261, 327680 - sit inside the artwork objects
-    `/home/weston/.config/OpenNOW/artwork-cache/v1/objects` holds now (385157 and
-    241834 bytes). The interface decodes a cached object through a `QFile` and the
-    JPEG decoder restart-scans forward for its next segment, so every seek that
-    failed asked for an offset past the end of the file: the object on disk is
-    shorter than the image it was stored for. `download()` in
-    `native/opennow-core/src/artwork_cache.rs` never compares the body it wrote
-    against a complete image - it rejects only an object *over*
-    `max_object_bytes` - so a body that ended early became a cache object and the
-    interface decoded a half-image. The event is not the stream's own: `c53` kept
-    its rate through all seven warnings, and the freeze behind them at
-    `rx-stats elapsed=600.4s` is that harness's 600 s stop. `0030` (built as
-    `r0.58`) refuses the half-image with `holds_whole_image`, the same path
-    `too-large` already takes leaves the entry for a later attempt, so only whole
-    images reach the interface. What is still owed: its marker `truncated-image`
-    has no measured hit yet, so the next manual session has to say whether the
-    warnings go with the guard, and the two queued patches are still open -
-    `setWindowHasContents(Never)` while the stream window is mapped (the ~12 fps
-    `0029` costs, p50 43.6 against `r0.56`'s 55.9) and refusing `::close` of the
-    number `wl_display_get_fd(m_display)` reports, the last remaining source of
-    `Bad file descriptor` in the old close sites.
+    `c53` logged seven pairs inside one second (17:28:00.150..17:28:01.094) while the
+    stream around it presented at 53.0 fps, and the `r0.58` run logged two pairs at
+    20:57:17.379 and 20:57:19.151 in the middle of a session that streamed 664 s at
+    p50 37.7 fps with `flushFailed=0` in all 647 present samples. The positions are
+    block boundaries of Qt's own plugin, not of the cache: `180224 = 44 x 4096` and
+    `147456 = 36 x 4096`, and `src/plugins/imageformats/jpeg/qjpeghandler.cpp` reads
+    the device in `max_buf = 4096` blocks. The object neighbourhood they sit in is
+    whole - 145090 and 175462 bytes, both baseline JPEGs (SOS `FF C0`) ending `FF D9` -
+    and all 167 `index.json` entries matched their file size on disk, so there is no
+    short object and no index/disk disagreement to find. What happens instead: libjpeg's
+    entropy stream reaches EOF before its own EOI (that is the `premature end of data
+    segment` notice), the source manager's `resync_to_restart = jpeg_resync_to_restart`
+    asks the device for the next restart marker, the plugin's next block-boundary seek
+    lands past the end of the file, `QFile` refuses it and prints the warning, and
+    `qt_fill_input_buffer` installs its fake EOI (`qjpeghandler.cpp` lines 101-105) so
+    the decode finishes. The class is the decoder on a good file, and it costs at worst
+    the last scanline groups of one poster. No session this boot died from it, and the
+    two sessions that showed it ended at 0 of every crash class.
+
+    `0030` was landed against the hypothesis that the cache had stored a short body, and
+    the `r0.58` run measures that hypothesis as false: `truncated-image` 0 across a
+    session that did carry the warnings. The guard stays, because the gap it closes is
+    real - `download()` in `native/opennow-core/src/artwork_cache.rs` had no
+    completeness check at all, rejecting only an object *over* `max_object_bytes` -
+    so it is store-door hygiene with a measured 0 hits, not what answers those two
+    lines. An availability check is not the answer either: the file that is not there
+    prints `Cannot open: <url>`, the app already routes that through the empty
+    `resolvedUrl` in `ArtworkSource.qml` (and the acceptance harness whitelists that
+    message form beside `ArtworkEvictionUrls`), and this boot logged 0 of them. The
+    change that would silence both lines is on the decode path, not on availability:
+    `RoundedArtwork.qml` hands Qt a `source: artworkSource.resolvedUrl`, a `file://`
+    device, and the plugin's device branch is the one that fails; handing the decoder
+    the cache bytes instead (a `QBuffer`, which takes the plugin's `memDevice` branch at
+    lines 92-95, where no `QFile::at` exists) leaves nothing to fail. Not landed - the
+    class costs nothing measurable, and the one release it would need has to be
+    measured against the p50 the interface pays today. What is still owed elsewhere:
+    `setWindowHasContents(Never)` while the stream window is mapped, and refusing
+    `::close` of the number `wl_display_get_fd(m_display)` reports.
