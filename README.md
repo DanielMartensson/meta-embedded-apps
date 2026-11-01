@@ -741,4 +741,4 @@ permanent: the r0.48 session at 08:07 failed to decode, while the r0.50 session 
 decode failures and 0 dropped frames. What a reboot is still needed for is the
 ethernet PHY the board leaves un-armed, not this decoder state, and it is why a
 full r0.47 measurement - present rate, `queue-dropped`, the memory tally and the
-thread CPU - had to wait for one session.
+thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on a fresh boot: its first launch died at the first keyframe with `[V4L2RequestContext] Failed to allocate request for OUTPUT buffer 0: Inappropriate ioctl for device (25)`, then `Failed setup for format drm_prime`, a `closedir` panic and the vendor `buffer_fenced_release` assert, and the retry 85 s later streamed 535 s at p50 55.9 fps with no decode error at all. The retry in `measure73.sh` is therefore load-bearing, and a first attempt that dies this way says nothing about the build.
