@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 27, `recipes-apps/opennow/files/0001`…`0027` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.56` |
+| Patches applied | 30, `recipes-apps/opennow/files/0001`…`0030` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.58` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -560,6 +560,24 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
 
+#### The r0.57 crash-class pair and the r0.58 artwork guard (Nov 1, board `weston@192.168.1.33`)
+
+The house lost voltage and both addresses moved with the reboot that followed it:
+the board is `weston@192.168.1.33` and the build host is `ubuntu@192.168.1.35`,
+so the gateway-ping logs of the runs after that reboot have to target the new
+pair. `0028`/`0029` (built as `r0.57`) take the two crash classes this boot had
+been carrying; `0030` (built as `r0.58`) takes the artwork half-image behind the
+`QFile` warning the interface writes to stderr beside a stream that is still
+running.
+
+| Counter | Value |
+| --- | --- |
+| driven `r0.57` (`ab86`, ~9 min) | crash classes 0, `dropped=0`, p50 **43.6** fps against `r0.56`'s 55.9, load 2.28 → 6.12, `CmaFree` -111 MB across the run |
+| manual `r0.57`, fresh boot, whole pool | `session.create 1793555252518` → `game_launch: title=Dark and Darker appId=102303211` → streamer stop at `1793556244503`: `server-terminated: The server ended the streaming session (0x80030007)`, `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` |
+| crash-class lines in that 805 s session | `buffer_fenced_release` 0, `Bad file descriptor` 0, `Protocol error` 0, `destroyed object` 0, `dmabuf-rejected` 0 - the first session on a whole pool that survived its own end |
+| `CmaFree` on that boot | 504864/524288 kB at boot, 465492 kB after: this boot's deaths cost ~39 MB each, against the ~55 MB the `r0.56` classes used to cost |
+| `0030` | queued, not yet measured: the marker `truncated-image` has no hit yet |
+
 #### The r0.56 held-stream measurement (1080p, driven)
 
 This is the first hardware-decode measurement of the release fix (`0025`/`0026`),
@@ -589,6 +607,21 @@ The one thing this run does not show is the close side of the window: ESC opens
 the game's menu, it does not end the stream, so `opennow-interface-shown` is
 still owed by a session that ends through the window itself.
 
+The four axes the series was chasing hold while the stream is up, in the Nov-1
+session `play-ab84.log` of the same build:
+
+| Axis | Value |
+| --- | --- |
+| present rate | `NVST rx-stats elapsed=370.2s frames=21414` = **57.9 fps**, `dropped=0` |
+| handoff lag | `deliveryToAdmission p50=1.71 p95=3.32 max=6.71`, `admissionToControlQueue p50=27.4`, `qosOwdUs=416-7145` |
+| wire | `qosBweKbps=42852-47083`, 1.63 Mbit/s measured on `eth0` against a 100 Mbit/s link, `gaps=0`, gateway ping 1.6 ms at 0% loss |
+| audio | `audio-jitter target_ms=200 queued=17`, `underflows` 15 to 16 over a 10 s window, no `queue-dropped` |
+| input | user-verified on the board (controller and keyboard reach the game); the measured ESC press is item 10's `ab77-1-2.log` |
+
+That session then died for the reason item 11 records, so these numbers say what
+the release holds while it is up, not what ends it.
+
+
 
 ### YtGst
 
@@ -606,7 +639,10 @@ for audio output.
 | OpenNOW does not start at all | The launcher's `QT_QPA_PLATFORM=wayland-egl` is what this board needs; Qt's default wayland plugin cannot create a Vulkan instance |
 | A stream dies at the first presented frame with `buffer_fenced_release` | The VeriSilicon egl-wayland client rejects a swapchain image whose previous release fence is still unanswered. Patch `0014` makes the interface window's swap interval default to 2 vsyncs for exactly this; `OPENNOW_SWAP_INTERVAL=1` selects upstream's behaviour and reproduces the crash |
 | The picture is smooth but `flushFailed` is nearly `committed` | Fixed by patch `0027`. `wl_display_flush` returns the number of bytes it sent, so testing `== 0` read every present as a failure. On `r0.56` `flushFailed` stays at 0 for 31019 presents; if it moves again, read it as a real flush failure |
-| `Failed to import plane 0 as R8`, then the stream window closes | The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
+| `QFile::at: Cannot set file position N` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment` | Fixed in kind by patch `0030`. The interface decodes a cached artwork object through a `QFile` and its JPEG decoder restart-scans forward for the next segment, so the seek that failed asked for an offset the file does not have: the cached object is shorter than its image. `download()` stored that body as a finished object; `holds_whole_image` now refuses it (marker `truncated-image`). The stream keeps its rate through these warnings - they belong to the artwork, not to the video |
+| The picture stops and the streamer's last line is `server-terminated: The server ended the streaming session (0x80030007)` | Not an app-side end and not a layer's fix: the provider closed the session. `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` says the stream carried its frames up to that verdict, and the app answers with `qt-to-native id=qt-4 type=stop`, `engine-command end id=qt-4 type=stop success=true` and `session.ended: outcome=ok`, so nothing crashes and the last frame simply stays on screen. The answer is a new session, and `--auto-launch-ms=90000` presses Start for you |
+| `Failed to import plane 0 as R8`, then the stream window closes |
+ The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
 | `invalid arguments for zwp_linux_buffer_params_v1.add` after ~20 s | The compositor's 1024-descriptor limit. The surface reuses one `wl_buffer` per decoder buffer, so check whether the decoder's pool changed shape |
 | `dma alloc of size … failed` / `page allocation failure: order:10` in `dmesg` | The decoder needs CMA and a contiguous pool: `cma=512M` on the kernel command line, and headroom above ~756 MiB available |
 | Audio arrives but plays late | Not fixed yet. The wire is clean (0 dropped, 200 packets/s in) and OpenNOW's low-latency queue is what throws the stale packets — see the open items below |
@@ -717,6 +753,77 @@ Recorded here so the next reader does not mistake them for fixed:
 9. **These Oct-31 measurements ran at 1280x720 and the 1080p setting has to come back.** Every attempt on this boot died at decode with `Failed to create buffer of type 9: Cannot allocate memory (12)` because hantro refuses a contiguous 3657728-byte capture block while the boot's largest free DMA run is 2048 kB (open item 8), so `settings.json`'s `resolution` - the app's own `Exact stream size` setting, SettingsScreen.qml - was flipped from `1920x1080` to `1280x720` at 05:11: the same capture allocation is 1382400 B = a 512-page request, which fits. It is the same kind of runtime config on the board as the `launchInConsoleMode` flip of open item 7, not a layer change; the previous file is kept at `/home/weston/.config/OpenNOW/settings.json.resolution-1080.bak` and the restore after the measurement is `sed -i 's/"resolution": "1280x720"/"resolution": "1920x1080"/` against the live file (or copy the backup back). Everything on the table for r0.53/r0.54 below is at 1280x720: cheaper CPU copy, smaller hantro allocation, and if it survives at 720p it still has to be re-measured at 1080p on a boot whose capture pool is not starved. The setting is back at `1920x1080` and the r0.56 measurement above is that 1080p re-measurement: 535 s, p50 55.9 fps, no decode failures.
 10. **ESC against a live stream window and the 5-10 minute held stream are measured.** The press that closes this item is in `ab77-1-2.log`: 150 s into a driven 1080p window presenting at ~56 fps, `ydotool key 1:1 1:0` logged `wayland-video input: key 1 vk=0x1b mods=0x0 pressed=1` and then `pressed=0` (`key1-events=2 vk0x1b=2 pressed=1 released=1`), and the window kept presenting afterwards, so the key reached the game instead of being consumed by the app. The same run is the held stream: 535 s of picture, `committed=31019`, `dropped=0`, p50 55.9 fps, and `/proc/PID/fd` flat at 97-100 for the last 30k presents (the `ab71-1-1` press found the app already dead at `key1-events=0 vk0x1b=0`, and the r0.53 sessions never held past 17 s of picture because of the 1024-descriptor limit `0024` moved). What is still owed is the close side: ESC opens the game's menu rather than closing the stream window, so `opennow-interface-shown` still has to be produced by a session that ends through the window itself.
 
+11. **The interface dies by signal, not by exit, and there are two crash
+    classes.** `coredumpctl list` for the Nov-1 boot is unambiguous: seven
+    runs, seven crashes, zero clean exits - six `SIGABRT` and one `SIGSEGV`,
+    all of them `/usr/bin/opennow-qt`. What looks like "the app just closed"
+    is a process that died in the middle of the seat's own teardown.
+
+    (a) **`SIGABRT` in the vendor EGL-Wayland client.** Every one of those
+    logs ends with the same line:
+
+    ```
+    opennow-qt: api/gc_egl_wayland.c:2699: buffer_fenced_release:
+      Assertion `buffer->release_fence_fd == -1' failed.
+    ```
+
+    The interface window is the only window that reaches EGL - the stream
+    window goes through this series' own `wl_surface` plus `linux_dmabuf`
+    and never touches it - so the crash is never in the video path. The
+    vendor client asserts when it recycles a swapchain image whose previous
+    release fence was never answered, and patch `0019`'s `rootWindow->hide()`
+    is what leaves fences unanswered: hiding destroys the interface
+    window's `wl_surface` and its `wl_egl_window`, so weston never sends the
+    release for the buffers that were still in flight, and the swapchain
+    keeps images marked as pending. The poison then surfaces the next time
+    that EGL client runs, which is why the crash reads as a session end:
+    `ab81` asserted 33 ms and `ab82` 35 ms after `opennow-interface-shown`,
+    while `ab80` and `ab83` asserted about a session-end later, during the
+    seat's artwork reload (`Corrupt JPEG data: premature end of data
+    segment` and `QFile::at: Cannot set file position 180224` in both).
+    Every crashed run logged `opennow-interface-hidden`; the 535 s decisive
+    run that never left the streaming state had 0 asserts.
+
+    (b) **weston's protocol error, then `SIGSEGV`.** The run's own chain, in
+    `play-ab84.log`:
+
+    ```
+    09:03:26  wayland-video: dropping a frame (the frame could not be
+                exported as a DMA-BUF)                                x33
+    09:03:28  [destroyed object]: error 6: invalid offset 0 for plane 0
+    09:03:28  wayland-video: the compositor connection failed: Protocol error
+    09:03:28  opennow-interface-shown: the stream window is gone
+    09:03:33  SIGSEGV
+    ```
+
+    `error 6: invalid offset 0 for plane 0` is weston's own validation of a
+    `zwp_linux_buffer_params_v1_add`: it `fstat`s the plane's fd and rejects
+    a plane whose `offset + size` does not fit what it sees, so the fd that
+    request carried had already been closed when weston read it. That is the
+    same fd-number reuse `0011` wrote about - the decoder opens a fresh dma-buf
+    descriptor for every frame it exports, and this board's capture pool
+    churns the numbers at frame rate - and `0026` closing what no request
+    carried is what makes the window for it. `ab84` got there 370 s into play,
+    at `replay=164` and `nackRecovered=499`; `ab81` and `ab82` within 9-17 s
+    of the first frame, with `exportFail=59` and `exportFail=12`.
+
+    The two classes feed each other through the DMA pool. `CmaFree` read while
+    nothing was running went 287 MB (08:26) to 232 MB (08:29) to 126 MB
+    (09:08), and dmesg carries `cma_alloc: reserved: alloc failed, req-size:
+    893 pages, ret: -12` at 08:57:20 and 09:03:18 - 893 x 4096 is 3.5 MB, one
+    1080p NV12 set, which is what the surface asks for per buffer. So every
+    crash costs the pool about 55 MB, and after a few of them the next
+    session fails at (b) rather than at (a). Only a reboot returns the 512 MB
+    pool.
+
+    What a fix has to do about each: (a) keep the interface window's EGL
+    swapchain whole across the hide, or drop the hide - `0014`'s swap-interval
+    2 alone already keeps that window safe, and the same series measured the
+    stream at 58.6-60 fps with the interface painting; (b) make the surface
+    refuse an `add()` whose plane does not fit the fd it just `fstat`ed, which
+    is the check `bufferFor` already makes for the descriptor being alive and
+    has to make for the size as well.
+
 Caveats on the numbers above: single runs per phase, not an average of many
 sessions; `presents/s` is only available for sessions launched with
 `OPENNOW_LOG_PRESENT=1` and captured to a file; the board has no swap device and
@@ -742,3 +849,52 @@ decode failures and 0 dropped frames. What a reboot is still needed for is the
 ethernet PHY the board leaves un-armed, not this decoder state, and it is why a
 full r0.47 measurement - present rate, `queue-dropped`, the memory tally and the
 thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on a fresh boot: its first launch died at the first keyframe with `[V4L2RequestContext] Failed to allocate request for OUTPUT buffer 0: Inappropriate ioctl for device (25)`, then `Failed setup for format drm_prime`, a `closedir` panic and the vendor `buffer_fenced_release` assert, and the retry 85 s later streamed 535 s at p50 55.9 fps with no decode error at all. The retry in `measure73.sh` is therefore load-bearing, and a first attempt that dies this way says nothing about the build.
+
+    The Nov-1 boot answers the pair, and `r0.57` is the release that carries it:
+    `0028` refuses a dma-buf whose planes do not fit the descriptor weston just
+    `fstat`-ed (the `(b)` family, `[destroyed object]: error 6/7` → `the
+    compositor connection failed: Protocol error` → SIGSEGV) without closing the
+    descriptor a refusal must keep, and `0029` reverts `0019`'s `hide()` - Qt
+    6.8's `setVisible(false)` already reaches `reset()` → `invalidateSurface()`,
+    so the hide only added the unanswered fences the vendor `(a)` assert then
+    trips. The driven `r0.57` session carried neither class for ~9 minutes
+    (crash-class counters 0, `dropped=0`, p50 43.6 fps), and the first manual
+    session on a fresh boot with a whole pool ended at the provider's own
+    verdict and survived it: `server-terminated (0x80030007)` after 805 s of
+    picture with 47803 video and 160359 audio packets in and `dropped=5`, and
+    0 of either class in the run.
+
+12. **The `QFile` warning and the corrupt JPEG are the artwork cache's half-image,
+    and `0030` answers it.** The terminal of this boot's runs carries a warning
+    none of the diagnostics logs has, because Qt writes it to stderr:
+
+    ```
+    qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment
+    QFile::at: Cannot set file position 49152
+    QFile::at: Cannot set file position 163840
+    QFile::at: Cannot set file position 327680
+    ```
+
+    `c53` logged that pair seven times inside one second (17:28:00.150..17:28:01.094)
+    while the stream around it presented at 53.0 fps, and the offsets it asked for -
+    16384, 49152, 163840, 212992, 272261, 327680 - sit inside the artwork objects
+    `/home/weston/.config/OpenNOW/artwork-cache/v1/objects` holds now (385157 and
+    241834 bytes). The interface decodes a cached object through a `QFile` and the
+    JPEG decoder restart-scans forward for its next segment, so every seek that
+    failed asked for an offset past the end of the file: the object on disk is
+    shorter than the image it was stored for. `download()` in
+    `native/opennow-core/src/artwork_cache.rs` never compares the body it wrote
+    against a complete image - it rejects only an object *over*
+    `max_object_bytes` - so a body that ended early became a cache object and the
+    interface decoded a half-image. The event is not the stream's own: `c53` kept
+    its rate through all seven warnings, and the freeze behind them at
+    `rx-stats elapsed=600.4s` is that harness's 600 s stop. `0030` (built as
+    `r0.58`) refuses the half-image with `holds_whole_image`, the same path
+    `too-large` already takes leaves the entry for a later attempt, so only whole
+    images reach the interface. What is still owed: its marker `truncated-image`
+    has no measured hit yet, so the next manual session has to say whether the
+    warnings go with the guard, and the two queued patches are still open -
+    `setWindowHasContents(Never)` while the stream window is mapped (the ~12 fps
+    `0029` costs, p50 43.6 against `r0.56`'s 55.9) and refusing `::close` of the
+    number `wl_display_get_fd(m_display)` reports, the last remaining source of
+    `Bad file descriptor` in the old close sites.

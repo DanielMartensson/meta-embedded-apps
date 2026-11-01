@@ -1,0 +1,123 @@
+From 79a8338913988f6c66130cefdd915394ea582461 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Sun, 1 Nov 2026 14:26:44 +0100
+Subject: [PATCH 28/29] reject a dma-buf whose planes do not fit the descriptor
+ it just fstat-ed
+
+Three of this boot's runs end the stream window from inside the handoff:
+
+  09:03:26  wayland-video: dropping a frame (the frame could not be
+              exported as a DMA-BUF)                            x33
+  09:03:28  [destroyed object]: error 6: invalid offset 0 for plane 0
+  09:03:28  wayland-video: the compositor connection failed: Protocol error
+
+`error 6: invalid offset 0 for plane 0` is weston's own validation of a
+`zwp_linux_buffer_params_v1_add`: it reads the size of the plane's fd
+itself and rejects a plane whose `offset + stride * height` does not fit
+what it sees, so the descriptor that request carried had already been
+closed or had been taken back for something else by the time weston read
+it. That is the fd-number churn `0011` is about - the decoder opens a
+fresh dma-buf descriptor for every frame it exports, and this board's
+capture pool recycles the numbers at frame rate - and it is `0026`
+closing what no request carried that opens the window for it. `ab84` got
+there 370 s into play at `replay=164`, `ab81` and `ab82` within 9-17 s
+of the first frame, and a protocol error on this connection costs the
+rest of the session: the app then dies in the teardown.
+
+`bufferFor` asks the descriptor with `fstat` and stops when the answer
+fails, but it never looks at the answer: a descriptor that fstats but
+covers less than the frame's planes still gets sent, and that is the
+request weston refuses. Check the extent of each plane against the size
+the descriptor reports, and refuse the frame when it does not fit.
+present() then closes the descriptor and the frame is dropped as one
+missed present, which is the cost a dead export should have; the
+connection keeps its buffers.
+
+Greppable markers: opennow-diag, opennow-dmabuf-rejected
+---
+ .../rendering/WaylandVideoSurface.cpp         | 69 +++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+index be1f910..87e2659 100644
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -1041,6 +1041,75 @@ wl_buffer *WaylandVideoSurface::bufferFor(const Frame &frame, bool *queued)
+     const quint64 inode = quint64(info.st_ino);
+     const quint32 planeCount = std::min<quint32>(frame.planeCount, 2);
+ 
++    // The size the descriptor answers is the only thing that can say whether
++    // this frame's planes are still there. weston reads it itself when the
++    // add() arrives and rejects a plane whose extent does not fit it:
++    //
++    //   [destroyed object]: error 6: invalid offset 0 for plane 0
++    //   wayland-video: the compositor connection failed: Protocol error
++    //
++    // and a protocol error on this connection ends the stream window, so a
++    // descriptor whose number the decoder took back for something else - the
++    // churn 0011 wrote about - costs the rest of the session if it is still
++    // sent. A plane whose stride is zero does not describe a picture either.
++    // Refusing the frame is what keeps the connection: present() closes the
++    // descriptor and the frame is dropped as one missed present.
++    const quint64 bytes = quint64(info.st_size);
++    // A chroma plane is not as tall as the picture: NV12 on this board is one
++    // Y plane plus one interleaved VU plane, and that plane carries height/2
++    // rows of double-width samples, which is why its stride answers the full
++    // width. The measured frame says so: the descriptor covers 3657728 bytes,
++    // offsets[1] is 2088960 (the pool's aligned Y plane, stride 1920 x 1088
++    // lines), and 2088960 + 1920 x 540 = 3125760 fits it, so a check that
++    // takes the picture's height for every plane refuses every frame of a
++    // healthy stream. Halve the height of every plane past the first, which is
++    // what the 4:2 subsampled layouts this board's decoder answers are.
++    const quint32 lastPlane = planeCount > 0 ? planeCount - 1 : 0;
++    bool planesFit = bytes > 0 && planeCount > 0;
++    for (quint32 plane = 0; plane < planeCount && planesFit; ++plane) {
++        const quint64 planeHeight = plane == 0 ? quint64(frame.size.height())
++                                               : (quint64(frame.size.height()) + 1) / 2;
++        const quint64 extent = quint64(frame.offsets[plane])
++                             + quint64(frame.strides[plane]) * planeHeight;
++        planesFit = frame.strides[plane] > 0 && extent <= bytes;
++    }
++    if (!planesFit) {
++        static int rejected = 0; // the surface posts frames from one thread
++        ++rejected;
++        if (rejected == 1 || rejected % 256 == 0)
++            qInfo("opennow-diag: dmabuf-rejected: fd %d covers %llu bytes, the planes need "
++                  "%llu/%llu at stride %u/%u height %d/%d, %d of them so far; not sending the add",
++                  frame.fd,
++                  static_cast<unsigned long long>(bytes),
++                  static_cast<unsigned long long>(quint64(frame.offsets[0])
++                        + quint64(frame.strides[0]) * quint64(frame.size.height())),
++                  static_cast<unsigned long long>(quint64(frame.offsets[lastPlane])
++                        + quint64(frame.strides[lastPlane])
++                        * (lastPlane == 0 ? quint64(frame.size.height())
++                                          : (quint64(frame.size.height()) + 1) / 2)),
++                  frame.strides[0], frame.strides[1], frame.size.height(),
++                  (frame.size.height() + 1) / 2, rejected);
++        // The descriptor is not ours to close: the size the descriptor answers
++        // says the planes are not there, so the number has already been taken
++        // by something else, and closing it revokes that something. In this
++        // release's first attempt the refused fd 97 covered 0 bytes, which is
++        // what a socket answers, and the close was the next line the log has:
++        //
++        //   present record frame failed: ... failed to map DMA-BUF for the
++        //     CPU copy: Bad file descriptor (os error 9)      x338
++        //   The Wayland connection experienced a fatal error: Bad file
++        //     descriptor
++        //
++        // i.e. the number had been recycled by the compositor connection
++        // itself, and its close ended the stream at 57 s and cost 338 of the
++        // streamer's exports. So answer like the frame whose wl_buffer is
++        // already cached: no request carried the descriptor and the surface
++        // still does not own it, which leaves the streamer's own close of the
++        // picture in charge of the number.
++        if (queued) *queued = true;
++        return nullptr;
++    }
++
+     for (CachedBuffer &cached : m_buffers) {
+         if (cached.device != device || cached.inode != inode) continue;
+         if (cached.size != frame.size || cached.format != frame.format
+-- 
+2.43.0
+
