@@ -1,0 +1,82 @@
+From 3f2c1de90a4b6c7d8e9f0a1b2c3d4e5f60718293 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Mon, 2 Nov 2026 09:05:00 +0100
+Subject: [PATCH] 0031 close the stream window when the server ends the
+ session
+
+The window that stays on the screen after the server ends a session is
+still mapped: the end makes the next frames unusable and stops the media
+transport, but the stream window is never unmapped, so the compositor
+keeps presenting the DMA-BUF of the last frame forever. Measured over
+this boot: after every verdict the pull clock keeps counting (opennow-present
+cost: pulls=626 presented=0 noframe=626 five seconds apart) and the
+marker of the teardown, wayland-video: stream window closed, appears in none
+of the seven runs. The runtime already answers the core's event
+type=status status=stopped by dropping the session and invalidating the
+presentation, and that answer is a signal, so follow it and call the
+surface's own dismiss(), which commits one unmapped frame (the form that
+answers the pending release fences) and destroys the window. That
+teardown path was measured once before this patch, through the development
+aid: the app stayed alive, no crash class appeared, and about 30 MB of the
+DMA pool came back. With the window gone the interface underneath is what
+the screen comes back to, which is the state 0029 leaves it in, and a
+session started in the same run puts the pull clock back.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+index 41c0de7..9b7e2a4 100644
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -510,16 +510,49 @@
+                 // the window has to re-open the path when that happens.
+                 QObject::connect(runtime, &NativeStreamRuntime::inputAllowedChanged, surface,
+                                  [surface] { surface->refreshCaptureState(); },
+                                  Qt::QueuedConnection);
+                 QMetaObject::invokeMethod(surface, [surface, this] {
+                     surface->setInputHooks(videoInputHooks());
+                     surface->setFramePuller([this] { pullWaylandFrame(); });
+                 }, Qt::QueuedConnection);
++                // A session the server ends leaves the stream window on the screen
++                // with its last picture still mapped: the core answers with
++                // native-to-qt type=status status=stopped and the runtime's own
++                // response drops the session and invalidates the presentation,
++                // which makes frames unusable but never asks the window to go
++                // away, so the pull clock keeps running against nothing (the
++                // measured runs of r0.57/r0.58 say opennow-present cost: pulls=626
++                // presented=0 noframe=626 in the five seconds after an end, and
++                // wayland-video: stream window closed appeared in none of them)
++                // and the compositor keeps presenting one DMA-BUF forever.
++                // The runtime's answer is a signal, so follow it: closing is
++                // dismiss(), which commits one unmapped frame first, the form
++                // that answers the pending release fences, and then destroys
++                // the window. That teardown was measured once through the
++                // development aid: the app stayed alive, no class appeared, and
++                // about 30 MB of the DMA pool came back. Installing the pull
++                // clock is a one-time act in this run, so a session started
++                // afterwards puts it back.
++                QObject::connect(runtime, &NativeStreamRuntime::streamingChanged, surface,
++                                 [surface, runtime, this] {
++                                     if (runtime->streaming()) {
++                                         if (surface->hasFramePuller()) return;
++                                         surface->setFramePuller([this] { pullWaylandFrame(); });
++                                         return;
++                                     }
++                                     // A second stop (the user closed the window
++                                     // and the shell then asked the core to stop)
++                                     // finds no window left and does nothing.
++                                     if (!surface->isMapped()) return;
++                                     qInfo("opennow-server-end-closes-window: the server ended the session; unmapping the stream window");
++                                     surface->setFramePuller({});
++                                     surface->dismiss();
++                                 }, Qt::QueuedConnection);
+             }
+             return;
+         }
+ #endif
+         if (m_resetFrameGeneration) {
+             resetFrameGeneration();
+             m_resetFrameGeneration = false;
+         }
+-- 
+2.43.0

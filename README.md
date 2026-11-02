@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 30, `recipes-apps/opennow/files/0001`…`0030` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.58` |
+| Patches applied | 31, `recipes-apps/opennow/files/0001`…`0031` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.59` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -560,6 +560,36 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
 
+#### The r0.59 stream-window close on the server's end (Nov 2, board `weston@192.168.1.33`)
+
+What an end the provider sends leaves behind is a window that is still mapped.
+`server-terminated: The server ended the streaming session (0x80030007)` and the
+`native-to-qt type=status status=stopped` that follows it make the runtime drop
+the session (`streamSessionActive = false`, `setStreaming(false)`) and invalidate
+the presentation, which decides that the *next* frames are unusable - it never
+asks the stream window to go away. So the pull clock keeps running against nothing
+and weston keeps presenting the one DMA-BUF the surface last committed: measured
+across `ab91`…`ab97`, the teardown marker `wayland-video: stream window closed`
+appears **0** times in all seven run logs, and the pull counter keeps going after
+every verdict (`opennow-present cost: pulls=626 presented=0 stale=0 noframe=626`
+in the five seconds after `ab95`'s end). `0031` follows the runtime's own answer
+instead: `streamingChanged` with `streaming()` false, and calls the surface's
+`dismiss()`, which commits one unmapped frame - the form that answers the pending
+release fences - and destroys the window. It is deferred through
+`QMetaObject::invokeMethod(surface, ..., Qt::QueuedConnection)`, the idiom the two
+places that close the window already use, because the surface must not be
+destroyed inside its own event dispatch. The teardown itself was measured **before**
+the patch, through the development aid (`touch /tmp/opennow-close`; the aid is
+compiled in, its path just is not greppable because `QStringLiteral` keeps it as
+UTF-16), so `0031` only had to reach a path whose cost was already known. With the
+window gone the interface underneath is what the screen comes back to - `0029` left
+it visible for exactly that.
+
+| Counter | Value |
+| --- | --- |
+| the teardown, measured before the patch (`ab97`, PID 49599) | `wayland-video: stream window closed` 1 at 2026-11-02T08:36:37.524 after the aid's trigger, app alive immediately after (`pidof opennow-qt` still 49599), 0 of every crash class, 0 coredumps, `CmaFree` 9568 kB before the close → 22180 kB just after → 40172 kB a minute later, so a close hands part of the capture pool back |
+| the frozen window, measured before the patch | `wayland-video: stream window closed` **0** in the seven run logs of `ab91`…`ab97`; after an end the surface is still mapped and the pull keeps counting, `pulls=626 presented=0 stale=0 noframe=626` five seconds apart |
+
 #### The r0.57 crash-class pair and the r0.58 artwork guard (Nov 1, board `weston@192.168.1.33`)
 
 The house lost voltage and both addresses moved with the reboot that followed it:
@@ -653,7 +683,8 @@ for audio output.
 | A stream dies at the first presented frame with `buffer_fenced_release` | The VeriSilicon egl-wayland client rejects a swapchain image whose previous release fence is still unanswered. Patch `0014` makes the interface window's swap interval default to 2 vsyncs for exactly this; `OPENNOW_SWAP_INTERVAL=1` selects upstream's behaviour and reproduces the crash |
 | The picture is smooth but `flushFailed` is nearly `committed` | Fixed by patch `0027`. `wl_display_flush` returns the number of bytes it sent, so testing `== 0` read every present as a failure. On `r0.56` `flushFailed` stays at 0 for 31019 presents; if it moves again, read it as a real flush failure |
 | `QFile::at: Cannot set file position N` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment` | Cosmetic, artwork only, and no layer fix is needed: the stream keeps its rate through them (2 pairs at 20:57:17.379 and 20:57:19.151 inside an `r0.58` session still streaming at p50 37.7 fps with `flushFailed=0`; 7 pairs inside one second in `c53` at 53.0 fps). The positions are Qt's own JPEG-plugin blocks past the end of a **whole** file - `180224 = 44 x 4096`, `147456 = 36 x 4096`, and `src/plugins/imageformats/jpeg/qjpeghandler.cpp` reads the device in `max_buf = 4096` blocks - so libjpeg's entropy stream reached EOF before its own EOI (that is the notice), `resync_to_restart = jpeg_resync_to_restart` asked the `QFile` for the next restart marker, the block-boundary seek landed past EOF, `QFile` refused it and warned, and the plugin installed its fake EOI and finished the decode. The objects there are baseline JPEGs ending `FF D9` (145090 and 175462 bytes) with `index.json` sizes matching disk, so there is no short object and nothing to avoid. The file the interface cannot open at all prints `Cannot open: <url>` instead, which the app already avoids through the empty `resolvedUrl` in `ArtworkSource.qml`; this boot logged 0 of those |
-| The picture stops and the streamer's last line is `server-terminated: The server ended the streaming session (0x80030007)` | Not an app-side end and not a layer's fix: the provider closed the session. `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` says the stream carried its frames up to that verdict, and the app answers with `qt-to-native id=qt-4 type=stop`, `engine-command end id=qt-4 type=stop success=true` and `session.ended: outcome=ok`, so nothing crashes and the last frame simply stays on screen. The answer is a new session, and `--auto-launch-ms=90000` presses Start for you |
+| The picture stops and the streamer's last line is `server-terminated: The server ended the streaming session (0x80030007)` | Not an app-side end and not a layer's fix: the provider closed the session. `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` says the stream carried its frames up to that verdict, and the app answers with `qt-to-native id=qt-4 type=stop`, `engine-command end id=qt-4 type=stop success=true` and `session.ended: outcome=ok`, so nothing crashes and the window used to stay on screen with the last frame; `0031` now closes it, see the row below. The answer is a new session, and `--auto-launch-ms=150000` presses Start for you |
+| The stream window stays on screen with a frozen picture after `server-terminated` | Fixed by patch `0031` (built as `r0.59`): the end answers with `native-to-qt type=status status=stopped`, so the app follows that answer and unmaps the window. Both sides are greppable - `opennow-server-end-closes-window: the server ended the session; unmapping the stream window` and the surface's own `wayland-video: stream window closed` - and the interface, which `0029` leaves painting underneath, is what the screen comes back to |
 | `Failed to import plane 0 as R8`, then the stream window closes |
  The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
 | `invalid arguments for zwp_linux_buffer_params_v1.add` after ~20 s | The compositor's 1024-descriptor limit. The surface reuses one `wl_buffer` per decoder buffer, so check whether the decoder's pool changed shape |
