@@ -1,0 +1,150 @@
+From 5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Tue, 3 Nov 2026 11:30:00 +0000
+Subject: [PATCH] 0033 hold the enter the clock answers with, so the host reads it
+
+The clock 0032 arms answers the pop-up, and the pop-up stays up. Measured over
+the two fresh r0.60 sessions of this boot (play-dstny6.log PID 17149,
+play-dstny7.log PID 22016, board weston@192.168.1.33): the window armed the
+clock at its own live marker - `wayland-video: stream window created` and
+`wayland-video input: opening enter clock armed: 30000 ms then 11 more at 5s`
+in the same millisecond at 11:13:43.187 - and answered 12 times 5.00-5.01 s
+apart between 11:14:13.188 and 11:15:08.199, `wayland-video input: opening
+enter answered (11 left)` down to `(0 left)`, beside a picture that held
+`wayland-video fps=54.1 committed=8177 dropped=0 flushFailed=0` and 0 of the
+DMA-BUF export class. The game did not start: the cloud session still sat at
+Steam's notice 38 s later, when the player pressed Enter at the board and the
+window logged `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` at
+11:15:46.301 with `pressed=0` at .333 - 32 ms of key held down - and Destiny 2
+went on. The two answers reach the host the same way (the window's own calls
+are the calls `submitKey` makes, and the NVST codec forwards a keyboard packet
+as a down and an up message with a timestamp, nothing else) and they differ in
+one measured thing: the clock's press went down and came back up inside the
+same microsecond, since 0032's answer calls the release right after the press,
+while the finger's Enter stayed down for 32 ms. The host reads key state, so a
+press that is already up when it samples is a press it never saw. 0033 makes
+the answer a hold on the same clock: the press goes out on one round and the
+release follows on the next round, whose interval is the hold
+(OPENNOW_POPUP_ENTER_HOLD_MS, 120 ms when unset), while the follow-up answers
+keep their 5 s spacing. The teardown releases a press the clock was still
+holding, so a session that ended does not leave Enter down in the game.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ srcrev/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h	2026-11-03 12:28:59.541287335 +0100
+@@ -238,6 +238,7 @@
+     bool m_f11Down = false;
+     QTimer *m_enterTimer = nullptr;
+     int m_enterLeft = 0;
++    int m_enterHeldMs = 0;
+     quint32 m_xkbModifiers = 0;
+     bool m_pointerInside = false;
+ 
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ srcrev/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp	2026-11-03 12:32:09.502799367 +0100
+@@ -523,9 +523,12 @@
+ // and a session started while the board sits empty has nobody to press one, so
+ // the window answers with an Enter of its own. OPENNOW_POPUP_ENTER_MS says how
+ // long after the window became live the first press goes out; unset arms nothing.
+-// OPENNOW_POPUP_ENTER_TIMES (4 when unset) repeats the press, and the press
+-// travels the streamer's own key API, so it does not need the compositor to
+-// hand the window the keyboard: it is the same Enter a physical key makes.
++// OPENNOW_POPUP_ENTER_TIMES (4 when unset) repeats the press, and each press
++// stays down for OPENNOW_POPUP_ENTER_HOLD_MS (120 ms when unset) because a press
++// that comes back up in the same instant it went down is one the host never
++// reads. The press travels the streamer's own key API, so it does not need the
++// compositor to hand the window the keyboard: it is the same Enter a physical
++// key makes.
+ void WaylandVideoSurface::armOpeningEnterClock()
+ {
+     static const int armMs = [] {
+@@ -538,6 +541,7 @@
+     }();
+     if (armMs <= 0) return;
+     m_enterLeft = times;
++    m_enterHeldMs = 0;
+     if (!m_enterTimer) {
+         m_enterTimer = new QTimer(this);
+         m_enterTimer->setTimerType(Qt::PreciseTimer);
+@@ -555,27 +559,55 @@
+ 
+ void WaylandVideoSurface::answerOpeningEnter()
+ {
+-    if (m_enterLeft <= 0) {
++    // What answers the pop-up has to be a press the cloud host can read, and a
++    // press has to stay down long enough to be read at all. A tap is not: the
++    // r0.60 run armed this clock and answered 12 times, 5.00-5.01 s apart,
++    // through the very hooks a player's own Enter uses, and the notice Steam
++    // puts in front of Destiny 2 stayed up; the same Enter pressed by a finger
++    // on this board held for 32 ms (wayland-video input: key 28 vk=0xd pressed=1
++    // at 11:15:46.301 and pressed=0 at .333) and closed it. So the clock presses
++    // on one round and releases on the next, which makes the hold the release's
++    // own interval. OPENNOW_POPUP_ENTER_HOLD_MS (120 ms when unset) says how long
++    // that press stays down.
++    static const int holdMs = [] {
++        const int parsed = qgetenv("OPENNOW_POPUP_ENTER_HOLD_MS").toInt();
++        return parsed > 0 ? parsed : 120;
++    }();
++    if (m_enterLeft <= 0 && m_enterHeldMs <= 0) {
+         if (m_enterTimer) m_enterTimer->stop();
+         return;
+     }
++    if (m_enterHeldMs > 0) {
++        // The press is still down: answer with the release and put the clock back
++        // on the 5 s spacing the follow-up answers keep.
++        const int held = m_enterHeldMs;
++        m_enterHeldMs = 0;
++        if (m_input.key) m_input.key(0x0d, 0, false);
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++            qInfo("wayland-video input: opening enter held for %d ms and released", held);
++        if (!m_enterTimer) return;
++        if (m_enterLeft <= 0) {
++            m_enterTimer->stop();
++            return;
++        }
++        m_enterTimer->setInterval(5'000);
++        m_enterTimer->start();
++        return;
++    }
+     // Until the streamer is attached there is no key API to answer through, and
+     // the clock keeps its spacing rather than burning a press on nothing.
+     if (m_input.key) {
+         --m_enterLeft;
+-        // Enter is VK_RETURN; a tap sends the press and the release together.
++        // Enter is VK_RETURN; the press goes out now and the release follows on
++        // the next round, holdMs later.
+         m_input.key(0x0d, 0, true);
+-        m_input.key(0x0d, 0, false);
++        m_enterHeldMs = holdMs;
+         qInfo("wayland-video input: opening enter answered (%d left)", m_enterLeft);
+     }
+     if (!m_enterTimer) return;
+     m_enterTimer->stop();
+-    if (m_enterLeft > 0) {
+-        // The round that just fired was the arming distance, so the clock is
+-        // retimed for the answers that follow and started again from the top.
+-        m_enterTimer->setInterval(5'000);
+-        m_enterTimer->start();
+-    }
++    m_enterTimer->setInterval(m_enterHeldMs > 0 ? holdMs : 5'000);
++    m_enterTimer->start();
+ }
+ 
+ void WaylandVideoSurface::releaseHeldKeys()
+@@ -952,6 +984,9 @@
+     releaseHeldKeys();
+     // A stream that ended has no pop-up left to answer, and a clock that keeps
+     // running would press Enter into whatever the next screen shows.
++    if (m_enterHeldMs > 0 && m_input.key)
++        m_input.key(0x0d, 0, false);
++    m_enterHeldMs = 0;
+     if (m_enterTimer) {
+         m_enterTimer->stop();
+         m_enterLeft = 0;
+

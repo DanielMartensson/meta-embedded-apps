@@ -1,0 +1,212 @@
+From 6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f9 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Tue, 3 Nov 2026 17:10:00 +0000
+Subject: [PATCH] 0034 give the stream window its pointer before the first mouse
+ event, and make a click carry its position
+
+The stream window forwards pointer and keyboard events to the host through the
+streamer's own key/button/absolute APIs, and the player still could not click
+Steam's notice on the first screen of Destiny 2. Two measured holes sit on that
+path.
+
+The seat does not always advertise its pointer when the stream window binds it.
+Run 9 (`play-dstny9.log`, PID 44011) created the window at 16:43:56.312 and only
+logged `wayland-video input: the seat now has a pointer` at 16:44:03.843, with
+the first position at 16:44:03.859: 7.5 s in which the window had no pointer at
+all. Run 10 (`play-dstny10.log`, PID 48992) had the capability 2 ms before the
+window instead (17:01:16.009 vs 17:01:16.011), so the gap is not a constant of
+the board, it is a race with the first mouse event. Weston's seat_get_pointer
+answers from the seat's pointer_state, so a seat that has ever had a pointer
+hands out a real wl_pointer even before the capability event says so; the window
+now asks for it as soon as the seat is bound, and the capability event replaces
+that object only when it was created before the seat had a pointer (an inert
+object, which weston does not bind retroactively). The relative pointer and the
+pointer lock still wait for the capability, because creating them on an inert
+pointer dereferences the NULL weston_pointer and ends the session.
+
+A click is a position and a transition, but only the transition was sent. The
+streamer clears its captured-input queue on every poll until the host's input
+channel reports ready (native streamer: `native-to-qt type=input-ready
+protocolVersion=3`, 1793724235908 ms in run 9), so a motion that arrived before
+that point is dropped and the button that follows lands wherever the host's
+cursor was. handlePointerButton now sends the last position the compositor
+reported immediately before the button, so the click carries the point the
+player aimed at. Both paths are greppable with OPENNOW_LOG_INPUT:
+`wayland-video input: streamer capture requested=%d inputAllowed=%d` records the
+streamer's own gate, and `wayland-video input: button %u submit refused
+status=%d` records a refused submit instead of swallowing it.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -221,6 +221,10 @@
+     quint32 m_seatCapabilities = 0;
+     wl_keyboard *m_keyboard = nullptr;
+     wl_pointer *m_pointer = nullptr;
++    // Whether the pointer was asked for before the seat advertised it. Such an
++    // object is inert if the seat has never had a pointer, and weston does not
++    // bind it retroactively, so the capability event replaces it.
++    bool m_pointerBeforeCapability = false;
+     zwp_pointer_constraints_v1 *m_pointerConstraints = nullptr;
+     zwp_relative_pointer_manager_v1 *m_relativePointerManager = nullptr;
+     zwp_relative_pointer_v1 *m_relativePointer = nullptr;
+@@ -231,6 +235,11 @@
+     bool m_captureActive = false;
+     void setCaptureActive(bool active);
+     double m_relativeRest[2] = {0.0, 0.0};
++    // The last position the compositor reported for the pointer, in surface
++    // units. A button transition carries it so the host aims where the click
++    // happened even if the motion that got there was dropped.
++    double m_lastPointerX = 0.0;
++    double m_lastPointerY = 0.0;
+     FramePuller m_puller;
+     QTimer *m_pullTimer = nullptr;
+     QSize m_videoSize;
+
+diff --git a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -126,6 +126,10 @@
+             return listener;
+         }();
+         wl_seat_add_listener(self->m_seat, &seatListener, self);
++        // The seat may not advertise its pointer until the first mouse event;
++        // ask for it now so a click that comes before any motion is forwarded
++        // (see ensureSeatInput).
++        self->ensureSeatInput();
+     } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+         self->m_dmabuf = static_cast<zwp_linux_dmabuf_v1 *>(
+             wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface,
+@@ -177,8 +181,18 @@
+         self->m_lockActive = false;
+         self->m_capturePointer = false;
+     }
+-    if (hasPointer && !hadPointer && qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
+-        qInfo("wayland-video input: the seat now has a pointer");
++    if (hasPointer && !hadPointer) {
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++            qInfo("wayland-video input: the seat now has a pointer");
++        // The pointer asked for at bind is inert when the seat had no pointer
++        // yet, and weston does not bind that object retroactively. Drop it so
++        // the ask below gets a real one.
++        if (self->m_pointer && self->m_pointerBeforeCapability) {
++            wl_pointer_release(self->m_pointer);
++            self->m_pointer = nullptr;
++            self->m_pointerBeforeCapability = false;
++        }
++    }
+     self->ensureSeatInput();
+     self->updatePointerConstraint();
+ }
+@@ -344,6 +358,12 @@
+     default: return;
+     }
+     const bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
++    // A click is a position and a transition. The streamer clears its input
++    // queue until the host's input channel is ready, so a motion that was
++    // dropped would leave the host aiming at the old position; send the one
++    // the compositor last reported immediately before the transition.
++    if (!self->m_lockActive && self->m_input.absolute && self->m_pointerInside)
++        self->submitPointer(self->m_lastPointerX, self->m_lastPointerY);
+     self->m_input.button(wire, pressed);
+     if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
+         qInfo("wayland-video input: button %u pressed=%d", wire, pressed);
+@@ -476,6 +496,8 @@
+ 
+ void WaylandVideoSurface::submitPointer(double x, double y)
+ {
++    m_lastPointerX = x;
++    m_lastPointerY = y;
+     // A locked pointer carries no position worth sending; its movement goes
+     // through submitRelative instead.
+     if (m_lockActive) return;
+@@ -925,9 +947,9 @@
+     // data is NULL. Asking the compositor for a relative pointer on that inert
+     // object makes it dereference the NULL weston_pointer and take the whole
+     // session down, so nothing that hangs off the pointer is created until the
+-    // seat says it has one. The capability arrives with the first mouse event,
+-    // so a game started before the mouse ever moved still gets its pointer,
+-    // just a little later.
++    // seat says it has one. The pointer object itself is asked for at bind (see
++    // below), because a click can arrive before the first motion; only the
++    // relative pointer waits for the capability.
+     if ((m_seatCapabilities & WL_SEAT_CAPABILITY_KEYBOARD) && !m_keyboard) {
+         m_keyboard = wl_seat_get_keyboard(m_seat);
+         // Every callback has to be present: libwayland stops demarshalling the
+@@ -945,8 +967,18 @@
+         }();
+         wl_keyboard_add_listener(m_keyboard, &keyboardListener, this);
+     }
+-    if ((m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER) && !m_pointer) {
++    if (m_seat && !m_pointer) {
++        // Ask for the pointer as soon as the seat is bound, not when the
++        // capability says so. Weston's seat_get_pointer uses the seat's
++        // pointer_state directly, so a seat that has ever had a pointer hands
++        // out a real object even before the capability event - and this board
++        // only advertises the pointer with the first mouse event, which left
++        // run 9's window without one for its first 7.5 s (window created
++        // 16:43:56.312, "the seat now has a pointer" 16:44:03.843). A seat
++        // that never had a pointer hands out an inert object that simply sends
++        // nothing; the capability event replaces it then.
+         m_pointer = wl_seat_get_pointer(m_seat);
++        m_pointerBeforeCapability = (m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER) == 0;
+         static const wl_pointer_listener pointerListener = [] {
+             wl_pointer_listener listener{};
+             listener.enter = handlePointerEnter;
+@@ -962,7 +994,8 @@
+         }();
+         wl_pointer_add_listener(m_pointer, &pointerListener, this);
+     }
+-    if (m_pointer && !m_relativePointer && m_relativePointerManager) {
++    if (m_pointer && !m_relativePointer && m_relativePointerManager
++        && (m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER)) {
+         // Raw movement is a different stream from the position: a game that
+         // looks with the mouse needs the deltas, and they keep coming while
+         // the pointer itself is locked in place.
+
+diff --git a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+--- a/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
++++ b/opennow-qt/src/streaming/rendering/NativeStreamRenderCallback.cpp
+@@ -56,7 +56,10 @@
+ 
+ void submitVideoInputButton(quint8 button, bool pressed)
+ {
+-    if (videoInputRuntime) videoInputRuntime->submitMouseButton(button, pressed);
++    if (!videoInputRuntime) return;
++    const auto status = videoInputRuntime->submitMouseButton(button, pressed);
++    if (status != OPENNOW_STREAMER_OK && qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: button %u submit refused status=%d", button, int(status));
+ }
+ 
+ void submitVideoInputWheel(qint16 deltaY)
+@@ -66,7 +69,11 @@
+ 
+ void submitVideoInputKey(quint16 virtualKey, quint16 modifiers, bool pressed)
+ {
+-    if (videoInputRuntime) videoInputRuntime->submitKey(virtualKey, modifiers, pressed);
++    if (!videoInputRuntime) return;
++    const auto status = videoInputRuntime->submitKey(virtualKey, modifiers, pressed);
++    if (status != OPENNOW_STREAMER_OK && qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: key vk=0x%x submit refused status=%d", virtualKey,
++              int(status));
+ }
+ 
+ void setVideoInputCapture(bool active, bool relative)
+@@ -75,9 +82,12 @@
+     // The streamer discards every event until it has been told that the user is
+     // playing in a window the embedder feeds, and it refuses input until the
+     // host has authorized the session. Both gates are opened here.
++    const bool allowed = videoInputRuntime->inputAllowed();
++    if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++        qInfo("wayland-video input: streamer capture requested=%d inputAllowed=%d", active,
++              allowed);
+     bool rawInput = false;
+-    videoInputRuntime->setCaptureActive(active && videoInputRuntime->inputAllowed(),
+-                                        relative, 0, &rawInput);
++    videoInputRuntime->setCaptureActive(active && allowed, relative, 0, &rawInput);
+ }
+ 
+ WaylandVideoSurface::InputHooks videoInputHooks()
+

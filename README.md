@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 31, `recipes-apps/opennow/files/0001`…`0031` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.59` |
+| Patches applied | 36, `recipes-apps/opennow/files/0001`…`0036` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.63` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -584,6 +584,177 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
 
+#### The r0.63 screenshot clock and the compositor's own descriptor (Nov 3, board `weston@192.168.1.33`)
+
+Two things the player reported - "I can see the pointer in Steam but I cannot
+move it", and a click that does nothing - are both about what the screen shows,
+and this series has no way to look at the screen: the counters say what the app
+sent, the TV says what the host did. The app's own screenshot shortcut cannot be
+used while a stream is up, because the stream window takes the seat's keyboard
+and forwards every key to the host - it goes into the game. So `0035` arms the
+same path from the environment: `OPENNOW_STREAM_SCREENSHOT_MS` is the interval
+and `OPENNOW_STREAM_SCREENSHOT_TIMES` how many pictures to keep (4 when unset),
+and it goes through `AppController::captureStreamScreenshot` and
+`NativeStreamRuntime::requestScreenshot`, i.e. the streamer's own decoded frame
+written under `Pictures/OpenNOW/Screenshots`. A tick while the stream is not
+presenting is refused and costs nothing, so the first picture lands once the
+host has painted. The two ends are `opennow-stream-screenshot: armed every %d
+ms, %d times` and `opennow-stream-screenshot: saved %s`.
+
+`0036` closes the class that ended two of the sessions that were being measured.
+Run 10 (`play-dstny10.log`, PID 48992) created its window at 17:01:16.011, made
+four `wl_buffer`s over the next 94 ms, and at .121 lost the connection:
+
+  wayland-video: the compositor connection failed: Socket operation on non-socket
+  wayland-video: flush failed: Socket operation on non-socket (display error 88)
+  wayland-video: stream window closed
+
+ENOTSOCK is what sendmsg answers when the descriptor is not a socket, so by then
+this surface's own connection number named something else. The decoder exports a
+fresh dma-buf descriptor per frame out of a pool this board churns through, and
+a number the streamer has already closed is handed to the next `open()` in the
+process, which can be `wl_display_connect`'s socket; `present()` closes every
+frame descriptor no request carried, and that close is correct for every number
+except this one. It now refuses that number and says so once,
+`opennow-diag: frame fd %d is the compositor connection; not closing it`: the
+frame is lost either way, the window is not.
+
+| Counter | Value |
+| --- | --- |
+| the class it answers (`play-dstny10.log`) | window created 17:01:16.011, `dmabuf buffer 1…4 created` by .105, `the compositor connection failed: Socket operation on non-socket` at .121, `flush failed: Socket operation on non-socket (display error 88)` at .165, `stream window closed` at .165: the window died 154 ms after it appeared and the run logged **0** `wayland-video fps=` samples |
+| the neighbouring fd churn | Run 11 (`play-dstny11.log`, PID 53158) is the other session of this family, measured one build earlier: its window lived 24.9 s, `opennow-server-end-closes-window` and `wayland-video: stream window closed` both at 17:07:08.324, and the pull clock then logged `[V4L2RequestContext] Failed to reinit request object 0: Bad file descriptor (9)` and `hardware accelerator failed to decode picture` before the log's last line was the `buffer_fenced_release` assertion. `Socket operation on non-socket` does not appear in that log, so 0036's refusal is not what its fd churn is made of |
+| what this release has measured so far | `play-dstny13.log` (the r0.63 launch at 17:33) never reached its stream window before the board stopped answering, so every counter of this release is owed to the session after the restart: the screenshot clock's `armed`/`saved` lines, and 0036's `frame fd %d is the compositor connection` refusal |
+| the input half, already measured on the build before it | `play-btn1.log` logged `the seat now has a pointer` 4 ms **before** the window, 10 button transitions and **0** `submit refused`; see the `r0.62` section above |
+
+The run that measures the picture is the one that has to follow a reboot: the
+screenshot clock writes into `Pictures/OpenNOW/Screenshots`, so the picture the
+player described - the host's cursor visible in the video and not moving while
+the mouse does - becomes a file that can be looked at next to the log.
+
+#### The r0.62 seat pointer at bind and the click that carries its position (Nov 3, board `weston@192.168.1.33`)
+
+The window answered Steam's notice with held Enters and the player still could
+not click anything in the stream. Two measured holes sit on the click's own path.
+
+The first is the pointer object. The window asked the seat for a `wl_pointer`
+only when the seat advertised the pointer capability, and on this board the
+capability arrives with the first pointer event, not with the seat: `play-dstny9.log`
+created the window at 16:43:56.312 and logged `wayland-video input: the seat now
+has a pointer` at 16:44:03.843, so for 7.5 s the window had no pointer at all and
+a click in that interval went nowhere. Weston's `seat_get_pointer` answers from
+`seat->pointer_state` directly - the comment in its own source says it hands out
+a pointer "if the seat has ever had one - even though the spec explicitly states
+that this request only takes effect if the seat has the pointer capability" - so
+the window now asks at bind. `0034` keeps the capability event for the parts that
+must not exist on an inert pointer (the relative pointer and the lock, which is
+what took the session down when it was created on a NULL `weston_pointer`), and
+the capability event replaces the inert object with a real one when the seat
+finally gets a pointer - `unbind_pointer_client_resource` in weston 13 nulls the
+user data before it touches it, so releasing that object is safe.
+
+The second hole is the click itself: a click is a position and a transition, and
+only the transition was sent. The streamer clears its captured input on every
+poll until the host's channel reports ready, so a motion dropped before that
+point leaves the host aiming somewhere else, and the button lands there.
+`handlePointerButton` now sends the last position the compositor reported
+immediately before the transition. Both ends of the gate became greppable:
+`wayland-video input: streamer capture requested=%d inputAllowed=%d` and
+`wayland-video input: button %u submit refused status=%d`.
+
+| Counter | Value |
+| --- | --- |
+| the pointer at bind (`play-btn1.log`, PID 74254) | `wayland-video input: the seat now has a pointer` at 17:41:48.787, **4 ms before** `wayland-video: stream window created` at 17:41:48.791, against r0.61's run 9 where the same line sat 7.5 s **after** the window |
+| the click's own path | `streamer capture requested=0 inputAllowed=1` at 17:41:48.506 (the hooks are installed before the window exists), `streamer capture requested=1 inputAllowed=1` at .906, `wayland-video input: capture active` at .907 and the first `wayland-video input: pointer 364x567 of 1920x1080` in the same millisecond |
+| buttons the window forwarded | **10** transitions in 1 s: `button 1 pressed=1` 17:41:54.665, `button 1 pressed=0` .761, `button 3 pressed=1` .849, `button 3 pressed=0` .999, `button 1 pressed=1` 17:41:55.000, `button 3 pressed=1` .092, `button 1 pressed=0` .146, `button 1 pressed=1` .242, `button 3 pressed=0` .440, `button 1 pressed=0` .440, and **0** `submit refused`, so none of them was dropped by the streamer. r0.61's four runs (`play-dstny8`…`play-dstny11`) logged **0** button lines |
+| keys | 2: `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` at 17:41:50.996 and `pressed=0` at 17:41:51.100 - a physical Enter held 104 ms, which the host reads |
+| the F11 window | `wayland-video: stream window windowed` at 17:42:21.691 and the stream kept its rate through the toggle: `fps=48.1 committed=1589 dropped=0 flushFailed=0` at 17:42:21.691's next sample and `fps=52.4 committed=1692 dropped=0 flushFailed=0` three seconds later |
+| the picture it paid | 35 s of stream, first sample `wayland-video fps=42.5 committed=44 dropped=0 flushFailed=0`, last `fps=52.4 committed=1692`, 0 dropped of 1692, 0 `dropping a frame (the frame could not be exported as a DMA-BUF)` |
+| what survived | 0 `connection failed`, 0 `Socket operation on non-socket`, 0 `invalid fence`, 0 `dropping a frame`; the run's one crash is the `buffer_fenced_release` assertion 3 s after the windowed toggle, which is the vendor EGL client's release-fence family and is item 14's, not this patch's |
+
+The window is therefore not a picture only: it forwards the pointer's positions,
+its buttons and the keyboard, and this release does it from the millisecond the
+window exists. What the run still cannot show is where the host's cursor was when
+the player clicked, which is what the `r0.63` screenshot clock is for.
+
+#### The r0.61 held opening enter (Nov 3, board `weston@192.168.1.33`)
+
+The `r0.60` clock answered Steam's notice twelve times and the notice stayed up,
+so the press was not the problem - its length was. The run that shows it is the
+`r0.60` session the player ended by hand: `play-dstny7.log` holds the clock's own
+`wayland-video input: opening enter answered (11 left)` down to `(0 left)`, and
+the physical Enter that finally dismissed the notice is the window's next input
+line, `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` at 11:15:46.301
+with `pressed=0` at 11:15:46.333 - **32 ms** down. A cloud host samples its input
+channel; a press and a release inside one sample is a press it never saw. `0033`
+keeps the answer on the same clock and the same `VK_RETURN`, but sends the press
+on one round and the release on the next, so the key is still down when the host
+looks: `OPENNOW_POPUP_ENTER_HOLD_MS` is the hold (120 ms when unset), the answer
+is logged before the press goes out and `opening enter held for %d ms and
+released` when the release does, and the teardown releases a press the clock is
+still holding, so a session that ends cannot leave Enter down in the game.
+
+| Counter | Value |
+| --- | --- |
+| the answer as it fired (`play-dstny8.log`) | `wayland-video: stream window created` at 11:55:42.565 and `wayland-video input: opening enter clock armed: 30000 ms then 23 more at 5s` at 11:55:42.570, then **24** answers, first at 11:56:12.571 and last at 11:58:10.516, `(23 left)` down to `(0 left)`, 5.121-5.124 s apart |
+| the hold | **24** `opening enter held for 120 ms and released` lines, one after every answer, each 120 ms later (11:56:12.571 → 11:56:12.691, 11:58:10.516 → 11:58:10.637), and `120 ms and released` is the only duration in the log |
+| nothing else pressed it | **0** `wayland-video input: key` and **0** `wayland-video input: button` forwards in the whole session, and one pointer position (`pointer 740x573 of 1920x1080` at 11:55:42.588). The board was empty: all 24 Enters are the window's own |
+| the picture it paid | 10 min 0 s of stream (11:55:42 → 12:05:42), last sample `wayland-video fps=56.7 committed=32906 dropped=0 flushFailed=0`, `opennow-frame-rate native=59.9/s delivered=56.9/s`, `opennow-present cost: pulls=566 presented=272`, and **0** `dropping a frame (the frame could not be exported as a DMA-BUF)` |
+| what survived | **0** of `invalid fence`, `Protocol error`, `destroyed object`, `Bad file descriptor`, `buffer_fenced_release` in the streaming window. The log's only Wayland line is `The Wayland connection broke. Did the Wayland compositor die?` at 16:39:23.869, when this boot's weston was restarted four and a half hours later in log time |
+
+What the run cannot say is whether the host read the hold: there is no picture of
+the screen in it, so the notice's own disappearance is still the TV's answer.
+
+#### The r0.61 pointer gap, measured in the next session (Nov 3, board `weston@192.168.1.33`)
+
+The same release's next session found the other half of "the mouse does not
+work": `play-dstny9.log` (PID 44011) created the window at 16:43:56.312 and only
+logged `wayland-video input: the seat now has a pointer` at 16:44:03.843, with
+the first position at 16:44:03.859 - **7.5 s** in which the window had no
+`wl_pointer` at all, so a click in that window went nowhere. The clock kept
+answering through it (`opening enter answered (23 left)` at 16:44:26.315,
+`(22 left)` at 16:44:31.436, both held 120 ms), and the session then died on a
+decode side the release does not touch (`dropping a frame (the frame could not be
+exported as a DMA-BUF)` 92, `invalid fence` 1, `Protocol error` 1). `0034` is the
+answer to the gap and to the click: the pointer is asked for when the seat is
+bound rather than when the capability says so, and a button transition carries
+the last position the compositor reported. See the `r0.62` section.
+
+#### The r0.60 opening-enter clock (Nov 3, board `weston@192.168.1.33`)
+
+GeForce NOW puts Steam's own notice in front of the game before it starts, and
+only an Enter dismisses it. The app already had a way to answer that notice -
+the stream window takes the seat's keyboard and forwards an Enter the host
+sees - but it answers at the wrong moment and it answers only while someone
+sits at the board: measured over the two Destiny 2 sessions of the `r0.59`
+build, presses made at the start of the stream landed while the cloud boot had
+not reached the pop-up yet, and a session started with the board empty got no
+press at all. The same pair of runs shows why a physical press is the fragile
+one: at 07:39:46.984 weston logged `event1 - Dell Dell USB Keyboard: device
+removed`, 30 ms later the surface logged `wayland-video input: capture
+inactive`, and in weston 13.0.1's own source that is `weston_seat_release_keyboard()`
+answering a device leaving the seat with `weston_keyboard_set_focus(keyboard, NULL)`
+plus `cancel_grab`, with only `weston_view_activate_input()` handing the focus
+back - on a pointer motion. Item 13 keeps that class. `0032` stops leaning on
+it: the surface already holds the streamer's own input hooks, the same key
+calls `submitKey` makes, so a clock on those hooks sends the same `VK_RETURN` a
+physical Enter becomes with the compositor not involved. `OPENNOW_POPUP_ENTER_MS`
+says how long after the stream window became live the first press goes out,
+`OPENNOW_POPUP_ENTER_TIMES` repeats it 5 s apart (4 times when unset), `OPENNOW_POPUP_ENTER_MS`
+unset arms nothing - which leaves every earlier series' run unchanged - and
+`destroySurface` stops the clock, so a session that ended cannot press Enter
+into whatever the interface comes back to.
+
+| Counter | Value |
+| --- | --- |
+| the answer as it first fired (`play-dstny6.log`, PID 17149) | `wayland-video: stream window created` at 10:23:31.051 and `wayland-video input: opening enter clock armed: 30000 ms then 11 more at 5s` in the same millisecond, then 12 answers at 10:24:01.052…10:24:56.066, 5.00-5.01 s apart, `wayland-video input: opening enter answered (11 left)` down to `(0 left)` |
+| the board stayed empty | 0 `wayland-video input: key` forwards in the whole run - the only input line of the run is `wayland-video input: capture active` at 10:23:31.130 - so nothing the compositor owns made the press: all 12 Enters are the window's own, which is exactly what item 13's keyboard-focus class costs a physical one |
+| the picture it paid | `wayland-video fps=55.8 committed=27323 dropped=0 flushFailed=0` at 10:31:54 against 8 min 23 s of picture, `opennow-frame-rate native=59.4/s delivered=55.4/s`, and 0 `dropping a frame (the frame could not be exported as a DMA-BUF)` in the run |
+| what the run's cost says | the session lived past the ~10 min an idle session usually costs the provider: `opennow` alive 11 min 47 s after the launch (PID 17149) and still streaming, with `server-terminated`, `session_allocation_unresolved` and every crash class at 0 in the log |
+
+The counters say the press left the app at the right distance and at the game's
+own key rate; what it dismissed at the screen is the part only the TV can answer.
+
+
 #### The r0.59 stream-window close on the server's end (Nov 2, board `weston@192.168.1.33`)
 
 What an end the provider sends leaves behind is a window that is still mapped.
@@ -724,6 +895,11 @@ for audio output.
 | `QFile::at: Cannot set file position N` beside `qt.gui.imageio.jpeg: Corrupt JPEG data: premature end of data segment` | Cosmetic, artwork only, and no layer fix is needed: the stream keeps its rate through them (2 pairs at 20:57:17.379 and 20:57:19.151 inside an `r0.58` session still streaming at p50 37.7 fps with `flushFailed=0`; 7 pairs inside one second in `c53` at 53.0 fps). The positions are Qt's own JPEG-plugin blocks past the end of a **whole** file - `180224 = 44 x 4096`, `147456 = 36 x 4096`, and `src/plugins/imageformats/jpeg/qjpeghandler.cpp` reads the device in `max_buf = 4096` blocks - so libjpeg's entropy stream reached EOF before its own EOI (that is the notice), `resync_to_restart = jpeg_resync_to_restart` asked the `QFile` for the next restart marker, the block-boundary seek landed past EOF, `QFile` refused it and warned, and the plugin installed its fake EOI and finished the decode. The objects there are baseline JPEGs ending `FF D9` (145090 and 175462 bytes) with `index.json` sizes matching disk, so there is no short object and nothing to avoid. The file the interface cannot open at all prints `Cannot open: <url>` instead, which the app already avoids through the empty `resolvedUrl` in `ArtworkSource.qml`; this boot logged 0 of those |
 | The picture stops and the streamer's last line is `server-terminated: The server ended the streaming session (0x80030007)` | Not an app-side end and not a layer's fix: the provider closed the session. `media-ingress consumer stopped elapsed_ms=804681 video=47803 audio=160359 keyframes=3 dropped=5` says the stream carried its frames up to that verdict, and the app answers with `qt-to-native id=qt-4 type=stop`, `engine-command end id=qt-4 type=stop success=true` and `session.ended: outcome=ok`, so nothing crashes and the window used to stay on screen with the last frame; `0031` now closes it, see the row below. The answer is a new session, and `--auto-launch-ms=150000` presses Start for you |
 | The stream window stays on screen with a frozen picture after `server-terminated` | Fixed by patch `0031` (built as `r0.59`): the end answers with `native-to-qt type=status status=stopped`, so the app follows that answer and unmaps the window. Both sides are greppable - `opennow-server-end-closes-window: the server ended the session; unmapping the stream window` and the surface's own `wayland-video: stream window closed` - and the interface, which `0029` leaves painting underneath, is what the screen comes back to |
+| The cloud game opens behind a pop-up that wants an Enter, and nobody sits at the keyboard | Fixed by patch `0032` (built as `r0.60`): the stream window answers with an Enter of its own on a clock, `OPENNOW_POPUP_ENTER_MS=30000 OPENNOW_POPUP_ENTER_TIMES=12` arms it 30 s after the window became live and repeats the press 5 s apart, 12 times. The press is the streamer's own key API, so it is the same `vk=0xd` Enter a physical key becomes - the `r0.59` run proved that half from the other side, logging `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` for ydotool's evdev 28 - and it needs nothing from the compositor, which is what item 13 records the compositor doing to the keyboard behind a press. Both sides of the answer are greppable: `wayland-video input: opening enter clock armed: %d ms then %d more at 5s` and `wayland-video input: opening enter answered (%d left)`. `OPENNOW_POPUP_ENTER_MS` unset arms nothing, which leaves every earlier series' run unchanged, and the teardown stops the clock, so a session that ended cannot press Enter into whatever the interface comes back to |
+| The clock answered the pop-up and the notice is still up | Fixed by patch `0033` (built as `r0.61`): a press the cloud host reads is a press that is still down when it samples. The `r0.60` clock answered 12 times through the window's own key API - `wayland-video input: opening enter clock armed: 30000 ms then 11 more at 5s` beside `wayland-video: stream window created`, answers 5.00-5.01 s apart - and the notice stayed up until the player pressed Enter at the board, which the window logged as `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` at 11:15:46.301 with `pressed=0` at `.333`: 32 ms of key held down. `0033` keeps the answer on the same clock but sends the press on one round and the release on the next, whose interval is `OPENNOW_POPUP_ENTER_HOLD_MS` (120 ms when unset), so the press is a hold the host can read; greppable side by side, `wayland-video input: opening enter held for %d ms and released` next to `wayland-video input: opening enter answered (%d left)`. The teardown releases a press the clock was still holding, so a session that ended cannot leave Enter down in the game |
+| The stream window appears and closes again ~150 ms later with `the compositor connection failed: Socket operation on non-socket` | Fixed by patch `0036` (built as `r0.63`): ENOTSOCK is what sendmsg answers when the descriptor is not a socket, so the surface's own connection number had been closed and recycled by then; `present()` closes every frame descriptor no request carried, and one of those numbers is the compositor connection. It refuses that number now and says so once, `opennow-diag: frame fd %d is the compositor connection; not closing it` |
+| Nothing on the board can show what the cloud host put on the screen | Answered by patch `0035` (built as `r0.63`): the app's screenshot shortcut cannot be pressed while a stream is up, because the stream window holds the seat's keyboard and forwards the key to the host. `OPENNOW_STREAM_SCREENSHOT_MS` arms the same capture path on a clock (`OPENNOW_STREAM_SCREENSHOT_TIMES` is how many to keep, 4 when unset) and the picture is written where the shortcut writes it, under `Pictures/OpenNOW/Screenshots`; the two ends are `opennow-stream-screenshot: armed every %d ms, %d times` and `opennow-stream-screenshot: saved %s` |
+| The pointer moves over the stream but a click does nothing in the game | Fixed by patch `0034` (built as `r0.62`): the window asked the seat for its `wl_pointer` only when the seat advertised the pointer capability, and on this board that arrives with the first pointer event, so the window had no pointer at all for the first seconds of the stream (`play-dstny9.log`: window created 16:43:56.312, `wayland-video input: the seat now has a pointer` 16:44:03.843). It asks for it at bind now, and the capability event replaces the inert object weston hands out for a seat that never had a pointer (`unbind_pointer_client_resource` nulls the user data before it touches it). The click also carries the last position the compositor reported immediately before the transition, because the streamer clears captured input until the host reports its input channel ready and a dropped motion otherwise leaves the button wherever the host cursor still was. Both ends are greppable: `wayland-video input: streamer capture requested=%d inputAllowed=%d` and `wayland-video input: button %u submit refused status=%d` |
 | `Failed to import plane 0 as R8`, then the stream window closes |
  The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
 | `invalid arguments for zwp_linux_buffer_params_v1.add` after ~20 s | The compositor's 1024-descriptor limit. The surface reuses one `wl_buffer` per decoder buffer, so check whether the decoder's pool changed shape |
@@ -996,3 +1172,48 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     measured against the p50 the interface pays today. What is still owed elsewhere:
     `setWindowHasContents(Never)` while the stream window is mapped, and refusing
     `::close` of the number `wl_display_get_fd(m_display)` reports.
+
+13. **The seat keyboard does not survive a device leaving it, so a press the
+    player makes can reach nothing, and nothing restores it on its own.** The
+    stream window asks the seat for the keyboard and answers the presses it gets
+    while weston gives that window keyboard focus, and weston focuses one window
+    at a time - the interface behind it never has the keyboard. The churn was
+    measured on the `r0.59` board: at 07:39:46.984 weston logged
+    `event1 - Dell Dell USB Keyboard: device removed`, and 30 ms later the surface
+    logged `wayland-video input: capture inactive`. In weston 13.0.1's own source
+    that pair is `weston_seat_release_keyboard()` answering a device leaving the
+    seat with `weston_keyboard_set_focus(keyboard, NULL)` and `cancel_grab`, and
+    the only path that hands the focus back is `weston_view_activate_input()`,
+    which does it when a pointer motion activates the window's surface again. So
+    a press made at the board after such a churn lands on nothing until the
+    pointer moves, and the cloud game's own pop-up - Steam's notice, which only an
+    Enter dismisses and which appears some way into the cloud boot rather than at
+    the start of the stream - gets no press at all when the session started with
+    the board empty. What answers that pop-up is not the seat: `r0.60`'s `0032`
+    sends the Enter through the streamer's own key hooks the surface already
+    holds, which is the press `submitKey` makes without the compositor in the way.
+    The other half was measured from the same board before the patch: ydotool's
+    evdev 28 while the focus was alive logged 20 forwards of
+    `wayland-video input: key 28 vk=0xd mods=0x0 pressed=1` 14 s apart beside a
+    picture that held `fps=48.7 committed=13125 dropped=0`, so the key that is
+    sent does reach the host, and what loses it is the focus, not the wire. Still
+    open: why the seat's keyboard device left the seat at all - udev had tagged it
+    and the board kept the keyboard for everything that came after the window -
+    and that the window's own keyboard capture goes inactive across it, which
+    makes a player's keys the fragile side rather than the app's answer.
+
+14. **The host's cursor is visible in the video and does not follow the mouse, and
+    a click over the stream changes nothing** - the player reported both halves on the
+    `r0.61` and `r0.62` builds. `r0.62` answers the app's half: the window forwarded
+    10 button transitions and 9 pointer positions in one second of play with 0
+    `submit refused`, so the events leave the app and reach the streamer. What is not
+    answered is where the host's cursor was when they arrived. The host keeps its own
+    cursor state in the control channel - `NVST cursor wire rx: ... cursorId=Some(1)
+    position=Some((32784, 32797)) visible=Some(false)` in the native streamer's log,
+    which is centre-screen and not moving while the mouse does - and the surface hides
+    weston's cursor over the stream window (`wl_pointer_set_cursor(pointer, serial,
+    nullptr, 0, 0)`), so nothing on the board says where the player is pointing. `0035`
+    of `r0.63` is what turns the picture into a file the next reader can compare with
+    those numbers; still owed are the surface's own cursor image for the case where the
+    host reports its cursor invisible, and reading the host's cursor position back into
+    the log.
