@@ -627,6 +627,30 @@ the surface's own counters now read `committed=412 dropped=2 flushFailed=116`
 flush is the first named reason the window's pull clock is kept off, and it is
 open item 17 below, because the seat cannot play at one commit every 1-2 s.
 
+The same release then measured the clean chain to the end of a session: the
+retry loop died twice on the known `buffer_fenced_release: Assertion
+buffer->release_fence_fd == -1 failed` and the third attempt streamed
+(`play-d2d-19.log`, window live from 11:37:31). Its clocks armed the consent
+and PLAY presses only - `signup clock armed` never appears in the log because
+`OPENNOW_SIGNUP_MS` is unset - and the two presses at +62 s and +212 s
+crossed the gate (`NVST native input drain: available=true … keys=4
+absolutes=1`) and rode the wire (2 `events=[key-down(3)]` and 2
+`events=[key-up(4)]` inside 5 `route=ControlReliable` packets). The witness
+stills hold the character screen at +400 s and at +800 s with no quit notice
+in sight, and the session ended only when the host ended it
+(`server ended the session` 1, `invalid fence` and `buffer_fenced_release` 0
+in that session). Two presses are the whole budget the Main Menu needs, and
+once it renders the seat's own keyboard drives the game.
+
+That run splits the rate reading, which one session alone could not: the clean
+session presents at `wayland-video fps=0.5` to `fps=0.7` while its own
+counters read `committed=448 dropped=0 flushFailed=0`, so the slow pull of the
+Main Menu refuses and fails nothing at all, while the 116 failed flushes above
+belong to the session where a player's own mouse was moving through the queue
+(the tally read `moves=539 absolutes=730 buttons=18` there against this
+session's `keys=4 absolutes=1`). Two separate things are owed now, not one.
+
+
 #### The r0.68 play clock answers the PLAY notice, and the chain's third notice becomes visible (Nov 4, board `weston@192.168.1.33`)
 
 The r0.67 stills closed open item 16's question and named the press budget: ONE
@@ -1650,15 +1674,17 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     fps=0.6` with a histogram of 0.4 to 0.7/s for the whole session against
     `opennow-frame-rate native=59.6/s delivered=0.7/s`, and the surface's own
     counters now read `committed=412 dropped=2 flushFailed=116` where the
-    `r0.67` attempt had read `dropped=0 flushFailed=0`. The failures are new to
-    these releases and they name the suspect: a failed compositor flush, not a
-    refused frame, is what keeps the window's own pull clock off. This is what
-    makes the cloud game unplayable from the seat - the picture and the sound
-    reach it, but the picture advances once every 1-2 s - so the fix is owed by
-    reading the surface's commit path: whether the weston front window refuses
-    a second commit while the previous one is still pending, whether the
-    surface's `damage` region and its `wl_surface_commit` are paired at all on
-    this path, and whether asking the compositor at 60 Hz is the wrong interval
-    for a surface this large on this driver. It is the same family as the
-    starved capture pool of open item 8 and the `galcore` core hangs the launch
-    retries die in, but a failed flush is measured here and a hang is not.
+    `r0.67` attempt had read `dropped=0 flushFailed=0`. The clean `r0.69` run
+    splits this into two things, which one session alone could not: the Main
+    Menu session presents at 0.5-0.7/s with `committed=448 dropped=0
+    flushFailed=0`, so its slow pull neither refuses nor fails a commit and the
+    suspect is the window's pull clock being off while everything it does is
+    accepted - which reads back through the surface's own `damage`/`wl_surface_commit`
+    pairing, the interval it asks the compositor for, and the same starved
+    capture pool as open item 8; and separately, the 116 failed flushes belong
+    to a session where a player's own mouse went through the queue
+    (`moves=539 absolutes=730 buttons=18` there against `keys=4 absolutes=1`
+    in the clean one), which is a pointer-traffic symptom of its own and a
+    second thing to read. Both matter to the seat: at 0.6/s the picture and
+    the sound reach it but advance once every 1-2 s, so the cloud game cannot
+    be played even once its Main Menu renders.
