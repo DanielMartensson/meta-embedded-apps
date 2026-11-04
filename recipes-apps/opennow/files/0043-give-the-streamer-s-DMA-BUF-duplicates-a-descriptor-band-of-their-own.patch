@@ -1,0 +1,157 @@
+From 5c61d3f70a8b4c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70819a0b1c2d3e4f5 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Wed, 4 Nov 2026 17:45:00 +0000
+Subject: [PATCH] 0043 give the streamer's DMA-BUF duplicates a descriptor band of
+ their own, so the driver's release fences keep their numbers
+
+The session the seat played to death measured what ends the stream: at
+16:53:20.314, 3 min into a run that had streamed cleanly at 49-55/s the whole
+time (`committed=10216 dropped=0 flushFailed=0`), the log gains one line with
+no timestamp of its own - a raw write to stderr, since the string it prints
+lives in the board's `libEGL.so` and not in anything we build -
+
+  zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd
+
+and the next line is the interface's own death: `The Wayland connection
+experienced a fatal error: Protocol error`. The board's EGL driver carries
+weston's egl-wayland client (`libEGL.so.1.5.0` holds `api/gc_egl_wayland.c`)
+and hands the compositor a release FENCE for every swapchain image it presents,
+with that fence carried as a descriptor in the SAME table this process has. The
+surface's own fd table during the same session is tight, not leaky: 102-104
+live descriptors for ten minutes at 47/s, `0` naming `anon_inode:sync_file`,
+`4` naming `/dev/galcore`, 21 `anon_inode:[eventfd]` entries spread through the
+low teens, 37 `/dmabuf:` objects - and every duplicate this crate makes asks
+for the LOWEST free number, `, 3` at the compositor handoff and `, 0` at the
+Vulkan imports, 55 times a second. So the streamer's exports live inside the
+driver's band, and the fence the driver had just created comes back to the
+compositor as one of them, which is what `invalid fence fd` says. The two
+sibling deaths the series has been paying for are the same collision read from
+the other side: `buffer_fenced_release: Assertion buffer->release_fence_fd ==
+-1 failed` (the driver recycling a buffer whose fence number the streamer took)
+and libsystemd's `Assertion close_nointr(fd) != -EBADF failed at
+.../fd-util.c:75, function safe_close()` (a number the streamer closed that
+names the connection).
+
+So the four places that duplicate a DMA-BUF descriptor - the compositor handoff
+of `0011`/`0016`, the Vulkan import, the SAND import and `0038`'s presenter -
+ask for their number at a band of their own, `EXPORT_FD_BAND` at 4096 in the
+crate root, instead of at the bottom of the table: nothing in the driver or in
+libEGL allocates that high, and since the previous export is released before the
+next is made the duplicates reuse the same handful of numbers rather than walk
+the table. Says once per process `opennow-diag: dma-buf export fd band:
+duplicates start at 4096`, so a session can be read back against
+`ls /proc/<pid>/fd` and the separation seen rather than assumed. Every r0.44
+behaviour of these paths is kept: the export still owns its own duplicate and
+the presenter still keeps it open until the flush that carries it succeeds, the
+handoff ring still pins the frame it handed over, and the surface's own refusal
+of a descriptor whose planes do not fit (`opennow-diag: dmabuf-rejected`) still
+answers, now against a number the driver cannot steal.
+
+This is a separation, not a rescue: the driver's fence stays a fence, so the
+deaths it causes with no collision - `0014`'s swap interval, which keeps a
+release from arriving after its image is presented again - stay as they are.
+Nothing is buffered, no rate is added, and a path that duplicates nothing is
+unchanged.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer/sand.rs
+@@ -536,7 +536,9 @@
+         requirements.memory_type_bits & properties.memory_type_bits,
+         vk::MemoryPropertyFlags::empty(),
+     )?;
+-    let fd = unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 0) };
++    let fd = unsafe {
++        libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, crate::EXPORT_FD_BAND)
++    };
+     if fd < 0 {
+         return Err(Error::backend(
+             Subsystem::Vulkan,
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -512,10 +512,21 @@
+         return None;
+     }
+     let object = dmabuf.objects[first.object_index];
+-    let fd = unsafe { libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, 3) };
++    let fd = unsafe {
++        libc::fcntl(object.fd, libc::F_DUPFD_CLOEXEC, crate::EXPORT_FD_BAND)
++    };
+     if fd < 0 {
+         return None;
+     }
++    // Says once per process where the duplicates start, so a session can be
++    // read back against the driver's own table (`ls /proc/<pid>/fd` names the
++    // numbers) and the separation of the two bands can be seen rather than
++    // assumed.
++    static BAND_LOGGED: std::sync::Once = std::sync::Once::new();
++    BAND_LOGGED.call_once(|| eprintln!(
++        "opennow-diag: dma-buf export fd band: duplicates start at {}",
++        crate::EXPORT_FD_BAND,
++    ));
+     // The buffer is described at the visible height even when the decoder pads
+     // the picture (1088 rows for 1080p): the planes carry their own offsets, so
+     // the extra rows never reach the compositor, and a surface matching the
+@@ -2754,7 +2765,9 @@
+         .ok_or_else(|| {
+             Error::unavailable(Subsystem::Vulkan, "no memory type can import DMA-BUF")
+         })?;
+-    let imported_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
++    let imported_fd = unsafe {
++        libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, crate::EXPORT_FD_BAND)
++    };
+     if imported_fd < 0 {
+         unsafe { device.destroy_image(image, None) };
+         return Err(Error::backend(
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/lib.rs
+@@ -4,6 +4,35 @@
+ ))]
+ compile_error!("the Linux backend currently supports x86_64 and aarch64");
+ 
++/// The descriptor number the crate's `F_DUPFD_CLOEXEC` duplicates start at.
++///
++/// Every one of these duplicates is handed to the compositor or to the GPU
++/// driver as a number, and both of them read the number out of THIS process's
++/// descriptor table, which is where the vendor EGL driver keeps its own
++/// objects: the measured session holds about a hundred live numbers, `0`
++/// naming `anon_inode:sync_file`, `4` naming `/dev/galcore`, and the driver's
++/// 21 `anon_inode:[eventfd]` entries spread through the low teens. Asking for
++/// the lowest free number (the `, 3` of the compositor handoff and the `, 0`
++/// of the Vulkan imports) put every one of the streamer's exports inside that
++/// band and recycled it 55 times a second, and the release FENCE the driver
++/// had just made for a swapchain image came back to the compositor as one of
++/// them:
++///
++///   zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd
++///   The Wayland connection experienced a fatal error: Protocol error
++///
++/// which is the interface connection going away 3 min into the first session
++/// long enough for a player to be inside the game, with the two sibling
++/// deaths of the same collision read from the other side
++/// (`buffer_fenced_release: Assertion buffer->release_fence_fd == -1 failed`
++/// and libsystemd's `Assertion close_nointr(fd) != -EBADF failed at
++/// .../fd-util.c:75, function safe_close()`). Nothing in the driver or in
++/// libEGL allocates this high, so the two stop taking each other's number,
++/// and because the previous export was released before the next one is made,
++/// the exports reuse the same handful of numbers instead of walking the table.
++#[cfg(target_os = "linux")]
++const EXPORT_FD_BAND: i32 = 4096;
++
+ #[cfg(target_os = "linux")]
+ mod audio;
+ #[cfg(target_os = "linux")]
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/presentation.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/presentation.rs
+@@ -1757,7 +1757,9 @@
+             return Err(error);
+         }
+     };
+-    let imported_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
++    let imported_fd = unsafe {
++        libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, crate::EXPORT_FD_BAND)
++    };
+     if imported_fd < 0 {
+         unsafe { device.destroy_image(image, None) };
+         return Err(Error::backend(

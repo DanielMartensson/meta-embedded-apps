@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 42, `recipes-apps/opennow/files/0001`…`0042` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.69` |
+| Patches applied | 43, `recipes-apps/opennow/files/0001`…`0043` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.70` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -583,6 +583,37 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 ```bash
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
+
+#### The r0.70 descriptor band, and the seat's own play measuring the death family's third reading (Nov 4, board `weston@192.168.1.33`)
+
+The seat is playable, and playing is what the series has never been able to do long enough to see the app's own death come. The session that ran the game for its player (attempt 22, still `r0.69`) answered the consent and PLAY notices with physical keys, streamed at 47-55/s the whole time and reached **103,880 presents**:
+
+```
+2026-11-04T18:02:28.305 info default: wayland-video fps=52.3 committed=103880 dropped=0 flushFailed=0
+2026-11-04T18:02:28.932 warning default: The Wayland connection experienced a fatal error: Bad file descriptor
+```
+
+no assertion and no `invalid fence` line there, one fatal error of a third shape (that session's log was reclaimed for board disk before this reading; the lines above are the ones recorded while it was still on the board). The 3-minute death of attempt 21 in the same release read the family's other two shapes side by side:
+
+```
+zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd
+2026-11-04T16:53:20.435 warning default: The Wayland connection experienced a fatal error: Protocol error
+```
+
+at `committed=10216 dropped=0 flushFailed=0`, after three clean minutes at 49-55/s.
+
+The line with no timestamp of its own names the interface's own connection, not the stream window's: the string it prints lives in the board's `/usr/lib/libEGL.so` (the vendor's `libEGL.so.1.5.0` holds weston's egl-wayland client `api/gc_egl_wayland.c`), which hands the compositor a **release fence for every swapchain image it presents**, with that fence carried as a file descriptor. The descriptors are the collision, and the app's own table says so: watched for 8 minutes at 47/s during a session that was still alive, it holds **102-104 live descriptors, highest number 104**, and inside that narrow band sit `0` = `anon_inode:sync_file`, `4` = `/dev/galcore`, the driver's 21 `anon_inode:[eventfd]` entries in the low teens, 12 sockets and 37 `/dmabuf:` objects. Every one of the streamer's four `F_DUPFD_CLOEXEC` duplicates asks for the **lowest free number** - `, 3` at the compositor handoff, `, 0` at the Vulkan, SAND and presenter imports - so 55 times a second the exports and the driver's fences occupy the same numbers, and a fence or an import arrives naming one that was just taken back. The three readings are one family: the driver's fence gets a dma-buf's number (`invalid fence fd`), the compositor's read gets a closed number (`Bad file descriptor`), the driver's own release gets the number the streamer stole (`buffer_fenced_release`'s `release_fence_fd == -1`).
+
+`0043` separates them instead of catching them: the four duplications ask for their number at a band of their own, `EXPORT_FD_BAND` = 4096 in the crate root, and the driver and libEGL allocate nothing that high. The r0.70 session measures the separation in the process's own table - the band line prints once, and the table now splits:
+
+```
+opennow-diag: dma-buf export fd band: duplicates start at 4096
+live=103  highest=4113
+```
+
+the driver keeps its 0-104 band and never sees a streamer number, the duplicates reuse a handful of numbers above 4096 rather than walking the table, and 8 minutes into that session at 42-55/s the log carries zero of `invalid fence`, `Bad file descriptor`, `buffer_fenced_release` and `safe_close`. Nothing is buffered and no rate is added: the export still owns its duplicate and the presenter still keeps it until the flush that carries it succeeds, so `0011`'s handoff ring, `0025`'s ask-the-descriptor probe and `0026`'s release ownership are unchanged, and the surface's own refusal of a descriptor whose planes do not fit still answers.
+
+This closes the crash family the recipe was blocked by. The deaths that stay are the ones with no collision in them - `0014`'s swap interval keeps a release from arriving after its image is presented again, and the `galcore` `GPU[0] core0 hang` launches that die before the window are the driver's own recovery, not a shared number.
 
 #### The r0.69 signup clock reaches the character screen, and the third press is what broke in (Nov 4, board `weston@192.168.1.33`)
 
@@ -1271,6 +1302,7 @@ for audio output.
 | A stream dies 78 s to 3.5 min in with `zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd` and `The Wayland connection experienced a fatal error: Protocol error` | Not fixed, and the series keeps meeting it (open item 14 below): the r0.65 attempt died there after 78 s of picture, the r0.66 attempt 101 s in, and each attempt has to be relaunched because of it. The `buffer_fenced_release` assert of the r0.57/r0.58 runs is the same family of death from the other side |
 
 | The stream shows `ARE YOU SURE? … quit your current session and exit to desktop` with `Enter Confirm` / `Esc Cancel` | Not a fault, and not the host: an Esc reached the character screen, whose only visible key hint is the corner's `Esc Exit to Desktop`, so the press asked the game to quit. The notice waits there for the rest of the session; `Esc` answers its "Cancel" and keeps the session, `Enter` ends the cloud game. The measured chain arms only the consent and the PLAY clocks, which never reaches this notice |
+| The stream dies with `zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd`, with `The Wayland connection experienced a fatal error: Bad file descriptor`, or with the vendor `buffer_fenced_release: Assertion 'buffer->release_fence_fd == -1' failed` | One family, three readings: the process's descriptor table is shared ground. The board's EGL driver carries weston's egl-wayland client and hands the compositor a release FENCE for every swapchain image, as a file descriptor, and until `0043` every DMA-BUF duplicate the streamer made asked for the lowest free number (`, 3` and `, 0`) - 55 times a second inside a table of about a hundred numbers that also holds `anon_inode:sync_file`, `/dev/galcore`, the driver's event fds, the compositor's sockets and 37 `/dmabuf:` objects. A fence arrives naming a number the exports just took, or an import arrives naming one just closed. `0043` gives the duplicates a band of their own (`EXPORT_FD_BAND` = 4096, one line per process: `opennow-diag: dma-buf export fd band: duplicates start at 4096`); the driver's band and the streamer's never overlap again. A session that dies minutes in at a clean 50/s, with `dropped=0 flushFailed=0`, is this and not a rate problem |
 
 | A launch freezes minutes in: only `opennow-present fps=0.0 render=0.0 swapped=0` grows, the log stops growing while both apps stay alive (`opennow-qt` in `wchan=do_sys_poll`, `opennow-core` on `pipe_read`), and `dmesg` shows `[galcore]: GPU[0] core0 hang, automatic recovery.` | Not fixed: the same Vivante/driver death family as the starved capture pool (open item 8) - the lost compositor reply after a driver core hang leaves the interface unpainted and the launch never reaches a stream window. `r0.67`'s first attempt died exactly there; the session has to be relaunched, and the attempt driver now calls a log that stops growing a dead launch instead of waiting out its ten-minute budget |
 
@@ -1688,3 +1720,5 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     second thing to read. Both matter to the seat: at 0.6/s the picture and
     the sound reach it but advance once every 1-2 s, so the cloud game cannot
     be played even once its Main Menu renders.
+
+18. **The `r0.70` band makes a playing session refuse 282 of 16,483 presents, which the `r0.69` runs refused none of** - measured on the seat's own session (`play-manual-23.log`, 19:06: `wayland-video fps=42.7 committed=16483 dropped=282 flushFailed=0`) against `committed=448 dropped=0 flushFailed=0`, `committed=10216 dropped=0` and `committed=103880 dropped=0` on the runs that played before the band. `dropped` counts the presents `bufferFor()` refused: a descriptor whose planes do not fit what `fstat` says it covers, or a frame the surface could not answer because its `wl_buffer` cache had none. With the band in place a refusal can no longer be a number the driver stole, so these name the export path's own bookkeeping - `evictBuffers()` destroying the `wl_buffer` of a pool object the surface still shows, or a frame whose planes moved between the export and the add. Each costs one present and the seat still plays at 42-55/s, so it is a tail rather than a blocker; what is owed is a counter that says which of the two refusals it is, because today one line (`opennow-diag: dmabuf-rejected`) covers both and a session that refused 282 of them prints it at most a few times.
