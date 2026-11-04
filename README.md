@@ -676,6 +676,43 @@ off. The re-arm costs one call to the streamer per second and the stills cost
 nothing on the board, so this reads as owed to whatever starves the pull (the
 same suspect as the starved capture pool), not as a `0040` rate addition.
 
+The same release was then measured again after a session-service restart -
+which on this image kexecs a fresh kernel (`dmesg` starts over), the standing
+remedy for the degraded GPU session - where the first launches died in the
+same `galcore` core-hang family as attempt 3 (three frozen launches with
+`opennow-present fps=0.0` and a log frozen while the app waits in
+`do_sys_poll`/`futex_wait_queue`, one silent exit; the attempt driver now
+calls a log that stops growing a dead launch instead of waiting its budget
+out), while later attempts launched cleanly and `0040` measured identically
+again: `pushed=48 dropped=0`, `keys=48` on the drain, 24 Enters on the wire.
+
+The time-lapse witness this series added (the `d2d` driver keeps a time-stamped
+stills every 25 s through the stream) then reads the chain itself, which no
+counter had ever been able to say:
+
+- the Steam client is open from the first still, together with an unread
+  friend-chat pop-out, and the blocking notice is a consent window (a game
+  launcher's privacy consent, whose highlighted button at the bottom reads
+  "ok") that is up from the first still of the session
+- with NO presses at all (a no-clock observation attempt), the Steam client
+  sits with that consent window open for the whole 11 min: the notice, not
+  the host, is what waits
+- ONE Enter, armed 60 s after the window became live, answers it and the
+  game launches: the still 95 s later shows the Destiny 2 splash waiting for
+  "PRESS ENTER TO PLAY", and the splash is still unpressed at the 14th
+  minute - the presses never came again because the clock was armed once
+- the same clock with 12 presses 13 s apart (first at +90 s) closes the
+  host's own windows instead: the desktop is bare 95 s into the burst,
+  before the splash exists, and the extra presses wander into whatever
+  window the host has open - this is also why the 24-press attempts left
+  a bare desktop
+
+So the press budget of the cloud chain is ONE Enter per notice, with the
+notices about 135 s apart, and the opening clock's 5 s follow-ups cannot
+hold that shape; the answer is owed to the next patch. The chat pop-out and
+the account names in the host's own window belong to the player and stay
+out of this layer's documentation.
+
 How a later attempt's verdict is read - and why the picture is the witness:
 the delivered rate cannot tell Steam's painted window from Destiny's Main
 Menu, both run at 57-60/s, and `weston-screenshooter` answers
@@ -1481,6 +1518,13 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     either Steam waits for a click on a launch button (the `r0.62`
     pointer-with-position path is armed and a click with a known rest position
     is available) or the app-id opens the store page rather than the game
-    itself. The time-lapse of the next attempts - time-stamped stills from
-    window creation through the Enter burst, kept by the `d2d` driver - is
-    what tells the two candidates apart.
+    itself. The time-lapse did tell them apart, and neither candidate is
+    right: ONE Enter armed after the consent notice answers it and the game
+    launches (the stills read the consent window with its highlighted "ok",
+    then the Destiny 2 splash waiting "PRESS ENTER TO PLAY" about 135 s
+    later), while extra presses of the same clock close the host's own
+    windows and leave a bare desktop. What remains owed is a clock that can
+    hold that shape - one press per notice, notices ~135 s apart, which the
+    5 s follow-ups of the `0032`/`0033` clock cannot do; `0041` of `r0.68`
+    arms the PLAY press on a clock of its own, and the Main Menu itself is
+    owed to whichever attempt answers both notices.
