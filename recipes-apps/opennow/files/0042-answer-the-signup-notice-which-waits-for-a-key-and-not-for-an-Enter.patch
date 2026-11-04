@@ -1,0 +1,169 @@
+From 5c61d3f70a8b4c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70819a0b1c2d3e4f5 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Wed, 4 Nov 2026 10:20:00 +0000
+Subject: [PATCH] 0042 answer the signup notice, which waits for a key and not
+ for an Enter
+
+The r0.68 attempt read the chain one notice further than the enter clocks
+could answer (OPENNOW_FRAME_DUMP stills, one every 25 s): the consent
+window's Enter at +64 s and the PLAY splash's Enter at +213 s both crossed
+the gate and rode the wire, and 25 s after the second press the splash is
+gone and the host shows a screen that waits for a key rather than for one
+highlighted button - SIGN UP / JOIN THE FIGHT // EARN EXOTIC GEAR, whose
+options read `⏎ Sign Me Up` and `Esc Not Now`. That notice then waited
+unpressed to the host's ~14 min session end, so the third press is owed and
+is the first one the app cannot send with the Enter the two clocks use:
+Enter starts the signup the seat has nothing to complete, while Esc skips.
+
+So the signup notice gets a clock of its own, with the same shape the two
+measured notice clocks have and one new thing - a key of its own in the
+virtual-key space the streamer's own text path already uses (0x0d Enter,
+0x1b Esc): OPENNOW_SIGNUP_MS arms it at its own distance from the window
+becoming live (unset arms nothing), OPENNOW_SIGNUP_TIMES (1 when unset)
+repeats it at the same 5 s follow-up spacing, OPENNOW_SIGNUP_HOLD_MS (150
+when unset) holds each press down, and OPENNOW_SIGNUP_KEY is the hex key
+and defaults to 1b. The lines are `wayland-video input: signup clock armed:
+%d ms then %d more at 5s, key %02x`, `signup answered (%d left)` and `signup
+held for %d ms and released`, beside the `opening enter` and `opening play`
+lines. The press and its release re-assert the window's capture state like
+every other press, because the r0.67 reading proved a press that skips that
+is dropped by the owner silently.
+
+The clock counts calls, not bytes, and costs one key pair to the streamer
+while the window is armed: nothing is buffered, no rate is added, and an
+attempt that does not arm it is unchanged.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -742,6 +742,85 @@
+     m_playTimer->start();
+ }
+ 
++// The signup clock is the third notice of the chain the r0.68 attempt read:
++// the PLAY press answered the splash and the witness frames then show a screen
++// that waits for a key rather than a highlighted button, so an Enter would
++// start the signup flow the seat cannot finish and the Esc that skips it is
++// what is worth trying first. Everything else is the notice clocks' shape:
++// armed at its own distance, one press per notice as measured, the press and
++// its release re-asserting the window's capture state exactly as 0040 requires,
++// because the r0.67 reading proved a press that skips that is dropped silently.
++void WaylandVideoSurface::armSignupNoticeClock()
++{
++    static const int armMs = [] {
++        const int parsed = qgetenv("OPENNOW_SIGNUP_MS").toInt();
++        return parsed > 0 ? parsed : 0;
++    }();
++    if (armMs <= 0) return;
++    static const int times = [] {
++        const int parsed = qgetenv("OPENNOW_SIGNUP_TIMES").toInt();
++        return parsed > 0 ? parsed : 1;
++    }();
++    static const quint16 key = [] {
++        const quint32 parsed = qgetenv("OPENNOW_SIGNUP_KEY").toUInt(nullptr, 16);
++        return parsed > 0 ? quint16(parsed) : quint16(0x1b);
++    }();
++    m_signupKey = key;
++    m_signupLeft = times;
++    m_signupHeldMs = 0;
++    if (!m_signupTimer) {
++        m_signupTimer = new QTimer(this);
++        m_signupTimer->setTimerType(Qt::PreciseTimer);
++        connect(m_signupTimer, &QTimer::timeout, this, [this] { answerSignupNotice(); });
++    }
++    m_signupTimer->setInterval(armMs);
++    m_signupTimer->start();
++    qInfo("wayland-video input: signup clock armed: %d ms then %d more at 5s, key %02x",
++          armMs, m_signupLeft - 1, key);
++}
++
++void WaylandVideoSurface::answerSignupNotice()
++{
++    static const int holdMs = [] {
++        const int parsed = qgetenv("OPENNOW_SIGNUP_HOLD_MS").toInt();
++        return parsed > 0 ? parsed : 150;
++    }();
++    if (m_signupLeft <= 0 && m_signupHeldMs <= 0) {
++        if (m_signupTimer) m_signupTimer->stop();
++        return;
++    }
++    if (m_signupHeldMs > 0) {
++        const int held = m_signupHeldMs;
++        m_signupHeldMs = 0;
++        reassertCaptureOwner("signup release");
++        if (m_input.key) m_input.key(m_signupKey, 0, false);
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++            qInfo("wayland-video input: signup held for %d ms and released", held);
++        if (!m_signupTimer) return;
++        if (m_signupLeft <= 0) {
++            m_signupTimer->stop();
++            return;
++        }
++        m_signupTimer->setInterval(5'000);
++        m_signupTimer->start();
++        return;
++    }
++    if (m_input.key) {
++        --m_signupLeft;
++        // The key is the one the notice names: Esc skips the signup, and it
++        // travels the same key API and code space a finger on the seat's
++        // keyboard would use.
++        reassertCaptureOwner("signup press");
++        m_input.key(m_signupKey, 0, true);
++        m_signupHeldMs = holdMs;
++        qInfo("wayland-video input: signup answered (%d left)", m_signupLeft);
++    }
++    if (!m_signupTimer) return;
++    m_signupTimer->stop();
++    m_signupTimer->setInterval(m_signupHeldMs > 0 ? holdMs : 5'000);
++    m_signupTimer->start();
++}
++
+ void WaylandVideoSurface::releaseHeldKeys()
+ {
+     m_f11Down = false;
+@@ -1046,6 +1125,7 @@
+     qInfo("wayland-video: stream window created");
+     armOpeningEnterClock();
+     armOpeningPlayClock();
++    armSignupNoticeClock();
+     return true;
+ }
+ 
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -235,6 +235,20 @@
+     // long each press stays down.
+     void armOpeningPlayClock();
+     void answerOpeningPlay();
++
++    // The third notice of the chain, the one the r0.68 witness revealed where
++    // the two Enter clocks stop being enough: answering the PLAY splash opens a
++    // signup screen whose options are bound to keys rather than one highlighted
++    // button, "Sign Me Up" on Enter and "Not Now" on Esc. Enter would start the
++    // signup the seat cannot complete, so this clock's key is an env and its
++    // default is the skip. OPENNOW_SIGNUP_MS arms it at its own distance from
++    // the window becoming live (unset arms nothing), OPENNOW_SIGNUP_TIMES (1
++    // when unset) repeats it at the same 5 s follow-up spacing as the other
++    // notice clocks, OPENNOW_SIGNUP_HOLD_MS (150 when unset) holds each press,
++    // and OPENNOW_SIGNUP_KEY is the key in the same virtual-key space the
++    // streamer's own text path uses (0x0d Enter, 0x1b Esc) and defaults to Esc.
++    void armSignupNoticeClock();
++    void answerSignupNotice();
+     [[nodiscard]] quint16 wireModifiers(quint16 virtualKey) const;
+     [[nodiscard]] static quint16 virtualKeyFor(quint32 evdev);
+ 
+@@ -284,6 +298,12 @@
+     QTimer *m_playTimer = nullptr;
+     int m_playLeft = 0;
+     int m_playHeldMs = 0;
++    // The clock that answers the signup notice with a key of its own (see
++    // armSignupNoticeClock).
++    QTimer *m_signupTimer = nullptr;
++    int m_signupLeft = 0;
++    int m_signupHeldMs = 0;
++    quint16 m_signupKey = 0x1b;
+     quint32 m_xkbModifiers = 0;
+     bool m_pointerInside = false;
+ 

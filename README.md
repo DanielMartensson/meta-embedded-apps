@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 41, `recipes-apps/opennow/files/0001`…`0041` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.68` |
+| Patches applied | 42, `recipes-apps/opennow/files/0001`…`0042` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.69` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -583,6 +583,49 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 ```bash
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
+
+#### The r0.69 signup clock reaches the character screen, and the third press is what broke in (Nov 4, board `weston@192.168.1.33`)
+
+`0042` (built as `r0.69`, deb md5 `961fdcb99c0fc7d3c06add97166e6a16`) armed the
+third notice of the chain with a key of its own, and the attempt that streamed
+measured both halves of it - the Main Menu the series has been asking for
+renders, and the extra press that was armed for the signup notice is what
+broke in:
+
+- the clocks armed together at window creation (`stream window created`, 11:10:00):
+  `opening enter clock armed: 60000 ms`, `opening play clock armed: 210000 ms`,
+  `signup clock armed: 330000 ms then 0 more at 5s, key 1b`
+- the presses went out at +63 s (11:11:03, the consent window's "ok"), +212 s
+  (11:13:32, the PLAY splash, held 150 ms and released) and +332 s (11:15:32,
+  the signup clock's Esc, held 150 ms and released), and all three crossed the
+  gate and rode the wire: `NVST native input drain: … keys=6 absolutes=1`
+  for the three presses' two transitions each, 3 `events=[key-down(3)]` and 3
+  `events=[key-up(4)]` inside 7 `route=ControlReliable` packets, with
+  `buttons=0 moves=0` so nothing else reached the host that session
+- the witness stills read the chain: the loading screen 13 s after the PLAY
+  press, then the **character screen** 25 s after that - the guardian standing
+  with a class card beside it, and the corner's only key hint,
+  `Esc Exit to Desktop`. That is the Main Menu the series asked for,
+  40 s after the PLAY press
+- the third press is what did not belong there: the Esc hit that corner hint,
+  and the next still reads `ARE YOU SURE? … quit your current session and exit to
+  desktop`, whose options are `Enter Confirm` and `Esc Cancel`, waiting there
+  for the rest of the session
+
+So the measured press budget of the cloud boot is TWO Enters - consent and
+PLAY - and the Main Menu renders without a third press; the signup notice the
+`r0.68` stills named is not what the PLAY press opens next on this path. The
+quit notice has an answer if a player ever does press the corner's Esc - a
+second Esc, its "Cancel" - but arming only the consent and PLAY clocks never
+reaches it, and that is the clean chain the next attempts run.
+
+One rate has to be read in this release: the presented picture advanced at
+`wayland-video fps=0.6` (a histogram of 0.4 to 0.7/s across the session) while
+the stream delivered `opennow-frame-rate native=59.6/s delivered=0.7/s`, and
+the surface's own counters now read `committed=412 dropped=2 flushFailed=116`
+- the `r0.67` attempt had read `dropped=0 flushFailed=0`. A failed compositor
+flush is the first named reason the window's pull clock is kept off, and it is
+open item 17 below, because the seat cannot play at one commit every 1-2 s.
 
 #### The r0.68 play clock answers the PLAY notice, and the chain's third notice becomes visible (Nov 4, board `weston@192.168.1.33`)
 
@@ -1203,6 +1246,8 @@ for audio output.
 | The window logged its presses, 0 of them refused, and the drain says it forwarded none | Both halves are counters now, and the middle is measurable: `0038` (built as `r0.65`) prints `NVST native input drain: available={} clearedPolls={} keys={} absolutes={} moves={} buttons={}` once a pass, and `0039` (built as `r0.66`) prints `NVST embedded input tally: active={} pushed={} dropped={} keys={} … queue={:p}` at the queue's own gate and the same address on the drain's line. Armed together with `OPENNOW_NVST_TRACE=1`, which is what makes the streamer's HID wire lines print at all (`nvst.rs:198 verbose_diagnostics_enabled()`; without it a count of 0 for `NVST native input rx` proves nothing), the `r0.66` run says the presses never entered the queue: `tally: active=false pushed=1 dropped=48 keys=48`, the one absolute the seat made went in with `active=true`, and both sides name one queue `0x295638d0`. The gate is the app's own doing - `StreamVideoItem::syncCaptureState` calls the streamer's `setCaptureActive` directly and silently, and the stream window's own state says active, so nothing re-arms it; `0040` of `r0.67` answers it - the window re-asserts the capture state it asked for before each press and once a second, and the streamer prints the gate's own state changes |
 | A stream dies 78 s to 3.5 min in with `zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd` and `The Wayland connection experienced a fatal error: Protocol error` | Not fixed, and the series keeps meeting it (open item 14 below): the r0.65 attempt died there after 78 s of picture, the r0.66 attempt 101 s in, and each attempt has to be relaunched because of it. The `buffer_fenced_release` assert of the r0.57/r0.58 runs is the same family of death from the other side |
 
+| The stream shows `ARE YOU SURE? … quit your current session and exit to desktop` with `Enter Confirm` / `Esc Cancel` | Not a fault, and not the host: an Esc reached the character screen, whose only visible key hint is the corner's `Esc Exit to Desktop`, so the press asked the game to quit. The notice waits there for the rest of the session; `Esc` answers its "Cancel" and keeps the session, `Enter` ends the cloud game. The measured chain arms only the consent and the PLAY clocks, which never reaches this notice |
+
 | A launch freezes minutes in: only `opennow-present fps=0.0 render=0.0 swapped=0` grows, the log stops growing while both apps stay alive (`opennow-qt` in `wchan=do_sys_poll`, `opennow-core` on `pipe_read`), and `dmesg` shows `[galcore]: GPU[0] core0 hang, automatic recovery.` | Not fixed: the same Vivante/driver death family as the starved capture pool (open item 8) - the lost compositor reply after a driver core hang leaves the interface unpainted and the launch never reaches a stream window. `r0.67`'s first attempt died exactly there; the session has to be relaunched, and the attempt driver now calls a log that stops growing a dead launch instead of waiting out its ten-minute budget |
 
 | `Failed to import plane 0 as R8`, then the stream window closes |
@@ -1588,4 +1633,32 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     unpressed to the host's ~14 min session end. What is owed is a third clock
     of the same shape, armed farther still, answering the signup notice with the
     key it names rather than only with an Enter; the Main Menu itself is still
-    unwitnessed.
+    unwitnessed. `0042` of `r0.69` armed that third press and the attempt that
+    streamed measured what it did, and the launch half of this item is now
+    closed: two presses are the whole budget. The PLAY press lands the game
+    into a loading screen and the character screen renders 40 s after it - the
+    guardian standing with a class card, the corner's only key hint reading
+    `Esc Exit to Desktop` - which is the Main Menu this item asked for. The
+    third press is what broke in: the Esc reached that corner hint, the next
+    still reads the quit confirmation, and it waited there to the session's
+    end. What the chain still owes is not more presses but the rate (open item
+    17) and, only if a player does press the corner's Esc, one more Esc to
+    answer that notice's "Cancel".
+
+17. **The window presents at 0.6/s while the stream is delivered at 59-60/s** -
+    measured across the `r0.67`, `r0.68` and `r0.69` sessions: `wayland-video
+    fps=0.6` with a histogram of 0.4 to 0.7/s for the whole session against
+    `opennow-frame-rate native=59.6/s delivered=0.7/s`, and the surface's own
+    counters now read `committed=412 dropped=2 flushFailed=116` where the
+    `r0.67` attempt had read `dropped=0 flushFailed=0`. The failures are new to
+    these releases and they name the suspect: a failed compositor flush, not a
+    refused frame, is what keeps the window's own pull clock off. This is what
+    makes the cloud game unplayable from the seat - the picture and the sound
+    reach it, but the picture advances once every 1-2 s - so the fix is owed by
+    reading the surface's commit path: whether the weston front window refuses
+    a second commit while the previous one is still pending, whether the
+    surface's `damage` region and its `wl_surface_commit` are paired at all on
+    this path, and whether asking the compositor at 60 Hz is the wrong interval
+    for a surface this large on this driver. It is the same family as the
+    starved capture pool of open item 8 and the `galcore` core hangs the launch
+    retries die in, but a failed flush is measured here and a hang is not.
