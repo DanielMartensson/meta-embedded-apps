@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 39, `recipes-apps/opennow/files/0001`…`0039` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.66` |
+| Patches applied | 40, `recipes-apps/opennow/files/0001`…`0040` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.67` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -584,6 +584,71 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
 
+#### The r0.67 capture gate names who flips it, and the window keeps it armed (Nov 4, board `weston@192.168.1.33`)
+
+The r0.66 reading closed the two-queue theory and left one unexplained silence:
+the window armed capture once and the tally then said `active=false dropped=48`,
+with no capture call anywhere in the app's log. Reading the code names the
+caller exactly, and `0040` (built as `r0.67`, deb md5 `d858ac008683fe9afc0ee67722159c09`)
+answers it from both sides. The cause: the capture owner is **shared**. The
+application's own Qt video item switches it off on its own clock and never says
+so - `StreamVideoItem::syncCaptureState` (`src/streaming/StreamVideoItemInput.cpp:956`)
+calls `NativeStreamRuntime::setCaptureActive(desired, …)` directly, `desired`
+false for an item with no active Qt window focus, which is every run on this
+board because the stream window is weston's window, not a `QQuickWindow`'s. The
+native window's own `WaylandVideoSurface::setCaptureActive` then refuses to
+re-arm because its `m_captureActive` still says active - and `submit` answers
+`OPENNOW_STREAMER_OK` either way, so the presses die silently.
+
+- the streamer side logs the gate's own state changes, so the next reader does
+  not have to read code to find the caller:
+  `NVST embedded capture gate: call={} active={} previous={} relative={} window_handle={} raw={} queue={:p}`
+  on the gate's first call and on every call that changes the state it leaves
+  behind, beside the existing `NVST embedded input tally:` and the drain's line,
+  all three naming the same queue by address
+- the app side re-asserts what it believes it asked for:
+  `WaylandVideoSurface::reassertCaptureOwner(reason)` calls the existing
+  `refreshCaptureState` only while the window's own `m_captureActive` says
+  active - a keyboard that left the window or a teardown still owns that
+  decision and this cannot undo it - before every key transition the window
+  submits (`submitKey`, and the `0032`/`0033` clock's press and release) and
+  once a second on a `QTimer` while the window is live, which keeps a player's
+  pointer and button alive across the silent switch too. The line is
+  `wayland-video input: capture re-armed: %s`
+
+The install reads `/usr/bin/opennow-qt` `capture re-armed`=1 and
+`/usr/lib/libopennow_streamer_ffi.so` `embedded capture gate`=1,
+`embedded input tally`=1, `keeps the capture request armed`=1.
+
+The first `r0.67` attempt (`play-d2c-3.log`, app pid 164313) is evidence about
+the launch, not the re-arm: it never reached a stream window. The gate's first
+call is the app's own silent one reaching the owner before any window exists -
+
+  NVST embedded capture gate: call=1 active=false previous=false relative=false window_handle=0 raw=false queue=0x14e0c850
+
+then the interface came up at 03:26:51 and the log froze at 03:29:41 (13 KB,
+last lines all `opennow-present fps=0.0 render=0.0 swapped=0`). The app stayed
+alive: `opennow-qt` wedged in `wchan=do_sys_poll`, waiting on a compositor
+reply that never came, `opennow-core` on `pipe_read`, and `dmesg` carries
+three `[galcore]: GPU[0] core0 hang, automatic recovery.` for the boot, two
+of them within minutes of this launch. That is the Vivante/driver death
+family the starved capture pool sits in (open item 8), not a `0040`
+regression: with the compositor reply lost, the interface never painted and
+the launch never asked for a window. The attempt driver now treats a log that
+stops growing as a dead launch instead of waiting out its budget, and the
+attempt was relaunched.
+
+How a later attempt's verdict is read - and why the picture is the witness:
+the delivered rate cannot tell Steam's painted window from Destiny's Main
+Menu, both run at 57-60/s, and `weston-screenshooter` answers
+`unauthorized` here. The witness is the streamer's own dev aid:
+`OPENNOW_FRAME_DUMP=<dir>` writes the newest decoded frame as a PPM at most
+once a second (`frame_producer.rs:550 dump_decoded_frame`) and says once
+why one could not be written (`opennow-dump: <reason>`). The `0035`
+screenshot clock saved 0 files on this board because the native Wayland
+path never runs the Qt render callback that completes a screenshot, so it
+is replaced, not fixed.
+
 #### The r0.66 counters name the queue and both sides of its gate (Nov 4, board `weston@192.168.1.33`)
 
 `play-d2-1.log` (the r0.65 attempt that launched Destiny 2 by itself through
@@ -1008,8 +1073,10 @@ for audio output.
 | The stream window appears and closes again ~150 ms later with `the compositor connection failed: Socket operation on non-socket` | Fixed by patch `0036` (built as `r0.63`): ENOTSOCK is what sendmsg answers when the descriptor is not a socket, so the surface's own connection number had been closed and recycled by then; `present()` closes every frame descriptor no request carried, and one of those numbers is the compositor connection. It refuses that number now and says so once, `opennow-diag: frame fd %d is the compositor connection; not closing it` |
 | Nothing on the board can show what the cloud host put on the screen | Answered by patch `0035` (built as `r0.63`): the app's screenshot shortcut cannot be pressed while a stream is up, because the stream window holds the seat's keyboard and forwards the key to the host. `OPENNOW_STREAM_SCREENSHOT_MS` arms the same capture path on a clock (`OPENNOW_STREAM_SCREENSHOT_TIMES` is how many to keep, 4 when unset) and the picture is written where the shortcut writes it, under `Pictures/OpenNOW/Screenshots`; the two ends are `opennow-stream-screenshot: armed every %d ms, %d times` and `opennow-stream-screenshot: saved %s` |
 | The pointer moves over the stream but a click does nothing in the game | Fixed by patch `0034` (built as `r0.62`): the window asked the seat for its `wl_pointer` only when the seat advertised the pointer capability, and on this board that arrives with the first pointer event, so the window had no pointer at all for the first seconds of the stream (`play-dstny9.log`: window created 16:43:56.312, `wayland-video input: the seat now has a pointer` 16:44:03.843). It asks for it at bind now, and the capability event replaces the inert object weston hands out for a seat that never had a pointer (`unbind_pointer_client_resource` nulls the user data before it touches it). The click also carries the last position the compositor reported immediately before the transition, because the streamer clears captured input until the host reports its input channel ready and a dropped motion otherwise leaves the button wherever the host cursor still was. Both ends are greppable: `wayland-video input: streamer capture requested=%d inputAllowed=%d` and `wayland-video input: button %u submit refused status=%d` |
-| The window logged its presses, 0 of them refused, and the drain says it forwarded none | Both halves are counters now, and the middle is measurable: `0038` (built as `r0.65`) prints `NVST native input drain: available={} clearedPolls={} keys={} absolutes={} moves={} buttons={}` once a pass, and `0039` (built as `r0.66`) prints `NVST embedded input tally: active={} pushed={} dropped={} keys={} … queue={:p}` at the queue's own gate and the same address on the drain's line. Armed together with `OPENNOW_NVST_TRACE=1`, which is what makes the streamer's HID wire lines print at all (`nvst.rs:198 verbose_diagnostics_enabled()`; without it a count of 0 for `NVST native input rx` proves nothing), the `r0.66` run says the presses never entered the queue: `tally: active=false pushed=1 dropped=48 keys=48`, the one absolute the seat made went in with `active=true`, and both sides name one queue `0x295638d0`. The gate is the app's own doing - `StreamVideoItem::syncCaptureState` calls the streamer's `setCaptureActive` directly and silently, and the stream window's own state says active, so nothing re-arms it; the answer is owed by the next patch |
+| The window logged its presses, 0 of them refused, and the drain says it forwarded none | Both halves are counters now, and the middle is measurable: `0038` (built as `r0.65`) prints `NVST native input drain: available={} clearedPolls={} keys={} absolutes={} moves={} buttons={}` once a pass, and `0039` (built as `r0.66`) prints `NVST embedded input tally: active={} pushed={} dropped={} keys={} … queue={:p}` at the queue's own gate and the same address on the drain's line. Armed together with `OPENNOW_NVST_TRACE=1`, which is what makes the streamer's HID wire lines print at all (`nvst.rs:198 verbose_diagnostics_enabled()`; without it a count of 0 for `NVST native input rx` proves nothing), the `r0.66` run says the presses never entered the queue: `tally: active=false pushed=1 dropped=48 keys=48`, the one absolute the seat made went in with `active=true`, and both sides name one queue `0x295638d0`. The gate is the app's own doing - `StreamVideoItem::syncCaptureState` calls the streamer's `setCaptureActive` directly and silently, and the stream window's own state says active, so nothing re-arms it; `0040` of `r0.67` answers it - the window re-asserts the capture state it asked for before each press and once a second, and the streamer prints the gate's own state changes |
 | A stream dies 78 s to 3.5 min in with `zwp_linux_surface_synchronization_v1@30: error 0: invalid fence fd` and `The Wayland connection experienced a fatal error: Protocol error` | Not fixed, and the series keeps meeting it (open item 14 below): the r0.65 attempt died there after 78 s of picture, the r0.66 attempt 101 s in, and each attempt has to be relaunched because of it. The `buffer_fenced_release` assert of the r0.57/r0.58 runs is the same family of death from the other side |
+
+| A launch freezes minutes in: only `opennow-present fps=0.0 render=0.0 swapped=0` grows, the log stops growing while both apps stay alive (`opennow-qt` in `wchan=do_sys_poll`, `opennow-core` on `pipe_read`), and `dmesg` shows `[galcore]: GPU[0] core0 hang, automatic recovery.` | Not fixed: the same Vivante/driver death family as the starved capture pool (open item 8) - the lost compositor reply after a driver core hang leaves the interface unpainted and the launch never reaches a stream window. `r0.67`'s first attempt died exactly there; the session has to be relaunched, and the attempt driver now calls a log that stops growing a dead launch instead of waiting out its ten-minute budget |
 
 | `Failed to import plane 0 as R8`, then the stream window closes |
  The decoder retired the frame before the compositor imported it. Patch `0012` pins exactly one handoff frame; a wider ring pins the capture pool and breaks the stream instead |
@@ -1348,3 +1415,17 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     the owner armed while the stream window is the front window - without it the
     game never sees the Enter that answers the cloud game's opening notice, which
     is what the `0032`/`0033` clock and a player's own keyboard both depend on.
+    `0040` of `r0.67` answers both halves of it: the streamer prints the gate's
+    own state changes (the `NVST embedded capture gate:` line names the state,
+    the arguments the caller passed, and the queue by the same address the
+    tally and the drain print), and the window re-applies the state it asked
+    for before every key it submits and once a second while it is live,
+    without overriding a keyboard that left the window. What remains is the
+    measurement: the re-armed presses have to be seen reaching the wire
+    (`NVST native input rx: events=[key...]` and `NVST encoded input tx`),
+    and the verdict on the pop-up has to be read off the `OPENNOW_FRAME_DUMP`
+    PPMs, because the delivered rate cannot tell Steam's window from the
+    Main Menu and the `0035` screenshot clock never saved a file on this
+    board. The first `r0.67` attempt never streamed - it froze in the Vivante
+    driver two minutes and a half in with `galcore` core hangs beside it -
+    so the re-arm's measurement is owed by whichever attempt streams.
