@@ -1,0 +1,153 @@
+From 4a55b2f6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Wed, 4 Nov 2026 9:10:00 +0000
+Subject: [PATCH] 0041 answer the PLAY notice on a clock of its own, two minutes
+ late
+
+The r0.67 attempts read the cloud boot as a picture for the first time
+(OPENNOW_FRAME_DUMP stills, one every 25 s, listed by the d2d driver), and
+the chain is now visible: the first notice is a consent window ("Battlefield
+Launcher" privacy consent, highlighted button reads "ok") that is up from
+the first still; ONE Enter on it answers it and the game launches; the
+Destiny 2 splash that waits for "PRESS ENTER TO PLAY" arrives about 135 s
+after that press. The enter clock's follow-up answers are 5 s apart, so a
+clock set for both notices presses the splash's place long before it exists,
+and the extra presses wander into whatever window the host has open -
+measured in the 24-press and 12-press attempts, which closed the host's own
+windows and left a bare desktop. So the play press gets its own clock:
+OPENNOW_PLAY_ENTER_MS arms it at its own distance from the window becoming
+live (unset arms nothing), OPENNOW_PLAY_ENTER_TIMES (1 when unset) repeats
+it at the same 5 s follow-up spacing, OPENNOW_PLAY_ENTER_HOLD_MS (150 when
+unset) holds each press down - a tap the host never reads. The lines are
+wayland-video input: opening play clock armed: / opening play answered /
+opening play held for and released, beside the existing opening enter lines,
+and the press travels the same key API the seat's Enter and 0032/0033 use.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -669,6 +669,79 @@
+     m_enterTimer->start();
+ }
+ 
++// The play clock is the second half of the chain the r0.67 attempts measured:
++// the first notice goes down seconds after the window is live, but the splash
++// that waits for "PRESS ENTER TO PLAY" only arrives about two minutes after
++// that answer, so this press has its own arming distance instead of the
++// opening clock's 5 s follow-ups - those press the splash's place long before
++// it exists and wander into whatever window the host has open, which is what
++// closed the host's own windows in the 12-press attempt. The press itself
++// travels the same key API and stays down on the same hold principle.
++void WaylandVideoSurface::armOpeningPlayClock()
++{
++    static const int armMs = [] {
++        const int parsed = qgetenv("OPENNOW_PLAY_ENTER_MS").toInt();
++        return parsed > 0 ? parsed : 0;
++    }();
++    if (armMs <= 0) return;
++    static const int times = [] {
++        const int parsed = qgetenv("OPENNOW_PLAY_ENTER_TIMES").toInt();
++        return parsed > 0 ? parsed : 1;
++    }();
++    m_playLeft = times;
++    m_playHeldMs = 0;
++    if (!m_playTimer) {
++        m_playTimer = new QTimer(this);
++        m_playTimer->setTimerType(Qt::PreciseTimer);
++        connect(m_playTimer, &QTimer::timeout, this, [this] { answerOpeningPlay(); });
++    }
++    m_playTimer->setInterval(armMs);
++    m_playTimer->start();
++    qInfo("wayland-video input: opening play clock armed: %d ms then %d more at 5s",
++          armMs, m_playLeft - 1);
++}
++
++void WaylandVideoSurface::answerOpeningPlay()
++{
++    static const int holdMs = [] {
++        const int parsed = qgetenv("OPENNOW_PLAY_ENTER_HOLD_MS").toInt();
++        return parsed > 0 ? parsed : 150;
++    }();
++    if (m_playLeft <= 0 && m_playHeldMs <= 0) {
++        if (m_playTimer) m_playTimer->stop();
++        return;
++    }
++    if (m_playHeldMs > 0) {
++        const int held = m_playHeldMs;
++        m_playHeldMs = 0;
++        reassertCaptureOwner("play release");
++        if (m_input.key) m_input.key(0x0d, 0, false);
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++            qInfo("wayland-video input: opening play held for %d ms and released", held);
++        if (!m_playTimer) return;
++        if (m_playLeft <= 0) {
++            m_playTimer->stop();
++            return;
++        }
++        m_playTimer->setInterval(5'000);
++        m_playTimer->start();
++        return;
++    }
++    if (m_input.key) {
++        --m_playLeft;
++        // Enter is VK_RETURN again: the splash reads the same Enter a finger
++        // on the seat's keyboard would make.
++        reassertCaptureOwner("play press");
++        m_input.key(0x0d, 0, true);
++        m_playHeldMs = holdMs;
++        qInfo("wayland-video input: opening play answered (%d left)", m_playLeft);
++    }
++    if (!m_playTimer) return;
++    m_playTimer->stop();
++    m_playTimer->setInterval(m_playHeldMs > 0 ? holdMs : 5'000);
++    m_playTimer->start();
++}
++
+ void WaylandVideoSurface::releaseHeldKeys()
+ {
+     m_f11Down = false;
+@@ -972,6 +1045,7 @@
+     updatePointerConstraint();
+     qInfo("wayland-video: stream window created");
+     armOpeningEnterClock();
++    armOpeningPlayClock();
+     return true;
+ }
+ 
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -220,6 +220,21 @@
+     // so the window presses its own into the host.
+     void armOpeningEnterClock();
+     void answerOpeningEnter();
++
++    // The measured chain of the cloud boot is two notices far apart: the first
++    // pop-up answers an Enter within seconds of the window being live, but the
++    // Destiny 2 splash that says "PRESS ENTER TO PLAY" only arrives ~135 s
++    // after that press, and the enter clock's follow-up answers 5 s apart run
++    // the presses out long before it. Measured on the r0.67 board: one Enter at
++    // +60 s answered the consent notice and launched the game (the splash was
++    // witness in the streamer's own frame dumps), while the 12 presses 13 s
++    // apart that followed closed the host's own windows and left a bare
++    // desktop. So the play press is a clock of its own, armed far later and
++    // answering once: OPENNOW_PLAY_ENTER_MS says when, OPENNOW_PLAY_ENTER_TIMES
++    // (1 when unset) how many, OPENNOW_PLAY_ENTER_HOLD_MS (150 when unset) how
++    // long each press stays down.
++    void armOpeningPlayClock();
++    void answerOpeningPlay();
+     [[nodiscard]] quint16 wireModifiers(quint16 virtualKey) const;
+     [[nodiscard]] static quint16 virtualKeyFor(quint32 evdev);
+ 
+@@ -264,6 +279,11 @@
+     // The clock that keeps the capture state this window asked for applied
+     // against the owner's own switches (see reassertCaptureOwner).
+     QTimer *m_rearmTimer = nullptr;
++    // The clock that answers the "PRESS ENTER TO PLAY" splash far later than
++    // the opening clock (see armOpeningPlayClock).
++    QTimer *m_playTimer = nullptr;
++    int m_playLeft = 0;
++    int m_playHeldMs = 0;
+     quint32 m_xkbModifiers = 0;
+     bool m_pointerInside = false;
+ 

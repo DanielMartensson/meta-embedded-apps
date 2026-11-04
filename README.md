@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 40, `recipes-apps/opennow/files/0001`…`0040` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.67` |
+| Patches applied | 41, `recipes-apps/opennow/files/0001`…`0041` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.68` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -583,6 +583,58 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 ```bash
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
+
+#### The r0.68 play clock answers the PLAY notice, and the chain's third notice becomes visible (Nov 4, board `weston@192.168.1.33`)
+
+The r0.67 stills closed open item 16's question and named the press budget: ONE
+Enter per notice, the notices about 135 s apart, and any extra press of the
+opening clock wanders into whatever window the host has open (measured twice:
+the 24-press and the 12-press attempts both closed the host's own windows and
+left a bare desktop). The follow-up answers of the `0032`/`0033` clock are 5 s
+apart, so no setting of that clock can hold that shape. `0041` (built as
+`r0.68`, deb md5 `46058ccf2936c505f94b3f57ad18a037`) gives the second notice a
+clock of its own, beside the opening one and with the same key machinery:
+
+- `OPENNOW_PLAY_ENTER_MS` says how far after the stream window became live the
+  PLAY press goes out - unset arms nothing, so an attempt can still answer only
+  the first notice
+- `OPENNOW_PLAY_ENTER_TIMES` (1 when unset) repeats it at the same 5 s follow-up
+  spacing, `OPENNOW_PLAY_ENTER_HOLD_MS` (150 when unset) holds each press down
+- the press and its release re-assert the window's capture state exactly as
+  `0040`'s enter presses do, so a press cannot be lost in the silent switch the
+  r0.67 reading named
+- the lines are `wayland-video input: opening play clock armed: … ms then … more at 5s`,
+  `opening play answered (… left)` and `opening play held for … ms and released`,
+  beside the existing `opening enter` lines
+
+The install reads `/usr/bin/opennow-qt` `opening play clock armed`=1,
+`opening play answered`=1 and still `capture re-armed`=1 from `r0.67`, and the
+ffi keeps `embedded capture gate`=1, `embedded input tally`=1 and
+`keeps the capture request armed`=1.
+
+The first `r0.68` attempt that streamed (`play-d2d-14.log`, window live from
+~09:51:27) is the measured answer, and it walks one notice further down the
+chain:
+
+- `wayland-video input: opening play clock armed: 210000 ms then 0 more at 5s`
+  at window creation, then `opening enter answered (0 left)` at 09:52:31 (+64 s,
+  the consent window's "ok") and `opening play answered (0 left)` at 09:55:00
+  (+213 s) followed by `opening play held for 150 ms and released`
+- the presses crossed the gate and reached the host: `NVST native input drain:
+  … keys=4 absolutes=1` for the two presses' two transitions each, and the HID
+  wire carried 2 `events=[key-down(3)]` and 2 `events=[key-up(4)]` inside 5
+  `route=ControlReliable` packets
+- the witness stills read the chain: 25 s after the PLAY press the splash that
+  waited "PRESS ⏎ TO PLAY" is gone and the host shows a new notice -
+  **SIGN UP / JOIN THE FIGHT // EARN EXOTIC GEAR**, whose two options are bound to
+  keys: `⏎ Sign Me Up` and `Esc Not Now`. That notice then sits unpressed from there
+  to the end of the session, which the host ended again at ~14 min after window
+  creation through `0031`'s close
+
+So the cloud chain is three notices deep, not two: consent `⏎`, PLAY `⏎`, and a
+signup notice that answers `⏎` to sign up or `Esc` to skip. A third clock of the
+same shape, armed farther still and answering with a key the notice can name, is
+owed by the next patch; the Main Menu itself has not been witnessed yet.
 
 #### The r0.67 capture gate names who flips it, and the window keeps it armed (Nov 4, board `weston@192.168.1.33`)
 
@@ -1526,5 +1578,14 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     windows and leave a bare desktop. What remains owed is a clock that can
     hold that shape - one press per notice, notices ~135 s apart, which the
     5 s follow-ups of the `0032`/`0033` clock cannot do; `0041` of `r0.68`
-    arms the PLAY press on a clock of its own, and the Main Menu itself is
-    owed to whichever attempt answers both notices.
+    arms the PLAY press on a clock of its own, and the first `r0.68` attempt
+    that streamed measured it: the consent answer at +64 s and the PLAY answer
+    at +213 s both crossed the gate (`drain … keys=4`) and rode the wire (2
+    `key-down(3)` and 2 `key-up(4)`), and the stills 25 s later read the splash
+    answered. The chain is deeper than it was thought: the notice the PLAY press
+    opens is **SIGN UP / JOIN THE FIGHT // EARN EXOTIC GEAR** with two options
+    bound to keys - `⏎ Sign Me Up` or `Esc Not Now` - and it waited there
+    unpressed to the host's ~14 min session end. What is owed is a third clock
+    of the same shape, armed farther still, answering the signup notice with the
+    key it names rather than only with an Enter; the Main Menu itself is still
+    unwitnessed.
