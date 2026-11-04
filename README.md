@@ -638,6 +638,44 @@ the launch never asked for a window. The attempt driver now treats a log that
 stops growing as a dead launch instead of waiting out its budget, and the
 attempt was relaunched.
 
+The second `r0.67` attempt (`play-d2c-4.log`, window live 04:08:29 to 04:23:08,
+14.7 min - the first session in this series to outlive the release-fence death
+window, `invalid fence` 0 times) is the measured answer, and it closes the input
+half:
+
+- the gate transitions are now visible in one line each: `call=1 active=false`
+  (the app's Qt item reaches the owner before any window exists), `call=25
+  active=true` (the window arms it at its creation), and the flip-flop cycle
+  `26 false / 27 true / 28 false / 30 true` - the silent Qt-item flip and the
+  window's re-arm, both named
+- `NVST embedded input tally: active=true pushed=48 dropped=0 keys=47` beside
+  `NVST native input drain: available=true … keys=48`: all 24 Enter presses
+  of the opening clock crossed the gate and were forwarded
+- the HID wire carried them: 24 `events=[key-down(3)]` and 24 `key-up(4)`
+  packets with 49 `route=ControlReliable`
+- 249 `capture re-armed: clock` lines while the window was live, plus the
+  `key`/`enter press`/`enter release` re-arms at the presses
+
+The picture half is read off the witness PPMs (the streamer's own decoded
+frame): in the frames after the Enter burst the opening pop-up is gone - the
+presses reached the host and answered it - but the game did not launch: Steam
+sat on the store's **Featured & Recommended carousel, slide 6 of 10**
+(Torchlight Infinite featured), cursor still at its rest position, from ~6 min
+after the window to its end; at 04:23:08.864
+`opennow-server-end-closes-window: the server ended the session; unmapping the
+stream window` - the host's ~14 min idle timeout closing through `0031`'s
+path, and the app alive after it. What the presses did not do is navigate,
+which is open item 16.
+
+One rate has to be called out for the next reader: the window presented at
+`wayland-video fps=0.6 committed=475 dropped=0 flushFailed=0` across this
+session while the decoder produced `native=59.5/s` - the stills differ so the
+picture advanced, but one commit per 1.7 s reached the compositor. With
+`dropped=0` nothing was refused: something kept the window's own pull clock
+off. The re-arm costs one call to the streamer per second and the stills cost
+nothing on the board, so this reads as owed to whatever starves the pull (the
+same suspect as the starved capture pool), not as a `0040` rate addition.
+
 How a later attempt's verdict is read - and why the picture is the witness:
 the delivered rate cannot tell Steam's painted window from Destiny's Main
 Menu, both run at 57-60/s, and `weston-screenshooter` answers
@@ -1428,4 +1466,21 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
     Main Menu and the `0035` screenshot clock never saved a file on this
     board. The first `r0.67` attempt never streamed - it froze in the Vivante
     driver two minutes and a half in with `galcore` core hangs beside it -
-    so the re-arm's measurement is owed by whichever attempt streams.
+    the second attempt measured it end to end: 48 key transitions pushed with
+    0 dropped, 48 forwarded by the drain, 24 Enter presses on the HID wire,
+    and the pop-up gone in the witness frames. What is still owed is the game:
+    the answered presses never launched anything (open item 16 below).
+
+16. **The pop-up is answered and the presses reach the host, but the cloud
+    game is never launched** - measured on the second `r0.67` attempt
+    (`play-d2c-4.log`): the gate, the wire and the witness all say the window's
+    24 Enters went through and the pop-up is gone, yet Steam sat the whole
+    session on the store's Featured & Recommended carousel, slide 6 of 10,
+    cursor at rest, until the host's ~14 min idle timeout ended the session
+    through `0031`'s close. The host accepts the presses but nothing navigates:
+    either Steam waits for a click on a launch button (the `r0.62`
+    pointer-with-position path is armed and a click with a known rest position
+    is available) or the app-id opens the store page rather than the game
+    itself. The time-lapse of the next attempts - time-stamped stills from
+    window creation through the Enter burst, kept by the `d2d` driver - is
+    what tells the two candidates apart.
