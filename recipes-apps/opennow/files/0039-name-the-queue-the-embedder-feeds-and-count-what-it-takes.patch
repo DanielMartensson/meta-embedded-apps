@@ -1,0 +1,163 @@
+From 3f45a1e4d2f9b2b46b2f0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Tue, 3 Nov 2026 23:20:00 +0000
+Subject: [PATCH] 0039 name the queue the embedder feeds and count what it takes
+
+The window says it pressed, the drain says it forwarded nothing, and both are
+true. `play-d2-1.log` (the r0.65 attempt that launched Destiny 2 by itself
+through `--launch-app-id=100362311`) is the cleanest run this series has
+produced so far: the window opened by itself 132 s in, the streamer's input
+gate was already open, and the HID wire was finally visible because
+`OPENNOW_NVST_TRACE=1` arms `verbose_diagnostics_enabled()` (`nvst.rs:198`)
+- without that variable a count of 0 for the wire markers proves nothing,
+which is what the last two sessions got wrong.
+
+  23:08:01.146 wayland-video: stream window created
+  23:08:01.171 wayland-video input: capture active        (never inactive again)
+  23:09:01.146 wayland-video input: opening enter answered (14 left)
+  23:09:01.298 wayland-video input: opening enter held for 150 ms and released
+  ... 4 presses, 5 s apart, 0 of them refused
+  NVST native input drain: available=true clearedPolls=2906 keys=0 absolutes=1 moves=0 buttons=0
+  NVST native input rx: events=[mouse-settings(25)]
+  NVST encoded input tx: route=ControlReliable
+  NVST native input rx: events=[mouse-absolute(5)]
+  NVST encoded input tx: route=ControlPartial
+
+So the drain's queue is live and shared: the one absolute the seat made at the
+window's own creation came through and was encoded onto the wire. The four
+Enters the window answered Steam's pop-up with never reached `queue_input` at
+all, and `submit` returns nothing, so a press that `EmbeddedInputCapture`
+refuses (`embedded_input.rs:139: if self.active.load(Ordering::Acquire)`) is
+silent even though the surface asked for capture and the streamer accepted it.
+Nothing in the middle says which queue the window wrote and whether it took the
+event.
+
+This counts both sides of that gate and prints the queue's address:
+
+  NVST embedded input tally: active={} pushed={} dropped={} keys={} moves={}
+      absolutes={} buttons={} other={} queue={:p}
+
+once per 24 events, and puts the same address beside the drain's counters, so
+the next session can say in one line whether a press entered the queue the
+drain reads, entered a queue nobody reads, or was dropped because capture was
+inactive. The counters are statics of `AtomicUsize` and the drain gains one
+`format!` per 5 s line; nothing is buffered.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/native/opennow-streamer/crates/opennow-streamer-core/src/lib.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-core/src/lib.rs
+@@ -1967,13 +1967,16 @@
+         if drainNow >= drainAt {
+             drainAt = drainNow + Duration::from_secs(5);
+             eprintln!(
+-                "NVST native input drain: available={} clearedPolls={} keys={} absolutes={} moves={} buttons={}",
++                "NVST native input drain: available={} clearedPolls={} keys={} absolutes={} moves={} buttons={} queue={}",
+                 feedback_state.input_available,
+                 drainClearedPolls,
+                 drainKeys,
+                 drainAbsolute,
+                 drainMoves,
+                 drainButtons,
++                captured_input.as_ref()
++                    .map(|queue| format!("{:p}", Arc::clone(queue)))
++                    .unwrap_or("none".to_owned()),
+             );
+         }
+         if let Some(feedback) = media_feedback.as_ref() {
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs
+@@ -1,9 +1,79 @@
+ use std::sync::Arc;
+ use std::sync::Mutex;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
+ use crate::{CapturedInput, CapturedInputQueue, MouseSettings};
+ 
++// What the embedder actually handed the queue, and whether the queue's owner
++// was allowed to take it. The window reports its own presses (a key line per
++// transition, and 0 submit refusals because submit returns nothing), and the
++// drain reports what it forwarded; nothing in between says whether the event
++// ever entered the queue or which queue it entered. These counters close both
++// halves of that gap and name the queue by address so the drain's own line can
++// be put next to them.
++const EMBEDDED_INPUT_LOG_EVERY: usize = 24;
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum EmbeddedInputKind {
++    Key,
++    Move,
++    Absolute,
++    Button,
++    Other,
++}
++
++fn embedded_input_kind(input: &CapturedInput) -> EmbeddedInputKind {
++    match input {
++        CapturedInput::Key { .. } => EmbeddedInputKind::Key,
++        CapturedInput::MouseMove { .. } => EmbeddedInputKind::Move,
++        CapturedInput::MouseAbsolute { .. } => EmbeddedInputKind::Absolute,
++        CapturedInput::MouseButton { .. } => EmbeddedInputKind::Button,
++        _ => EmbeddedInputKind::Other,
++    }
++}
++
++fn embedded_input_tally(
++    kind: EmbeddedInputKind,
++    queue: Arc<CapturedInputQueue>,
++    active: bool,
++) {
++    static KEYS: AtomicUsize = AtomicUsize::new(0);
++    static MOVES: AtomicUsize = AtomicUsize::new(0);
++    static ABSOLUTES: AtomicUsize = AtomicUsize::new(0);
++    static BUTTONS: AtomicUsize = AtomicUsize::new(0);
++    static OTHER: AtomicUsize = AtomicUsize::new(0);
++    static PUSHED: AtomicUsize = AtomicUsize::new(0);
++    static DROPPED: AtomicUsize = AtomicUsize::new(0);
++
++    match kind {
++        EmbeddedInputKind::Key => KEYS.fetch_add(1, Ordering::Relaxed),
++        EmbeddedInputKind::Move => MOVES.fetch_add(1, Ordering::Relaxed),
++        EmbeddedInputKind::Absolute => ABSOLUTES.fetch_add(1, Ordering::Relaxed),
++        EmbeddedInputKind::Button => BUTTONS.fetch_add(1, Ordering::Relaxed),
++        _ => OTHER.fetch_add(1, Ordering::Relaxed),
++    };
++    let counted =
++        if active {
++            PUSHED.fetch_add(1, Ordering::Relaxed) + 1
++        } else {
++            DROPPED.fetch_add(1, Ordering::Relaxed) + 1
++        };
++    if counted == 1 || counted % EMBEDDED_INPUT_LOG_EVERY == 0 {
++        eprintln!(
++            "NVST embedded input tally: active={} pushed={} dropped={} keys={} moves={} absolutes={} buttons={} other={} queue={:p}",
++            active,
++            PUSHED.load(Ordering::Relaxed),
++            DROPPED.load(Ordering::Relaxed),
++            KEYS.load(Ordering::Relaxed),
++            MOVES.load(Ordering::Relaxed),
++            ABSOLUTES.load(Ordering::Relaxed),
++            BUTTONS.load(Ordering::Relaxed),
++            OTHER.load(Ordering::Relaxed),
++            queue,
++        );
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum EmbeddedLocalAction {
+     Guide,
+@@ -73,8 +143,12 @@
+                 return;
+             }
+         }
++        let kind = embedded_input_kind(&input);
+         if self.active.load(Ordering::Acquire) {
+             self.queue.push(input);
++            embedded_input_tally(kind, Arc::clone(&self.queue), true);
++        } else {
++            embedded_input_tally(kind, Arc::clone(&self.queue), false);
+         }
+     }
+ 
