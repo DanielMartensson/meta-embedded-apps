@@ -1,0 +1,158 @@
+From 6d72e4f80b9c5d1e2f3a4b5c6d7e8f901a2b3c4d5e6f70819a0b1c2d3e4f5a6b7c8d9 Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Wed, 4 Nov 2026 20:55:00 +0000
+Subject: [PATCH] 0044 close the duplicate of a refused frame when the number is
+ the streamer's own, and split the refusal counter by kind
+
+`0043` moved the deaths later without removing one: the seat's own session ran
+Destiny 2 at 50/s for 52 minutes and 150,129 presents and then ended the same
+way as the others, `The Wayland connection experienced a fatal error: Bad
+file descriptor`, immediately after the surface's own line
+
+  2026-11-04T19:52:50.257 warning default: wayland-video: dropping a frame
+  (the frame could not be exported as a DMA-BUF); continuing
+
+That session's counters read `dropped=2989 flushFailed=0` against `dropped=0`
+on every run before the band, and its process table grew with them:
+`live=103 highest=4113` at 8 minutes to `live=1303 highest=5312` at 17, about
+one descriptor a second, while `dmesg` collected 76 `cma: cma_alloc: reserved:
+alloc failed, req-size: 893 pages` entries and the log answered
+`could not be exported as a DMA-BUF` 6751 times. A duplicate keeps the dma-buf
+object it names alive, so every refused present pinned one capture buffer of
+the 3657728-byte pool, and a session that refuses 1200 of 65,936 presents a
+second time is the starved capture pool of open item 8 arriving from inside the
+process. Closing the duplicate is what releases it.
+
+Refusing to close was only ever right about a *shared* number: the guard above
+this branch and `0023`/`0026`'s ownership walk exist because the number could
+already be the decoder's own export of the same picture or the compositor
+connection's (`opennow-diag: frame fd %d is the compositor connection`), so
+closing it revoked something else. Above `0043`'s band the number is always the
+crate's own `F_DUPFD_CLOEXEC` duplicate, so the surface owns it and closing a
+refused one is simply ours to make. `bufferFor` therefore leaves the `queued`
+flag clear when the refused frame's descriptor is at or above the mirrored
+band constant, and `present()`'s existing `!handedOver` close releases it;
+below the band the flag stays set and the behaviour is exactly `r0.70`'s.
+
+The same branch counts the two kinds of refusal open item 18 asked to be told
+apart, since one line has covered both until now: `planesAbsent` is a frame
+whose descriptor answers a size its planes do not fit (the capture pool retired
+the picture across `0011`'s one-frame handoff ring) and `noBuffer` is one the
+surface could not answer for another reason (the descriptor names nothing, or
+the dmabuf params could not be built). The rate line grows to `wayland-video
+fps=... committed=... dropped=... planes=... dead=... flushFailed=...`, keeping
+every marker `r0.44` read.
+
+Nothing is buffered and no rate is added: a session that refuses nothing is
+unchanged, and a refused frame still costs one present.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -31,6 +31,15 @@
+ // decoder that hands out a fresh buffer every frame cannot grow the cache
+ // without bound.
+ constexpr int kMaxCachedBuffers = 24;
++// Mirrors EXPORT_FD_BAND in the streamer's crate root (`0043`): a frame
++// descriptor at or above this number is always this crate's own F_DUPFD_CLOEXEC
++// duplicate, so the surface owns the number outright and closing the duplicate
++// of a frame it refused is simply ours to do. Below it the number could already
++// be the decoder's own export or the compositor connection's, which is the state
++// `0023` and `0026` made the ownership careful about and the reason a refused
++// frame's descriptor used to stay open. The value is written down twice because
++// the Rust streamer and the Qt application are built as separate trees.
++constexpr int kOwnExportFdBand = 4096;
+ 
+ QString fourccName(quint32 format)
+ {
+@@ -1375,8 +1384,9 @@
+         m_sampleStart = now;
+         m_sampleCount = 0;
+         if (qEnvironmentVariableIsSet("OPENNOW_LOG_PRESENT"))
+-            qInfo("wayland-video fps=%.1f committed=%llu dropped=%llu flushFailed=%llu",
+-                  fps, m_committed, m_dropped, m_flushFailures);
++            qInfo("wayland-video fps=%.1f committed=%llu dropped=%llu planes=%llu dead=%llu flushFailed=%llu",
++                  fps, m_committed, m_dropped, m_planesAbsent, m_noBuffer,
++                  m_flushFailures);
+     }
+ }
+ 
+@@ -1384,7 +1394,12 @@
+ {
+     if (queued) *queued = false;
+     struct stat info {};
+-    if (::fstat(frame.fd, &info) != 0) return nullptr;
++    if (::fstat(frame.fd, &info) != 0) {
++        // The number names nothing: the frame cannot be sent, and nothing
++        // reached a request, so present() closes it.
++        ++m_noBuffer;
++        return nullptr;
++    }
+     const quint64 device = quint64(info.st_dev);
+     const quint64 inode = quint64(info.st_ino);
+     const quint32 planeCount = std::min<quint32>(frame.planeCount, 2);
+@@ -1454,7 +1469,20 @@
+         // already cached: no request carried the descriptor and the surface
+         // still does not own it, which leaves the streamer's own close of the
+         // picture in charge of the number.
+-        if (queued) *queued = true;
++        ++m_planesAbsent;
++        // Whether the refusal's descriptor may be closed. Below the band the
++        // answer is "not by us": the number could already be the decoder's own
++        // export of the same picture or the compositor connection's, which is
++        // what the refusal above this branch and `0023`'s ownership walk around,
++        // so the flag stays set and the frame's duplicate is left open. Above
++        // the band (`0043`) the number is always the crate's own duplicate, so
++        // the flag is left clear and present() closes it - which is what stops
++        // the one leaked descriptor a second the r0.70 session measured (its
++        // table went from live=103 highest=4113 at 8 minutes to live=1303
++        // highest=5312 at 17).
++        if (frame.fd < kOwnExportFdBand) {
++            if (queued) *queued = true;
++        }
+         return nullptr;
+     }
+ 
+@@ -1478,7 +1506,10 @@
+     }
+ 
+     zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(m_dmabuf);
+-    if (!params) return nullptr;
++    if (!params) {
++        ++m_noBuffer;
++        return nullptr;
++    }
+     // The add requests carry the descriptor, so libwayland owns it from here
+     // on and closes it once they are written; the surface must not close it
+     // again (see forgetDeferredFds()). Tracking it before the flush keeps the
+@@ -1494,7 +1525,10 @@
+     wl_buffer *buffer = zwp_linux_buffer_params_v1_create_immed(
+         params, quint32(frame.size.width()), quint32(frame.size.height()), frame.format, 0);
+     zwp_linux_buffer_params_v1_destroy(params);
+-    if (!buffer) return nullptr;
++    if (!buffer) {
++        ++m_noBuffer;
++        return nullptr;
++    }
+     static const wl_buffer_listener bufferListener = [] {
+         wl_buffer_listener listener{};
+         listener.release = handleBufferRelease;
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -350,6 +350,15 @@
+     bool m_windowed = false;
+     quint64 m_committed = 0;
+     quint64 m_dropped = 0;
++    // `dropped` answers every present the surface refused; these two say which
++    // kind refused it. `planesAbsent` is a frame whose descriptor answers a size
++    // its planes do not fit - the capture pool retired the picture across
++    // `0011`'s one-frame handoff ring, the same starvation as the starved-pool
++    // open item - and `noBuffer` is a frame the surface could not answer for
++    // another reason: the descriptor names nothing any more, or the dmabuf
++    // params could not be built. One line covered both until now.
++    quint64 m_planesAbsent = 0;
++    quint64 m_noBuffer = 0;
+     quint64 m_sampleStart = 0;
+     quint64 m_sampleCount = 0;
+ };

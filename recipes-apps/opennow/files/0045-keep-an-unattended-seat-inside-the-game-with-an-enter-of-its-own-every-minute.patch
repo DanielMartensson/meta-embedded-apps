@@ -1,0 +1,172 @@
+From 8c1a2b3c4d5e6f70819a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70819a0b1c Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 5 Nov 2026 09:30:00 +0000
+Subject: [PATCH] 0045 keep an unattended seat inside the game with an Enter of
+ its own every minute
+
+The seat has never been watched unattended for a whole free-tier hour, and
+what ends it is not the app: open item 16 measured an unattended session
+carrying nothing but the two notice presses being ended by the host's own
+idle timeout, about 14 min in through `0031`'s close, while the two sessions
+that carried a player's keys - `keys=5702 absolutes=67 moves=129018
+buttons=4310` in the 52-minute one - stayed inside the game for 35 and 52
+minutes of their own. The difference is traffic the host can see, and the
+traffic the free tier wants is one press a minute, which is also what its
+AFK check answers and what keeps the pop-up's Steam window closed.
+
+`0045` arms a fourth clock of the notices' own shape with a spacing of its
+own: `OPENNOW_KEEP_ENTER_MS` says when the first press comes, `OPENNOW_KEEP_
+ENTER_EVERY_MS` is the spacing (60 s when unset) and `OPENNOW_KEEP_ENTER_TIMES`
+counts the presses (60 when unset, the free tier's hour), each press staying
+down for `OPENNOW_KEEP_ENTER_HOLD_MS` (120 ms when unset) on the hold
+principle `0041` measured. It presses the character screen's own Enter and
+never the corner's Esc, because an Esc there opens the `Exit to Desktop`
+notice and its next still reads the quit confirmation (open item 16's
+measured chain). A minute is also wide enough that this never becomes the
+5 s follow-up burst the opening clock measured as wandering into whatever
+window the host has open and closing it.
+
+Nothing is buffered and no rate is added: the clock rides the same key API
+as the notice clocks, re-asserts `0040`'s capture owner around the press and
+its release exactly as they do, and prints one line per press
+(`wayland-video input: keep-alive answered (%d left)`) so the presses can be
+followed onto the wire through the gate and the drain. A session that does
+not arm it (`OPENNOW_KEEP_ENTER_MS` unset, the default) is unchanged.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
+@@ -751,6 +751,92 @@
+     m_playTimer->start();
+ }
+ 
++// The keep-alive clock is what an unattended seat needs to survive the free
++// tier's whole hour: with nothing at the keyboard the host ends the session on
++// its own idle timeout (open item 16 measured the ~14 min end through `0031`'s
++// close), while a seat that shows activity stays inside the game until GeForce
++// logs the free account out at 60 minutes, which is a logout and not a death.
++// One Enter a minute is the shape the seat's OWN sessions showed: the attempts
++// that carried a player's keys (`moves=129018 keys=5702 buttons=4310` in the
++// 52-minute run) stayed alive, and the unattended one did not. A minute is also
++// wide enough that this never becomes the 5 s follow-up burst the opening
++// clock measured as wandering into whatever window the host has open, and the
++// press is the character screen's own Enter, never the corner's Esc, because
++// an Esc there opens the `Exit to Desktop` notice (open item 16).
++void WaylandVideoSurface::armKeepAliveClock()
++{
++    static const int armMs = [] {
++        const int parsed = qgetenv("OPENNOW_KEEP_ENTER_MS").toInt();
++        return parsed > 0 ? parsed : 0;
++    }();
++    if (armMs <= 0) return;
++    static const int everyMs = [] {
++        const int parsed = qgetenv("OPENNOW_KEEP_ENTER_EVERY_MS").toInt();
++        return parsed > 0 ? parsed : 60'000;
++    }();
++    static const int times = [] {
++        const int parsed = qgetenv("OPENNOW_KEEP_ENTER_TIMES").toInt();
++        return parsed > 0 ? parsed : 60;
++    }();
++    m_keepLeft = times;
++    m_keepHeldMs = 0;
++    m_keepEveryMs = everyMs;
++    if (!m_keepTimer) {
++        m_keepTimer = new QTimer(this);
++        m_keepTimer->setTimerType(Qt::PreciseTimer);
++        connect(m_keepTimer, &QTimer::timeout, this, [this] { answerKeepAlive(); });
++    }
++    m_keepTimer->setInterval(armMs);
++    m_keepTimer->start();
++    qInfo("wayland-video input: keep-alive enter clock armed: %d ms then %d presses at %d ms",
++          armMs, m_keepLeft, everyMs);
++}
++
++void WaylandVideoSurface::answerKeepAlive()
++{
++    static const int holdMs = [] {
++        const int parsed = qgetenv("OPENNOW_KEEP_ENTER_HOLD_MS").toInt();
++        return parsed > 0 ? parsed : 120;
++    }();
++    if (m_keepLeft <= 0 && m_keepHeldMs <= 0) {
++        if (m_keepTimer) m_keepTimer->stop();
++        return;
++    }
++    if (m_keepHeldMs > 0) {
++        // The press is still down: answer with the release and put the clock
++        // back at its own spacing, so a host that reads a short press still
++        // sees the next one a full minute later.
++        const int held = m_keepHeldMs;
++        m_keepHeldMs = 0;
++        reassertCaptureOwner("keep release");
++        if (m_input.key) m_input.key(0x0d, 0, false);
++        if (qEnvironmentVariableIsSet("OPENNOW_LOG_INPUT"))
++            qInfo("wayland-video input: keep-alive held for %d ms and released", held);
++        if (!m_keepTimer) return;
++        if (m_keepLeft <= 0) {
++            m_keepTimer->stop();
++            return;
++        }
++        m_keepTimer->setInterval(m_keepEveryMs);
++        m_keepTimer->start();
++        return;
++    }
++    if (m_input.key) {
++        --m_keepLeft;
++        // Enter is VK_RETURN again: the press is the same one a finger on the
++        // seat's keyboard would make, and 0040's capture owner is re-asserted
++        // around it exactly as the notice clocks do.
++        reassertCaptureOwner("keep press");
++        m_input.key(0x0d, 0, true);
++        m_keepHeldMs = holdMs;
++        qInfo("wayland-video input: keep-alive answered (%d left)", m_keepLeft);
++    }
++    if (!m_keepTimer) return;
++    m_keepTimer->stop();
++    m_keepTimer->setInterval(m_keepHeldMs > 0 ? holdMs : m_keepEveryMs);
++    m_keepTimer->start();
++}
++
+ // The signup clock is the third notice of the chain the r0.68 attempt read:
+ // the PLAY press answered the splash and the witness frames then show a screen
+ // that waits for a key rather than a highlighted button, so an Enter would
+@@ -1135,6 +1221,7 @@
+     armOpeningEnterClock();
+     armOpeningPlayClock();
+     armSignupNoticeClock();
++    armKeepAliveClock();
+     return true;
+ }
+ 
+--- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
++++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.h
+@@ -249,6 +249,16 @@
+     // streamer's own text path uses (0x0d Enter, 0x1b Esc) and defaults to Esc.
+     void armSignupNoticeClock();
+     void answerSignupNotice();
++    // The clock that keeps an UNATTENDED seat inside the game for the free
++    // tier's whole hour. With nobody at the keyboard the host ends the session
++    // on its own idle timeout (open item 16 measured the ~14 min end through
++    // `0031`'s close), while a seat that shows activity stays inside the game
++    // until GeForce logs the free account out at 60 minutes, which is a
++    // logout and not a death. OPENNOW_KEEP_ENTER_MS arms the first press,
++    // OPENNOW_KEEP_ENTER_EVERY_MS is the spacing (60 s when unset) and
++    // OPENNOW_KEEP_ENTER_TIMES counts the presses (60 when unset, the hour).
++    void armKeepAliveClock();
++    void answerKeepAlive();
+     [[nodiscard]] quint16 wireModifiers(quint16 virtualKey) const;
+     [[nodiscard]] static quint16 virtualKeyFor(quint32 evdev);
+ 
+@@ -304,6 +314,12 @@
+     int m_signupLeft = 0;
+     int m_signupHeldMs = 0;
+     quint16 m_signupKey = 0x1b;
++    // The clock that drips an Enter of its own across the session (see
++    // armKeepAliveClock); m_keepEveryMs is the spacing it asked for.
++    QTimer *m_keepTimer = nullptr;
++    int m_keepLeft = 0;
++    int m_keepHeldMs = 0;
++    int m_keepEveryMs = 60'000;
+     quint32 m_xkbModifiers = 0;
+     bool m_pointerInside = false;
+ 
