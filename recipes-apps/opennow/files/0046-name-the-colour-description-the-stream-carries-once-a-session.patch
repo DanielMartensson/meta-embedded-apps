@@ -1,0 +1,87 @@
+From 9d2b3c4d5e6f70819a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f70819a0b1d Mon Sep 17 00:00:00 2001
+From: noname <noname@example.com>
+Date: Thu, 5 Nov 2026 18:20:00 +0000
+Subject: [PATCH] 0046 name the colour description the stream carries, once a session
+
+The seat's picture looked wrong on the owner's television - dark colours reading
+darker than the same numbers on a PC monitor and reds reading further into red -
+and the question was which link is at fault: the stream, the decoder, the seat's
+own colour handling, or the display. Nothing in the series had ever measured the
+colour description the stream carries, because nothing prints it: the seat's
+decode side models it fully (`StreamFormat` holds the pixel format, the range,
+the matrix, the primaries, the transfer function and the chroma siting) and the
+seat's handoff to a compositor drops it, because the legacy DMA-BUF interface
+describes planes and nothing else - `zwp_linux_buffer_params_v1_add` has no room
+for primaries and no room for a transfer function, so a display downstream can
+only guess them. Guessing is exactly the shape of the complaint: a display that
+applies its own native transfer function and a wider primary set to numbers made
+as BT.709 with the video range pushes saturation outward and deepens everything
+from black to mid-grey at once, which is what a set with a wide default colour
+space does to an untagged 8-bit signal.
+
+`0046` prints the description the stream declared, once per session, on both
+paths a decoded frame takes: the DMA-BUF handoff (printed beside `0043`'s own
+band line, since that is where the description is dropped) and the CPU copy,
+whose existing diagnostic line named only the range, the matrix and the chroma.
+The new line reads `opennow-diag: stream colour: pixels=... range=... matrix=...
+primaries=... transfer=... chroma=...` with every field's debug name, so the
+gamut a session carries (BT.709 or the wider BT.2020) and whether the coded
+values follow the video EOTF or an sRGB one can be read from the log next to
+what the compositor decided for its own output (`using color profile:` and
+`attempts EOTF mode:`), and the two sides can be compared rather than argued
+about.
+
+Nothing is converted and no colour is touched: the patch adds two print calls to
+paths that already run once per session, so an unchanged session behaves exactly
+as it did, and the cost when the log is discarded is a branch on an already
+swapped atomic.
+
+Upstream-Status: Inappropriate [STM32MP25 performance work]
+
+--- a/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
++++ b/native/opennow-streamer/crates/opennow-streamer-platform-linux/src/frame_producer.rs
+@@ -527,6 +527,28 @@
+         "opennow-diag: dma-buf export fd band: duplicates start at {}",
+         crate::EXPORT_FD_BAND,
+     ));
++    // Says once what the stream claims about the colours it carries, so the
++    // numbers a seat sends can be read against what the display downstream
++    // assumes: the legacy DMA-BUF handoff has no room for primaries or a
++    // transfer function (`zwp_linux_buffer_params_v1_add` describes planes,
++    // nothing else), so the description the bitstream's own header carried is
++    // dropped right here and a display has to guess it. The range names the
++    // video convention (`Limited` is luma 16..241 with chroma 33..223, which is
++    // what a hantro decode of a limited-range picture reports), the matrix
++    // folds YUV into RGB, the primaries name the gamut the container declared,
++    // the transfer function says whether the coded values follow the video EOTF
++    // or an sRGB one, and the pixel format says whether the picture is 8-bit
++    // SDR at all.
++    static COLOUR_LOGGED: std::sync::Once = std::sync::Once::new();
++    COLOUR_LOGGED.call_once(|| eprintln!(
++        "opennow-diag: stream colour: pixels={:?} range={:?} matrix={:?} primaries={:?} transfer={:?} chroma={:?}",
++        frame.format.pixel_format,
++        frame.format.color_range,
++        frame.format.color_matrix,
++        frame.format.color_primaries,
++        frame.format.color_transfer,
++        frame.format.chroma_location,
++    ));
+     // The buffer is described at the visible height even when the decoder pads
+     // the picture (1088 rows for 1080p): the planes carry their own offsets, so
+     // the extra rows never reach the compositor, and a surface matching the
+@@ -1286,6 +1308,15 @@
+                     frame.format.color_matrix,
+                     frame.format.chroma_location
+                 );
++                eprintln!(
++                    "opennow-diag: stream colour: pixels={:?} range={:?} matrix={:?} primaries={:?} transfer={:?} chroma={:?}",
++                    frame.format.pixel_format,
++                    frame.format.color_range,
++                    frame.format.color_matrix,
++                    frame.format.color_primaries,
++                    frame.format.color_transfer,
++                    frame.format.chroma_location
++                );
+             }
+         }
+         let planes = frame
