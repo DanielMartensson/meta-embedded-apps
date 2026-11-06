@@ -1356,6 +1356,68 @@ the release holds while it is up, not what ends it.
 
 
 
+### OpenNOWLite
+
+`recipes-apps/opennowlite` is the plan-B client. It is a separate recipe, a
+separate package and a separate source file from `opennow`: the two install side
+by side (`/usr/bin/opennow` and `/usr/bin/opennowlite`, no shared file), and
+nothing of the opennow patch series is reused. The upstream base it is pinned to
+is OpenNOW **v1.0.4-nightly.1515.1** (`SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"`),
+the same commit the opennow recipe builds, because OpenNOWLite calls that
+streamer's native FFI rather than reimplementing the NVST protocol.
+
+The design, in the order the pieces were measured:
+
+* **The window is OpenNOWLite's own.** `opennow-lite.c` creates an xdg-shell
+  toplevel (`app_id=opennowlite`) and the seat listeners for the keyboard and
+  the pointer on the same `wl_display`. opennow-qt is not involved at all.
+* **GStreamer draws into that window.** The `wl_display` goes to `waylandsink`
+  through `gst_wl_display_handle_context_new()` (`GstWlDisplayHandleContextType`,
+  from `gstreamer-wayland-1.0`) and the `wl_surface` through the
+  `GstVideoOverlay` window handle - the same hand-off this layer uses for YtGst.
+  An external window has no size of its own, so the sink also needs
+  `gst_video_overlay_set_render_rectangle(0, 0, width, height)` before the first
+  frame; without it it fails with `Window has no size set` and stops.
+* **The input is a separate pipeline.** `opennow-lite` keeps the seat's
+  `wl_keyboard` and `wl_pointer` events itself (Wayland key codes are evdev
+  codes plus 8) and prints them as `opennowlite-input: key ...` and
+  `opennowlite-input: pointer ...`. The same connection owns the window, so the
+  seat gives it focus; no focus hand-off to a Qt shell is needed.
+* **The media path is stage 2.** The streamer decodes H.264/Opus internally and
+  publishes Vulkan textures, so GStreamer cannot take the media yet: stage 2
+  adds an encoded passthrough to the streamer FFI (video NAL units and Opus
+  packets to two `appsrc` elements) and sends the seat's input back through
+  `opennow_streamer_submit_key()` / `opennow_streamer_submit_mouse_relative()`
+  / `opennow_streamer_submit_mouse_absolute()` / `_submit_mouse_button()` after
+  `opennow_streamer_set_capture_active()`. The window and the input path above
+  are the half that does not depend on that patch.
+
+Measured on the board, `opennowlite 1.0.4+nightly.1515.1+git0+b3fe71026d-r0.2`
+(the deb's md5 is `1ba26085b20c3b576370d365cd9706b5`, identical host to board):
+the bare `opennowlite --width 1280 --height 720` prints
+`opennowlite: seat has a keyboard`, `opennowlite: seat has a pointer`,
+`opennowlite: window ready surface=... app_id=opennowlite` and
+`opennowlite: pipeline playing`, keeps the test pattern running in its own
+window (`/home/weston/.runs/lite-2.log`, pid 41414, no pipeline error), and
+takes the whole seat down with a plain `SIGTERM` (it prints
+`opennowlite: stopping keys=N motions=N`). No key press has been witnessed in
+that log yet - the next reader should press one and look for
+`opennowlite-input: key`.
+
+Open items for OpenNOWLite, recorded so they are not mistaken for done:
+
+1. **Stage 2 is not wired**: the encoded passthrough, the `appsrc` pipelines and
+   the `submit_*` calls are the next patch series. Until then the window plays
+   a test pattern and the input is only logged.
+2. **No Opus element on the seat**: `opusparse`, `opusdec` and `opusenc` grep 0
+   in `gst-inspect-1.0` and `libgstopus.so` is not in
+   `/usr/lib/gstreamer-1.0/`, although `libopus0` is installed. The audio half
+   of stage 2 needs either that plugin packaged (`gstreamer1.0-plugins-base`
+   opus split package) or the streamer's own Opus decode kept.
+3. **The hardware video element is `v4l2slh264dec`** (V4L2 stateless, rank
+   primary+1, `/dev/video0`-`3` present), not `v4l2h264dec`. The stage-2 video
+   pipeline must name it explicitly.
+
 ### YtGst
 
 Start `ytgst`. Requires GStreamer plugins, the `yt-dlp` tool and PulseAudio
