@@ -76,11 +76,15 @@ that never had capture armed is unchanged.
 
 Upstream-Status: Inappropriate [STM32MP25 performance work]
 
---- a/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs
-+++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs
-@@ -74,6 +74,43 @@
-     }
- }
+--- a/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs	2026-11-06 08:00:00 +0000
++++ b/native/opennow-streamer/crates/opennow-streamer-platform/src/embedded_input.rs	2026-11-06 08:00:00 +0000
+@@ -1,9 +1,46 @@
+ use std::sync::Arc;
+ use std::sync::Mutex;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
+ use crate::{CapturedInput, CapturedInputQueue, MouseSettings};
  
 +// The gate above is silent about the side that owns it: `submit` answers the
 +// embedder with `OpenNowStreamerStatus::Ok` whether it took the event or threw
@@ -122,7 +126,7 @@ Upstream-Status: Inappropriate [STM32MP25 performance work]
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
  pub enum EmbeddedLocalAction {
      Guide,
-@@ -175,6 +212,7 @@
+@@ -101,6 +138,7 @@
      }
  
      pub fn set_active(&self, active: bool, relative_mouse: bool, window_handle: usize) -> bool {
@@ -130,7 +134,7 @@ Upstream-Status: Inappropriate [STM32MP25 performance work]
          let mut gamepads = self
              .gamepads
              .lock()
-@@ -203,6 +241,14 @@
+@@ -129,6 +167,14 @@
          #[cfg(not(target_os = "windows"))]
          let settings = MouseSettings::UNACCELERATED;
          self.queue.set_mouse_settings(settings);
@@ -144,7 +148,7 @@ Upstream-Status: Inappropriate [STM32MP25 performance work]
 +        );
          raw_relative
      }
- 
+
 --- a/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
 +++ b/opennow-qt/src/streaming/rendering/WaylandVideoSurface.cpp
 @@ -264,6 +264,25 @@

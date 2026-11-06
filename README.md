@@ -48,8 +48,8 @@ Additional recipes shipped in this layer.
 | Item | Value |
 | --- | --- |
 | Upstream source | `dev` branch, `SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"` |
-| Patches applied | 46, `recipes-apps/opennow/files/0001`…`0046` |
-| Package version | `1.0.4+git1+b3fe71026d-r0.73` |
+| Patches applied | 35 (the play set), `recipes-apps/opennow/files/0001`…`0044` with gaps at the retired numbers; 11 retired aside in `recipes-apps/opennow/files-unused-playset/` |
+| Package version | `1.0.4+git1+b3fe71026d-r0.74` |
 | Reference series kept aside | 39 patch files of the older `987ab3da` SRCREV, in `files-legacy-987ab3da/` (not in `SRC_URI`, not applied) |
 
 The two series solve the same problem from different directions, so only one
@@ -583,6 +583,48 @@ Run `nanobrowser`. As root, disable the Chromium sandbox:
 ```bash
 QTWEBENGINE_DISABLE_SANDBOX=1 nanobrowser
 ```
+
+#### The `r0.74` slim play set: the clocks and the tallies out, and the window opens on the first try (Nov 6, board `weston@192.168.1.33`)
+
+`r0.74` keeps the 35 patches a human player needs and retires the 11 that were
+only ever a witness or a clock for a seat nobody was driving; the retired files
+sit beside the series in `recipes-apps/opennow/files-unused-playset/` so the
+record keeps them while `SRC_URI` does not. Dropped clocks, five: `0015` pressed
+the Start button on a clock of its own, `0035` took a picture of the stream when
+asked for one, `0041`/`0042` answered the PLAY notice and the signup notice on
+clocks of their own, `0045` kept an unattended seat inside the game with an
+Enter every minute - all of them exist to keep a session alive while nobody was
+at the seat, and a player who is watching the window clicks those notices
+instead. Dropped tallies, six: `0020` wrote the diagnostic export when the
+interface exits, `0021`/`0022` measured the two halves of the frame handoff on
+the pull clock and named the starvation it saw, `0038`/`0039` counted what the
+drain side did with the window's input and named the queue the embedder feeds,
+`0046` named the colour description the stream carries - all print-only, their
+numbers fed the write-ups above and never changed what the seat did. Two groups
+are kept whole because dropping one half breaks the other half's context: `0019`
+and `0029`, the second reversing the first, and `0032`/`0033`, the pop-up's Enter
+clock and the hold that makes the host read it, which stay because `0040`'s
+capture-owner hunks edit that same clock code, and because the pop-up the game
+opens behind the window is a notice a human can miss while the host still needs
+it answered. `0040` was regenerated against this series: the full chain took the
+`AtomicUsize` import from the dropped `0039`, so `0040`'s own call counter had no
+name for its type and `do_compile` stopped at `cannot find type AtomicUsize` in
+`embedded_input.rs:27`; the section was re-diffed from the real pre state and now
+carries `use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};` itself,
+which is why `do_patch` applies all 35 patches with no fuzz and no offset.
+Measured on the board: the deb's md5 matched host to board
+(`d419baae6e48390f35b9ecd28ea19d45`), `dpkg -i` took `r0.74` over `r0.73`, and
+the bare launch with no clock env at all reached the window on the FIRST attempt
+of the retry loop (`p74-75.log`, app pid 253634, `wayland-video: stream window
+created` 10:05:03 after 148 s), ran the stream at 55.5 and 50.5 fps with
+`committed=4189 dropped=0 planes=0 dead=0 flushFailed=0`, printed `0040`'s
+naming 5 times, printed no clock press at all, and took none of the death
+family - no `invalid fence fd`, no `Bad file descriptor`, no vendor assert, no
+`Protocol error`. `opennow-server-end-closes-window: the server ended the
+session; unmapping the stream window` came 86 s later at 10:06:29 (this boot's
+cratering, not the app's), and both `opennow-qt` and `opennow-core` were still
+alive at 10:19 after the window's close, so the slim set starts, streams, and
+survives the close on its own.
 
 #### The `r0.73` colour naming reads out on a live session, and says the seat's own numbers were already right (Nov 5, board `weston@192.168.1.33`, this boot)
 
@@ -1771,3 +1813,14 @@ thread CPU - had to wait for one session. The r0.56 boot repeats the pattern on 
 19. **`0044`'s close and `0045`'s keep clock are installed and marked, and neither has been watched on a session that played** - the r0.71 session that presented at 39-51/s for 4.5 minutes measured the counter half (`planes=92 dropped=92 dead=0`, the refusals all answering as the planes-not-there kind with 324 `could not be exported as a DMA-BUF` in the same log) and ended with the family's third reading, and the r0.72 attempts have not reached the stream window at all on this boot (eleven in a row, 480 or 74 bytes, one `GPU[0] core0 hang, automatic recovery.` each). What is owed is one run on a fresh boot to measure both halves: the close keeping the app's own table bounded through an hour (the band's `live=1303 highest=5312` at 17 minutes on the r0.70 session is what it has to beat), and the keep clock's 60 Enters crossing the gate and the drain (`NVST native input drain: ... keys=`) well enough that an unattended seat survives the free tier's hour instead of being ended by the host's ~14 min idle timeout. Both halves are measured on the `r0.72` run of the same day (Nov 5, fresh boot): the stream ran 3,599 s at 42-56/s for 178,233 presents and the whole log carries zero death markers and zero failed flushes, the app's table stayed at `live=98-101 highest=4111-4112` through the hour against the r0.70 session's `live=1303 highest=5312` at 17 minutes, the compositor's stayed at `fds=96-99 dmabuf=56-59` against the cratered boot's `fds=252 dmabuf=217`, and 60 keep answers printed one a minute from 11:01:24 to 12:00:32 with the drain and the embedded tally reading them (`keys=6` at the first, `keys=127 absolutes=774` at the 58th). The item's remaining tail is the refusals, not the death: 3246 of 178,233 presents answered as `planes` (the capture pool retiring the picture across `0011`'s one-frame handoff ring, the same starvation as open item 8), so one present in 55 costs nothing to the seat but still names a ring that is one frame deep while the pool cycles through more.
 
 20. **`0046` is installed, its naming measured, and the r0.73 hour attempt read on the cratered boot** - the line prints once with `Limited`/`Bt709`/`Bt709`/`Sdr`, the frame reads `minL=0` with 9.7% of pixels at true-black-or-below, and the colour work is closed on the app side. The clocks, measured, arm ONLY when their env is set: the gate is `if (armMs <= 0) return;` on `OPENNOW_KEEP_ENTER_MS` (`EVERY_MS`/`TIMES`/`HOLD_MS` default to 60000/60/120), on `OPENNOW_POPUP_ENTER_MS` (`TIMES` default 4) and on `OPENNOW_PLAY_ENTER_MS` (`TIMES` default 1) - which is why the bare probe sessions never armed a clock while every hour launch carries the r0.72 hour's measured values 63000/212000/270000. The r0.73 attempt with those armed all three at its window (00:08:47): popup answered at 00:09:52, PLAY at 00:12:21, and the keep clock ran 60 of 60 presses, the last `keep-alive answered (0 left)` at 01:13:51, with zero death markers and zero failed flushes - the app survived the whole hour of presses even after `opennow-server-end-closes-window: the server ended the session; unmapping the stream window` at 00:34:19, 25 minutes in, with `committed=886 dropped=0 planes=0 dead=0 flushFailed=0` the last wayland-video line and 889 `opennow-pull-gap:` in the log. That 25-minute end is this boot's cratering - ten `GPU[0] core0 hang, automatic recovery.` by then - and not the app's doing: the free tier's whole hour is owed again on a fresh boot, as is a fresh witness for the NV12 plane dump, which lands no `nv12.y`/`nv12.uv` under `OPENNOW_DUMP_NV12` on r0.73 while the PPM dump keeps landing frames.
+
+21. **The slim `r0.74` play set is installed and starts on the board** - 35 patches
+    in `SRC_URI`, the 11 retired ones in `files-unused-playset/`, `0040` regenerated
+    to carry its own `AtomicUsize` import so `do_patch` is fuzz-free, and the bare
+    launch (no clock env) reached `wayland-video: stream window created` on the first
+    retry-loop attempt with the stream at 50-55 fps and zero death markers. What this
+    set still owes is the hour itself on a fresh boot with a human answering the
+    notices, since `0045`'s keep-alive clock is no longer in the build and an
+    unattended seat now idles away on its own; and the pre-window instant-death
+    launch family stays vendor-side on this boot, so the retry loop is still the
+    way in.

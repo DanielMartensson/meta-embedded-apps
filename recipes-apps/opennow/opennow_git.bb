@@ -27,14 +27,10 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0012-pin-one-handoff-frame-the-window-the-55-fps-series-measured.patch \
            file://0013-throttle-the-interface-window-s-presents.patch \
            file://0014-default-the-interface-window-s-present-throttle-on.patch \
-           file://0015-press-the-start-button-on-a-clock-of-its-own.patch \
            file://0016-open-the-audio-sink-on-a-device-and-a-format-the-card-has.patch \
            file://0017-answer-the-escape-key-in-the-stream-window.patch \
            file://0018-stop-concealing-the-hole-a-queue-drop-opens.patch \
            file://0019-hide-the-interface-window-under-the-stream-window.patch \
-           file://0020-write-the-diagnostic-export-when-the-interface-exits.patch \
-           file://0021-measure-the-two-halves-of-the-frame-handoff.patch \
-           file://0022-name-the-pull-clock-starvation-in-the-pull-it-just-made.patch \
            file://0023-stop-closing-the-descriptor-of-a-frame-the-surface-already-shows.patch \
            file://0024-raise-the-file-descriptor-limit-before-the-stream-starts.patch \
            file://0025-ask-the-descriptor-before-trusting-the-import-probe.patch \
@@ -47,18 +43,11 @@ SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=de
            file://0032-answer-the-pop-up-the-cloud-game-opens-behind-with-an-enter-of-its-own.patch \
            file://0033-hold-the-enter-the-clock-answers-with-so-the-host-reads-it.patch \
            file://0034-give-the-stream-window-its-pointer-before-the-first-mouse-event.patch \
-           file://0035-take-a-picture-of-the-stream-when-asked-for-one.patch \
            file://0036-never-close-the-compositor-connection-as-a-frame.patch \
            file://0037-keep-the-hosts-cursor-capture-armed-while-the-host-keeps-answering.patch \
-           file://0038-count-what-the-drain-side-did-with-the-window-input.patch \
-           file://0039-name-the-queue-the-embedder-feeds-and-count-what-it-takes.patch \
            file://0040-keep-the-stream-window-s-capture-owner-armed-and-say-who-turns-it-off.patch \
-           file://0041-answer-the-PLAY-notice-on-a-clock-of-its-own-two-minutes-late.patch \
-           file://0042-answer-the-signup-notice-which-waits-for-a-key-and-not-for-an-Enter.patch \
            file://0043-give-the-streamer-s-DMA-BUF-duplicates-a-descriptor-band-of-their-own.patch \
            file://0044-close-the-duplicate-of-a-refused-frame-when-the-number-is-the-streamer-s-own.patch \
-           file://0045-keep-an-unattended-seat-inside-the-game-with-an-enter-of-its-own-every-minute.patch \
-           file://0046-name-the-colour-description-the-stream-carries-once-a-session.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
 SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"
@@ -73,7 +62,7 @@ PV = "1.0.4+git${SRCPV}"
 # The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
 # r0.12 leaves the process when the event loop ends instead of running Qt
 # teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.73"
+PKGR = "r0.74"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
