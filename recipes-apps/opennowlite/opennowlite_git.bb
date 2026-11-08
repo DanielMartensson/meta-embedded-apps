@@ -46,7 +46,7 @@ S = "${WORKDIR}/git"
 
 # PR-server counter resets to r0.0 whenever the recipe changes; pin it so the
 # deb always installs over what the boards already carry.
-PKGR = "r1.8"
+PKGR = "r1.9"
 
 DEPENDS = " \
     gstreamer1.0 \
