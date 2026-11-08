@@ -31,6 +31,7 @@
  *   opennowlite: launch inspect reply=<n> decision=<n> scope=<n> status=<s>
  *   opennowlite: session create reply=<n> named=<0/1> phase=<s>
  *   opennowlite: poll attempt=<n> reply=<n> session=<0/1> status=<n> phase=<s> rtsps=<n>
+ *   opennowlite: polling the allocation up to <n> times     (the wait budget)
  *   opennowlite: session ready for <id>                    (launch)
  *   opennowlite: engine started for <id>                   (streamer up)
  *   opennowlite: encoded video unit 1 / encoded audio packet 1
@@ -51,6 +52,9 @@
  *   opennowlite: recording N s of picture into FILE        (--record on)
  *   opennowlite: recorded bytes=N units_left=N             (every 50 s of picture)
  *   opennowlite: record closed bytes=N                     (the witness file)
+ *   opennowlite-audio: witness frames=N bytes=N             (--debug-audio)
+ *   opennowlite-audio: witness closed frames=N             (the audio witness)
+ *   opennowlite-input: <kind> submit no=N at +Nms took N us (--debug-input)
  *   opennowlite-input: key code=<n> evdev=<n> state=<0/1>   (each key the seat sends)
  *   opennowlite-input: <kind> submit refused (<n>)          (first refused input call)
  *   opennowlite: stopping keys=N motions=N submits=N refused=N skipped=N pilot=N
@@ -168,6 +172,38 @@ static long ms_since(const struct timespec *then)
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (now.tv_sec - then->tv_sec) * 1000L +
            (now.tv_nsec - then->tv_nsec) / 1000000L;
+}
+
+/* Temporary input measurement (--debug-input). What the seat was complained
+ * of is that a press of the pop-up's OK closed a few seconds later, and that
+ * delay splits into three parts: how long the client held the press before
+ * handing it over (the seat's event arrives and is submitted in the same
+ * listener call, so this is the weston keyboard focus, already separate in
+ * `opennowlite-input: key code=`), how long the streamer's own call took to
+ * accept it, and how long the picture took to change afterwards. The first
+ * two are measured here against the session clock, and the third one is read
+ * off the video witness against the same clock, which is why both numbers are
+ * printed in milliseconds since the capture started. The count is capped so
+ * the log stays readable over an hour. */
+static bool debug_input;
+static unsigned long input_timed;
+
+static void note_submit(const char *kind, const struct timespec *at)
+{
+    if (!debug_input)
+        return;
+    ++input_timed;
+    if (input_timed > 400u)
+        return;
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    fprintf(stderr,
+            "opennowlite-input: %s submit no=%lu at +%ldms took %ldus\n",
+            kind, input_timed,
+            (at->tv_sec - app.capture_started.tv_sec) * 1000L +
+                (at->tv_nsec - app.capture_started.tv_nsec) / 1000000L,
+            (until.tv_sec - at->tv_sec) * 1000000L +
+                (until.tv_nsec - at->tv_nsec) / 1000L);
 }
 
 /* ---- xdg-shell ---- */
@@ -1398,6 +1434,18 @@ static int json_int_at(const char *doc, const char *key)
  * into its own pipeline, and the input is submitted through the streamer too.
  * The core holds an exclusive lock on its data directory, so OpenNOW and
  * OpenNOWLite cannot hold a seat at the same time - see the layer README. */
+
+/* How many times the allocation may be polled before the client gives up on
+ * it. r1.4 tried 60 times 2 s apart and every round that lost the launch ran
+ * out on the last try while the reply was still status=1 phase=preparing; the
+ * timed-out reply had already grown from 1846 bytes carrying an empty rtsps
+ * array (`rtsps=2`) to 2322 bytes carrying real endpoints (`rtsps=119`), so
+ * the ready answer was one poll away and only the wait was too short. The
+ * vendor's own shell leaves the same wait to the account's turn in the free-
+ * tier queue, so this is overridable: --poll-attempts=N at 2 s apart, 300
+ * (ten minutes) by default. */
+static int session_poll_attempts = 300;
+
 static bool session_open(const char *variant_id, const char *data_dir)
 {
     core_rpc = core_start(data_dir);
@@ -1562,7 +1610,18 @@ static bool session_open(const char *variant_id, const char *data_dir)
     bool prepared = false;
     int last_status = 0;
     char last_phase[32] = "";
-    for (int attempt = 0; attempt < 60 && !prepared; ++attempt) {
+    /* How long the allocation may stay preparing. The rounds at r1.4 that gave
+     * up after 60 tries never got a picture, and the timed-out poll was
+     * already holding the rtsps endpoints: the reply grew from 1846 bytes with
+     * rtsps=2 (an empty array) to 2322 bytes with rtsps=119, so the ready
+     * answer was one poll away and the wait was cut short, not refused. The
+     * vendor's own shell leaves this wait to the account's turn in the free-
+     * tier queue, which runs into minutes, so the default here is long and
+     * overridable: --poll-attempts=<n> at 2 s apart. */
+    int poll_limit = session_poll_attempts;
+    fprintf(stderr, "opennowlite: polling the allocation up to %d times\n",
+            poll_limit);
+    for (int attempt = 0; attempt < poll_limit && !prepared; ++attempt) {
         snprintf(params, sizeof(params), "{\"sessionId\":\"%s\"}", session_id);
         core_request(core_rpc, "lite-poll", "session.poll", params);
         frame = core_reply(core_rpc, "lite-poll", OPENNOWLITE_SESSION_TIMEOUT);
@@ -1660,6 +1719,10 @@ typedef struct Media {
     FILE *record;
     long long record_units_left;
     guint64 recorded_bytes;
+    FILE *audio_dump;
+    long long audio_dump_left;
+    guint64 audio_dump_frames;
+    guint64 audio_dump_bytes;
 } Media;
 
 static Media media;
@@ -1816,6 +1879,37 @@ static void media_push_audio(Media *owner,
         return;
     }
     ++owner->audio_units;
+    if (owner->audio_dump && owner->audio_dump_left > 0LL) {
+        /* the audio witness: the tap's Opus frames with a little-endian length
+         * in front of each, so the bytes an offline mux turns into an Ogg Opus
+         * file are exactly the bytes the seat's decoders were handed. Writing
+         * them here costs the session nothing: no second pipeline, no decode,
+         * a bounded count of frames rather than of seconds. */
+        guint32 le_len = (guint32)packet->data_len;
+        unsigned char hdr[4] = {
+            (unsigned char)(le_len & 0xffu),
+            (unsigned char)((le_len >> 8) & 0xffu),
+            (unsigned char)((le_len >> 16) & 0xffu),
+            (unsigned char)((le_len >> 24) & 0xffu),
+        };
+        if (fwrite(hdr, 1, sizeof(hdr), owner->audio_dump) == sizeof(hdr)
+            && fwrite(packet->data, 1, packet->data_len, owner->audio_dump)
+                == (size_t)packet->data_len) {
+            owner->audio_dump_left -= 1LL;
+            owner->audio_dump_frames += 1u;
+            owner->audio_dump_bytes += (guint64)packet->data_len;
+            if (owner->audio_dump_frames % 6000u == 0u)
+                fprintf(stderr,
+                        "opennowlite-audio: witness frames=%llu bytes=%llu at +%lds\n",
+                        (unsigned long long)owner->audio_dump_frames,
+                        (unsigned long long)owner->audio_dump_bytes,
+                        ms_since(&app.capture_started));
+        } else if (owner->audio_dump_frames == 0u) {
+            fprintf(stderr, "opennowlite-audio: witness write failed: %s\n",
+                    strerror(errno));
+            owner->audio_dump_left = 0LL;
+        }
+    }
     if (owner->audio_units == 1u) {
         fprintf(stderr,
                 "opennowlite: encoded audio packet 1 bytes=%zu channels=%u "
@@ -2212,10 +2306,16 @@ static void pointer_submit(struct lite *a, double x, double y)
         extent_x = 65535u;
     if (extent_y > 65535u)
         extent_y = 65535u;
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status =
         streamer.absolute(streamer.engine,
                           (uint16_t)(x + 0.5), (uint16_t)(y + 0.5),
                           (uint16_t)extent_x, (uint16_t)extent_y);
+    if (timed)
+        note_submit("position", &at);
     if (status == OPENNOW_STREAMER_OK) {
         ++a->submits;
     } else if (a->input_refused++ == 0u) {
@@ -2275,9 +2375,15 @@ static void seat_key(uint32_t key_code, bool pressed)
                     evdev);
         return;
     }
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status = streamer.key(streamer.engine, virtual_key,
                                                 modifier_bits(app.modifier_mask),
                                                 pressed);
+    if (timed)
+        note_submit("key", &at);
     if (status == OPENNOW_STREAMER_OK) {
         ++app.submits;
     } else if (app.input_refused++ == 0u) {
@@ -2305,9 +2411,14 @@ static void seat_key(uint32_t key_code, bool pressed)
  * act on. Return is VK 0x0d and Escape 0x1b from upstream's specials (the ad-
  * hoc evdev table this client used to have had no Return at all, so Enter was
  * silently dropped); one step of a press runs per pass of the main loop, so a
- * hold lasts a second rather than zero time. */
-static long pilot_press_at[96];
-static uint16_t pilot_press_key[96];
+ * hold lasts a second rather than zero time. The list is sized for a dense keep
+ * clock rather than the old once-a-minute one: a free-tier hour is 3600 s, so
+ * keeping the host's idle timer down every 5 s of that takes 720 events on top
+ * of the two notice answers, and a keep clock that thin (88 positions over the
+ * r1.4 round of Nov 7) was measured to lose the picture after 1720 s of media
+ * while the r1.2 round's 1734 positions held a full hour of it. */
+static long pilot_press_at[1200];
+static uint16_t pilot_press_key[1200];
 static unsigned long pilot_press_count;
 
 static void pilot_send(struct lite *a)
@@ -2339,8 +2450,14 @@ static void pilot_send(struct lite *a)
             pointer_submit(a, point_x, point_y);
         } else {
             bool pressed = extra == 1u;
+            struct timespec click_at;
+            bool click_timed = debug_input && input_timed < 400u;
+            if (click_timed)
+                clock_gettime(CLOCK_MONOTONIC, &click_at);
             OpenNowStreamerStatus status =
                 streamer.button(streamer.engine, 1u, pressed);
+            if (click_timed)
+                note_submit("click", &click_at);
             if (status == OPENNOW_STREAMER_OK)
                 ++a->submits;
             else if (a->input_refused++ == 0u)
@@ -2378,8 +2495,14 @@ static void pilot_send(struct lite *a)
         ++a->pilot_steps;
         return;
     }
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status =
         streamer.key(streamer.engine, pilot_press_key[press], 0u, pressed);
+    if (timed)
+        note_submit("press", &at);
     if (status == OPENNOW_STREAMER_OK)
         ++a->submits;
     else if (a->input_refused++ == 0u)
@@ -2434,8 +2557,14 @@ static void seat_button(struct lite *a, uint32_t button, uint32_t state)
      * have to keep their queue order. */
     if (a->pointer_surface == a->surface)
         pointer_submit(a, pointer_state.last_x, pointer_state.last_y);
+    struct timespec at;
+    bool timed = debug_input && input_timed < 400u;
+    if (timed)
+        clock_gettime(CLOCK_MONOTONIC, &at);
     OpenNowStreamerStatus status =
         streamer.button(streamer.engine, mapped, pressed);
+    if (timed)
+        note_submit("button", &at);
     if (status == OPENNOW_STREAMER_OK) {
         ++a->submits;
     } else if (a->input_refused++ == 0u) {
@@ -2460,7 +2589,7 @@ static void seat_wheel(struct lite *a, int32_t value120)
 static unsigned long pilot_list_parse(const char *list)
 {
     unsigned long count = 0u;
-    while (*list && count < 96u) {
+    while (*list && count < 1200u) {
         long value = strtol(list, NULL, 10);
         if (value < 0)
             value = 0;
@@ -2499,7 +2628,8 @@ static void usage(const char *argv0)
             "       [--width N] [--height N] [--pipeline DESC] [--test-pattern]\n"
             "       [--auto-pilot] [--pilot-at=S] [--pilot-times=N] [--pilot-gap=S]\n"
             "       [--pilot-click] [--pilot-point=WxH]\n"
-            "       [--record=FILE] [--record-seconds=S]\n"
+            "       [--record=FILE] [--record-seconds=S] [--poll-attempts=N]\n"
+            "       [--debug-input] [--debug-audio=FILE] [--debug-audio-seconds=S]\n"
             "  the default launch opens the seat's signed-in session and streams\n"
             "  the game into the app's own Wayland window; --test-pattern, or\n"
             "  --pipeline, plays a test pattern in that same window with no\n"
@@ -2507,6 +2637,21 @@ static void usage(const char *argv0)
             "  proven. --data-dir only points the shipped core at another copy\n"
             "  of its data directory; by default it uses this seat's. The seat's\n"
             "  pointer is sent as an absolute position inside the window.\n"
+            "  --poll-attempts=N caps how many times, 2 s apart, the allocated\n"
+            "  session is polled while the vendor still reports it preparing;\n"
+            "  300 (ten minutes) by default, since a free-tier queue wait was\n"
+            "  measured past the 120 s r1.4 spent before it gave up on a launch\n"
+            "  whose last poll had already started carrying rtsp endpoints.\n"
+            "  --debug-input stamps every input submit with its offset inside\n"
+            "  the session and the time the streamer's own call took, which is\n"
+            "  how the complaint that a press of a pop-up's OK closed seconds\n"
+            "  later splits: what the client held, what the accept cost, and\n"
+            "  what the picture answered on the same clock the witness runs on.\n"
+            "  --debug-audio also writes the first --debug-audio-seconds (60\n"
+            "  by default) of the stream's Opus frames into FILE as length-\n"
+            "  prefixed packets, which an offline mux turns into an Ogg Opus\n"
+            "  file: sound nobody is listening to can still be measured for\n"
+            "  level, pacing and gaps.\n"
             "  With --auto-pilot the app drives the cloud game's own notices: it\n"
             "  presses once per notice at --pilot-at, a comma list of seconds\n"
             "  after the stream starts, each optionally followed by the key the\n"
@@ -2546,6 +2691,8 @@ int main(int argc, char **argv)
     int pilot_point_y = 0;
     const char *record_path = NULL;
     int record_seconds = 120;
+    const char *audio_dump_path = NULL;
+    int audio_dump_seconds = 60;
     const char *pipeline =
         "videotestsrc is-live=true ! videoconvert ! waylandsink name=sink "
         "sync=false";
@@ -2597,6 +2744,22 @@ int main(int argc, char **argv)
             /* only the test pattern has no session to feed the window */
             pipeline = argv[++i];
             test_pattern = true;
+        } else if (strncmp(argv[i], "--poll-attempts=", 16) == 0) {
+            session_poll_attempts = atoi(argv[i] + 16);
+            if (session_poll_attempts < 1) {
+                fprintf(stderr,
+                        "opennowlite: --poll-attempts wants a positive count\n");
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--debug-input") == 0) {
+            debug_input = true;
+        } else if (strncmp(argv[i], "--debug-audio-seconds=", 22) == 0) {
+            audio_dump_seconds = atoi(argv[i] + 22);
+        } else if (strncmp(argv[i], "--debug-audio=", 14) == 0) {
+            /* the sound of the stream, kept so it can be analysed after the
+             * session instead of listened for during one */
+            audio_dump_path = argv[i] + 14;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -2619,7 +2782,7 @@ int main(int argc, char **argv)
         if (!pilot_at_given)
             pilot_press_count = pilot_list_parse("63:r,212:r");
         for (int i = 0; i < pilot_times; i++) {
-            if (pilot_press_count >= 96u)
+            if (pilot_press_count >= 1200u)
                 break;
             long last = pilot_press_at[pilot_press_count - 1u];
             pilot_press_at[pilot_press_count] = last + (long)pilot_gap;
@@ -2680,6 +2843,21 @@ int main(int argc, char **argv)
                 record_seconds, record_path);
     }
 
+    if (audio_dump_path) {
+        if (audio_dump_seconds < 1 || audio_dump_seconds > 600)
+            audio_dump_seconds = 60;
+        media.audio_dump = fopen(audio_dump_path, "wb");
+        if (!media.audio_dump) {
+            fprintf(stderr,
+                    "opennowlite-audio: cannot open the audio witness %s: %s\n",
+                    audio_dump_path, strerror(errno));
+            return 1;
+        }
+        media.audio_dump_left = (long long)audio_dump_seconds * 200LL;
+        fprintf(stderr, "opennowlite-audio: witnessing %d s of sound into %s\n",
+                audio_dump_seconds, audio_dump_path);
+    }
+
     if (!create_window(&app))
         return 1;
     if (test_pattern) {
@@ -2734,6 +2912,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "opennowlite: record closed bytes=%llu%s\n",
                 (unsigned long long)media.recorded_bytes,
                 record_failed ? " (fclose failed)" : "");
+    }
+    if (media.audio_dump) {
+        const int dump_failed = fclose(media.audio_dump) != 0;
+        fprintf(stderr,
+                "opennowlite-audio: witness closed frames=%llu bytes=%llu%s\n",
+                (unsigned long long)media.audio_dump_frames,
+                (unsigned long long)media.audio_dump_bytes,
+                dump_failed ? " (fclose failed)" : "");
+        media.audio_dump = NULL;
     }
     engine_stop();
     core_shutdown(core_rpc);
