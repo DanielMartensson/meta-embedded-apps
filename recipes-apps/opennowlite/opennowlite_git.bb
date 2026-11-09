@@ -46,7 +46,7 @@ S = "${WORKDIR}/git"
 
 # PR-server counter resets to r0.0 whenever the recipe changes; pin it so the
 # deb always installs over what the boards already carry.
-PKGR = "r2.8"
+PKGR = "r2.11"
 
 DEPENDS = " \
     gstreamer1.0 \
@@ -144,6 +144,24 @@ do_compile() {
         ${STAGING_DATADIR}/wayland-protocols/stable/xdg-shell/xdg-shell.xml \
         ${WORKDIR}/xdg-shell-protocol.c
 
+    # The relative-pointer protocol carries the hand's own unclamped delta,
+    # which is what lets the camera turn past the window edge; the pointer-
+    # constraints protocol keeps the seat's pointer on this surface so those
+    # deltas keep arriving. Both are unstable v1 and both are staged by the
+    # wayland-protocols dependency above.
+    wayland-scanner client-header \
+        ${STAGING_DATADIR}/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml \
+        ${WORKDIR}/relative-pointer-unstable-v1-client-protocol.h
+    wayland-scanner private-code \
+        ${STAGING_DATADIR}/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml \
+        ${WORKDIR}/relative-pointer-unstable-v1-protocol.c
+    wayland-scanner client-header \
+        ${STAGING_DATADIR}/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml \
+        ${WORKDIR}/pointer-constraints-unstable-v1-client-protocol.h
+    wayland-scanner private-code \
+        ${STAGING_DATADIR}/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml \
+        ${WORKDIR}/pointer-constraints-unstable-v1-protocol.c
+
     # The app first, so a broken app fails this task in seconds instead of
     # after the Rust library below has been built. -ldl: the streamer's
     # symbols come from dlopen, and this recipe must not carry OpenNOW's
@@ -155,6 +173,8 @@ do_compile() {
     # rather than being part of gstreamer-1.0's Libs.
     ${CC} ${CFLAGS} ${CPPFLAGS} -I${WORKDIR} -o opennow-lite \
         ${WORKDIR}/opennow-lite.c ${WORKDIR}/xdg-shell-protocol.c \
+        ${WORKDIR}/relative-pointer-unstable-v1-protocol.c \
+        ${WORKDIR}/pointer-constraints-unstable-v1-protocol.c \
         ${LDFLAGS} -ldl $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-wayland-1.0 wayland-client)
 
     # The streamer library, from the pinned and patched tree, for this machine.
