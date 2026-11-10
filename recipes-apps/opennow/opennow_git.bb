@@ -12,57 +12,58 @@ BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://LICENSE;md5=efa1357149ea0c1589fb5abd29da41b4"
 
-SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev \
-           file://0001-settle-the-interface-on-this-board.patch \
-           file://0002-give-the-streamer-a-frame-the-compositor-can-import.patch \
-           file://0003-keep-the-video-pass-running-under-the-interface.patch \
-           file://0004-present-decoded-frames-through-a-wayland-surface.patch \
-           file://0005-make-the-stream-window-a-window-the-user-can-drive.patch \
-           file://0006-make-the-stream-window-the-presentation-path.patch \
-           file://0007-hand-input-to-the-game-and-own-the-connection.patch \
-           file://0008-draw-with-opengl-and-keep-the-decoder-s-buffers-alive.patch \
-           file://0009-take-the-seat-s-pointer-only-when-it-has-one.patch \
-           file://0010-hand-the-streamer-its-own-device-whatever-qt-draws-with.patch \
-           file://0011-let-libwayland-own-the-descriptors-the-stream-window-sends.patch \
-           file://0012-pin-one-handoff-frame-the-window-the-55-fps-series-measured.patch \
-           file://0013-throttle-the-interface-window-s-presents.patch \
-           file://0014-default-the-interface-window-s-present-throttle-on.patch \
-           file://0016-open-the-audio-sink-on-a-device-and-a-format-the-card-has.patch \
-           file://0017-answer-the-escape-key-in-the-stream-window.patch \
-           file://0018-stop-concealing-the-hole-a-queue-drop-opens.patch \
-           file://0019-hide-the-interface-window-under-the-stream-window.patch \
-           file://0023-stop-closing-the-descriptor-of-a-frame-the-surface-already-shows.patch \
-           file://0024-raise-the-file-descriptor-limit-before-the-stream-starts.patch \
-           file://0025-ask-the-descriptor-before-trusting-the-import-probe.patch \
-           file://0026-close-the-descriptor-of-every-frame-no-request-carried.patch \
-           file://0027-read-wl_display_flush-as-the-byte-count-it-is.patch \
-           file://0028-reject-a-dma-buf-whose-planes-do-not-fit-its-descriptor.patch \
-           file://0029-leave-the-interface-window-visible-under-the-stream-window.patch \
-           file://0030-keep-an-artwork-object-out-of-the-cache-unless-its-bytes-hold-a-whole-image.patch \
-           file://0031-close-the-stream-window-when-the-server-ends-the-session.patch \
-           file://0032-answer-the-pop-up-the-cloud-game-opens-behind-with-an-enter-of-its-own.patch \
-           file://0033-hold-the-enter-the-clock-answers-with-so-the-host-reads-it.patch \
-           file://0034-give-the-stream-window-its-pointer-before-the-first-mouse-event.patch \
-           file://0036-never-close-the-compositor-connection-as-a-frame.patch \
-           file://0037-keep-the-hosts-cursor-capture-armed-while-the-host-keeps-answering.patch \
-           file://0040-keep-the-stream-window-s-capture-owner-armed-and-say-who-turns-it-off.patch \
-           file://0043-give-the-streamer-s-DMA-BUF-duplicates-a-descriptor-band-of-their-own.patch \
-           file://0044-close-the-duplicate-of-a-refused-frame-when-the-number-is-the-streamer-s-own.patch \
+# The pin is the released v1.0.4 tag, not a nightly: v1.0.4 is
+# bec4a0b11fc77fb5bfe9584f012296333718e84b. It is the tip of upstream's main
+# branch, and its second parent is dev's 1ce8a38c0f450afcc1706213dc2f0327955813ef
+# ("Merge pull request #1433 from OpenCloudGaming/dev", 8 Nov 2026). The fetch
+# therefore moves to branch=main: v1.0.4 is not reachable from dev, so keeping
+# the old branch=dev here would leave the fetcher unable to resolve this SRCREV
+# at all, which bitbake reports as a missing pin rather than a compile error.
+SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main \
+           file://0001-keep-the-sign-in-card-out-of-the-layer-path.patch \
            https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz;name=ffmpeg;unpack=0 \
           "
-SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"
+SRCREV = "bec4a0b11fc77fb5bfe9584f012296333718e84b"
 
 # Source for the bundled FFmpeg build (OPENNOW_CARGO_FEATURES = linux-ffmpeg-bundled).
 # The build script's default path clones github.com during configure, which a
 # package build must not depend on; OPENNOW_FFMPEG_ARCHIVE makes it extract this
-# tarball instead and apply the v4l2-request patches to it.
+# tarball instead and apply the v4l2-request patches to it. This is only in the
+# build because the streamer library has to compile: nothing here decodes a
+# stream on this board any more, the picture is OpenNOWLite's.
 SRC_URI[ffmpeg.sha256sum] = "7f607a00dd0d28a729d5a4811205812eef01cf6ef6155025febb6f36a9062d52"
 
-PV = "1.0.4+git${SRCPV}"
-# The dev branch reports 1.0.4 (nightly); the newest stable release is 1.0.3.
-# r0.12 leaves the process when the event loop ends instead of running Qt
-# teardown, which deadlocks or aborts in the VeriSilicon Vulkan driver.
-PKGR = "r0.74"
+# The upstream pin is the point of this recipe, and the patch series that made
+# OpenNOW's own stream window work on this board is gone. OpenNOW here has one
+# job: sign in and leave the account record in ~/.config/OpenNOW, which is what
+# OpenNOWLite reads back over the core's JSON-lines RPC. The picture, the
+# stateless V4L2 H.264 decode, the Opus audio and the seat's keyboard and
+# pointer all belong to OpenNOWLite (see the opennowlite recipe next door and
+# README.md), so the ~35 patches the earlier revision used on this board for
+# the compositor handoff, the DMA-BUF planes and the pointer path are none of
+# them on the login path and stay unpacked in files/ as a legacy audit trail
+# for the old pin b3fe710, referenced by nothing.
+#
+# One patch is back, and only because the login path needs it. Left alone at
+# v1.0.4 the client dies about fifteen seconds into sign-in; gdb puts the SIGSEGV
+# in the driver under QSGBatchRenderer::renderMergedBatch <- QSGRhiLayer::grab()
+# <- QSGRhiLayer::updateTexture(), which is the QML layer pass, and the only
+# layers on the login path at bec4a0b are the sign-in card and its primary
+# button in DesktopSignInScreen.qml. So 0001-keep-the-sign-in-card-out-of-the-
+# layer-path.patch draws both directly and nothing else: no streaming, video,
+# audio or input patch comes back, and that is the whole series here.
+
+# The version has to sort ABOVE what the boards already carry (1.0.4+git1+b3fe71026d
+#-r0.74 from the old nightly pin), which is why the release segment is spelled out:
+# do_packagedata's version-going-backwards QA check compares segment by segment, and
+# bare "1.0.4+git0+bec4a0b11f" loses against "1.0.4+git1+..." on the commit count.
+# +release+ also says what this pin is: the released v1.0.4 tag, not a nightly.
+PV = "1.0.4+release+git${SRCPV}"
+# The released tag reports 1.0.4 stable (the nightly pin before it reported
+# 1.0.4-nightly.1515.1). PKGR stays pinned instead of the PR-server counter,
+# which resets to r0.0 whenever the recipe changes and would then install an
+# older version string over what the boards already carry.
+PKGR = "r0.76"
 S = "${WORKDIR}/git"
 
 # This recipe is machine-agnostic. It builds the Qt application and the Rust
@@ -385,7 +386,12 @@ do_compile:prepend() {
     # Bundled FFmpeg: take the release tarball from SRC_URI instead of letting
     # build.rs clone github.com, and hand it the target sysroot so its configure
     # does not fall back to the host one.
-    export OPENNOW_FFMPEG_ARCHIVE="${WORKDIR}/ffmpeg-9.0.tar.xz"
+    # Only when the tarball was actually fetched: with a feature list that
+    # pulls no ffmpeg build (login-only builds), pointing at a missing file
+    # would make ffmpeg-sys-next's build.rs die on a path that does not exist.
+    if [ -f "${WORKDIR}/ffmpeg-9.0.tar.xz" ]; then
+        export OPENNOW_FFMPEG_ARCHIVE="${WORKDIR}/ffmpeg-9.0.tar.xz"
+    fi
     export SYSROOT="${RECIPE_SYSROOT}"
     # FFmpeg's configure takes its install destinations from the environment,
     # and oe-core exports them to every task (see temp/run.do_compile:

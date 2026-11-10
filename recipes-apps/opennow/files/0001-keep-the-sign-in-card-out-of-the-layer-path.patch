@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 +0000
+From: noname <noname@example.com>
+Date: Mon, 9 Nov 2026 22:30:00 +0000
+Subject: [PATCH] 0001 keep the sign-in card and its primary button out of
+ the layer path
+
+The released v1.0.4 starts on the seat and dies by itself about fifteen
+seconds into the sign-in flow, twice in a row, with nothing in its own log:
+
+  Nov 09 20:48:46 systemd-coredump[851208]: Process 850866 (opennow-qt)
+  of user 1000 terminated abnormally without generating a coredump
+  Nov 09 20:50:55 systemd-coredump[851343]: Process 851343 (opennow-qt) ...
+
+The same binary stopped under gdb -batch -ex run -ex bt answers on thread 18
+"QSGRenderThread", SIGSEGV inside the driver, and the frames under it name
+the pass that renders a QML layer into a texture:
+
+  #0 0x0000ffffd96764c8 in ?? () from /vendor/lib/libvulkan_VSI.so.1.3.3
+  #4 QSGBatchRenderer::Renderer::renderMergedBatch(...) from libQt6Quick.so.6
+  #5 QSGBatchRenderer::Renderer::recordRenderPass(...)
+  #6 QSGBatchRenderer::Renderer::render()
+  #7 QSGRenderer::renderScene()
+  #8 QSGRhiLayer::grab()
+  #9 QSGRhiLayer::updateTexture()
+  #10 QSGRenderer::preprocess()
+
+So the death is QSGRhiLayer, not the video path: there is no video here,
+the launch has not selected a game yet, and the only things on the login
+path that ask Qt6Quick for a layer at this pin are DesktopSignInScreen.qml,
+the primary action button through layer.enabled: action.primary and the
+sign-in card itself through layer.enabled: true, both with a MultiEffect
+drop shadow. The rest of the layer uses at bec4a0b sit in the home screen,
+the store hero and the stream screen, and none of those draw before the
+account record is written.
+
+Draw the card and the button directly, which keeps the login path off the
+driver path that segfaults. This is the whole patch series OpenNOW carries
+on this board: it only creates the account record that OpenNOWLite reads
+back over the core RPC, and the picture, the decoder, the audio and the
+seat keyboard all belong to opennowlite, so no streaming patch comes back.
+
+---
+diff --git a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+index f3bb04e5..961f1d8d 100644
+--- a/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
++++ b/opennow-qt/qml/desktop/auth/DesktopSignInScreen.qml
+@@ -111,14 +111,8 @@ FocusScope {
+             border.width: action.activeFocus ? 2 : action.primary || action.quiet ? 0 : 1
+             border.color: action.activeFocus ? DesktopTokens.focus : root.cardSeam
+             opacity: action.enabled ? 1 : 0.5
+-            layer.enabled: action.primary
+-            layer.effect: MultiEffect {
+-                shadowEnabled: true
+-                shadowColor: "#2E6EE7B7"
+-                shadowBlur: 0.6
+-                shadowVerticalOffset: DesktopTokens.px(8)
+-                shadowHorizontalOffset: 0
+-            }
++            // Drawn directly: the layered shadow below crashed the Vulkan
++            // driver on the STM32MP257F, see the sign-in card.
+         }
+     }
+ 
+@@ -251,14 +245,11 @@ FocusScope {
+                 color: Theme.lightMode ? Qt.rgba(Theme.shell.r, Theme.shell.g, Theme.shell.b, 0.92) : "#D10B0F1A"
+                 border.width: 1
+                 border.color: root.cardSeam
+-                layer.enabled: true
+-                layer.effect: MultiEffect {
+-                    shadowEnabled: true
+-                    shadowColor: "#8C000000"
+-                    shadowBlur: 1
+-                    shadowVerticalOffset: DesktopTokens.px(24)
+-                    shadowHorizontalOffset: 0
+-                }
++                // The card used to be a QML layer with a MultiEffect drop
++                // shadow. On the STM32MP257F the VeriSilicon Vulkan driver
++                // segfaults in QSGRhiLayer::grab() when the card re-renders
++                // while the QR panel appears, so it is drawn directly now. The
++                // button above lost its layer for the same reason.
+ 
+                 Column {
+                     id: cardColumn

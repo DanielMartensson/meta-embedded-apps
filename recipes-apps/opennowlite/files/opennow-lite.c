@@ -1728,7 +1728,7 @@ static bool session_open(const char *variant_id, const char *data_dir)
      * matches its own; the shipped v1.0.4 speaks 6. */
     snprintf(params, sizeof(params),
         "{\"protocolVersion\":%d,\"shell\":\"opennowlite\","
-        "\"shellVersion\":\"1.0.4-nightly.1515.1\"}",
+        "\"shellVersion\":\"1.0.4\"}",
         OPENNOWLITE_CORE_PROTOCOL);
     if (!core_request(core_rpc, "lite-hello", "core.hello", params))
         return false;

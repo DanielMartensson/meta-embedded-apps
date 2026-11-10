@@ -4,7 +4,7 @@ own Wayland window for the stream instead of hosting the picture in \
 opennow-qt, draws it with GStreamer (waylandsink plus the SoC's stateless V4L2 \
 H.264 decoder, fed with the vendor's H.264 and Opus bytes through appsrc) and \
 keeps the seat's keyboard and pointer as a separate input pipeline. The native \
-streamer of upstream OpenNOW v1.0.4-nightly.1515.1 is used only to carry the \
+streamer of the released upstream OpenNOW v1.0.4 is used only to carry the \
 input and the already-encoded media to Nvidia: it never decodes here, because \
 the encoded packets are tapped out of it and handed to this program's own \
 pipeline. Only the shipped opennow-core binary is asked for sign-in, the \
@@ -15,20 +15,27 @@ BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-# The upstream pin is the point of this recipe: v1.0.4-nightly.1515.1 is
-# b3fe71026d8261d386c6f16fcdeb1596ebb85942, the same commit the opennow recipe
-# builds. Nothing of that recipe is reused: OpenNOWLite has its own source file,
+# The upstream pin is the point of this recipe: the released v1.0.4 tag is
+# bec4a0b11fc77fb5bfe9584f012296333718e84b, the same commit the opennow recipe
+# builds. It is the tip of upstream's main branch, not of dev (v1.0.4 is not
+# reachable from dev), so the fetch below names branch=main: with the old
+# branch=dev the fetcher cannot resolve this SRCREV at all. Nothing of that recipe is reused: OpenNOWLite has its own source file,
 # its own patch series, its own FFI library in its own directory and its own
 # package, so the two clients install side by side and share no binary, no
 # library file and no log line. The patched tree is also kept in a standalone
 # repository next to this layer; see the README.
-SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=dev \
+SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main \
            file://0001-hand-encoded-media-to-the-host.patch \
            file://opennow_streamer_ffi.h \
            file://opennow-lite.c \
            file://opennowlite-launch.sh"
-SRCREV = "b3fe71026d8261d386c6f16fcdeb1596ebb85942"
-PV = "1.0.4+nightly.1515.1+git${SRCPV}"
+SRCREV = "bec4a0b11fc77fb5bfe9584f012296333718e84b"
+# +release+ is here so the version keeps sorting above the nightly string the boards
+# carry (1.0.4+nightly.1515.1+git0+b3fe71026d-r2.11): do_packagedata's
+# version-going-backwards QA check compares segment by segment, and "git0..." loses
+# against "nightly...". The pin is the released v1.0.4 tag, which is what +release+
+# records.
+PV = "1.0.4+release+git${SRCPV}"
 S = "${WORKDIR}/git"
 
 # The one patch this recipe carries. Upstream's streamer decodes the media
@@ -46,7 +53,7 @@ S = "${WORKDIR}/git"
 
 # PR-server counter resets to r0.0 whenever the recipe changes; pin it so the
 # deb always installs over what the boards already carry.
-PKGR = "r2.11"
+PKGR = "r2.12"
 
 DEPENDS = " \
     gstreamer1.0 \
