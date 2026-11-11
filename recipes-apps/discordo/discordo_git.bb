@@ -29,7 +29,7 @@ PV = "0.1+git${SRCPV}"
 # does not reset and the deb version stays comparable across rebuilds.
 PKGR = "r0.01"
 
-# The 22 modules go.mod asks for at this pin are vendored into the recipe, as
+# The 21 modules go.mod asks for at this pin are vendored into the recipe, as
 # one tarball, and unpacked into the app's own vendor/ directory next to go's
 # modules.txt manifest, so the build needs no network. Going without this is
 # not an option: bitbake runs do_compile in a sandbox without network, and a
@@ -39,7 +39,7 @@ PKGR = "r0.01"
 # It was made by running `go mod vendor` once at SRCREV with this tree's
 # staged go 1.22.12, then tarred with fixed mode, owner and mtime so a
 # rebuild of the recipe does not churn the layer. The README in this
-# directory lists the 22 modules and the versions that ended up in the
+# directory lists the 21 modules and the versions that ended up in the
 # manifest.
 SRC_URI += "file://discordo-vendor-31905f3e.tar.gz"
 

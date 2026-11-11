@@ -2,14 +2,17 @@
 
 Detail file for `recipes-apps/opennowlite/opennowlite_git.bb`. Everything in it
 was measured on the seat with the package this recipe builds. How to use the
-client itself, switch by switch, lives in the standalone OpenNOWLite
-repository's own README; this file is the build-side record.
+client itself, switch by switch, lives in `files/README.md` under this recipe
+- the OpenNOWLite project's own README, vendored into the recipe beside its
+whole patched working tree at `files/native`; this file is the build-side
+record.
 
 This branch builds `opennowlite 1.0.4+release+git0+bec4a0b11f-r2.12` from the
 release tag `v1.0.4` = `bec4a0b11fc77fb5bfe9584f012296333718e84b` on
 `refs/heads/main`, the same pin as the OpenNOW recipe, and it is still the one
 client that plays. The sections below record the older pins (`1.0.4+nightly.1515.1+git0+b3fe71026d`,
-up to `r2.11`) as history; the current round is item 65 of the running log in
+up to `r2.11`) as history; the vendored source round is item 67 and the two
+native games beside this layer item 66 of the running log in
 `../opennow/README.md`.
 
 ### OpenNOWLite
@@ -31,9 +34,21 @@ and the `encoded_media_callback` plus `media_passthrough` fields of
 `OpenNowStreamerConfig`. The library is dlopened by absolute path out of this
 recipe's own directory and the app links `-ldl` only, so the process has no
 `DT_NEEDED` entry for OpenNOW's SONAME and can never load, shadow or replace the
-library the opennow recipe ships. The patched tree is also kept in a standalone
-repository next to the layer, `/home/ubuntu/Dokument/Github/OpenNOWLite`, so the
-same source can be read outside the build.
+library the opennow recipe ships. The tree is no longer kept anywhere
+outside this recipe: the standalone OpenNOWLite repository was deleted on the
+decision that everything it carried is vendored into the recipe - `files/native/opennow-streamer`
+is its working tree as it stood, `files/opennow-lite.c`, `files/opennowlite-launch.sh`,
+`files/README.md`, `files/LICENSE`, `files/opennowlite-games` and the 0001
+patch are that repository's own root files, and the recipe builds straight
+from that copy: SRC_URI is `file://native file://opennow-lite.c
+file://opennowlite-launch.sh` with no git and no SRCREV, `S = ${WORKDIR}`,
+and cargo is driven from `${S}/native/opennow-streamer` exactly the way the
+opennow recipe drives it inside its own upstream checkout, with the app
+compiled against the vendored tree's own `crates/opennow-streamer-ffi/include/opennow_streamer_ffi.h`
+so the layout the app fills and the layout the Rust side validates are one
+file. The 0001 patch stays in `files/` as documentation of the delta against
+pristine upstream rather than as something to apply: its hunks are already
+folded into `files/native`, and applying it again answers with failing hunks.
 
 The design, in the order the pieces were measured:
 

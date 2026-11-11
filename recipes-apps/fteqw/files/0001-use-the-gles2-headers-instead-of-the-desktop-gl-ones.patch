@@ -1,0 +1,31 @@
+From 8dcd3ac3b6a851264f44b480c0a9381970989acc Mon Sep 17 00:00:00 2001
+From: Your Name <you@example.com>
+Date: Tue, 10 Nov 2026 21:11:23 +0100
+Subject: [PATCH 1/2] use the gles2 headers instead of the desktop gl ones for
+ the seat
+
+the board carries no desktop GL at all: EGL, GLES1/2/3 and the Vivante
+VSC/GAL stack only. FTEQW reaches GL entry points at runtime through
+SDL_GL_GetProcAddress, so the only compile-time need is the GLES2
+headers plus the gles2 typedef shims that the ANDROID branch already
+sets up. FTE_GLES is the trigger the recipe passes in CFLAGS.
+---
+ engine/gl/glquake.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/engine/gl/glquake.h b/engine/gl/glquake.h
+index 55ea4b1..5afd77c 100644
+--- a/engine/gl/glquake.h
++++ b/engine/gl/glquake.h
+@@ -35,7 +35,7 @@ void ClearBounds (vec3_t mins, vec3_t maxs);
+ void ModBrush_LoadGLStuff(void *ctx, void *data, size_t a, size_t b);	//data === builddata_t
+ 
+ #ifdef GLQUAKE
+-	#if defined(ANDROID) /*FIXME: actually just to use standard GLES headers instead of full GL*/
++	#if defined(ANDROID) || defined(FTE_GLES) /*the seat build: GLES2 headers, no desktop GL anywhere*/
+ 		#ifndef GLSLONLY
+ 			#include <GLES/gl.h>
+ 			#ifndef GL_CLIP_PLANE0
+-- 
+2.43.0
+

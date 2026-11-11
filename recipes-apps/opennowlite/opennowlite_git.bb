@@ -15,44 +15,59 @@ BUGTRACKER = "https://github.com/OpenCloudGaming/OpenNOW/issues"
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
-# The upstream pin is the point of this recipe: the released v1.0.4 tag is
-# bec4a0b11fc77fb5bfe9584f012296333718e84b, the same commit the opennow recipe
-# builds. It is the tip of upstream's main branch, not of dev (v1.0.4 is not
-# reachable from dev), so the fetch below names branch=main: with the old
-# branch=dev the fetcher cannot resolve this SRCREV at all. Nothing of that recipe is reused: OpenNOWLite has its own source file,
-# its own patch series, its own FFI library in its own directory and its own
-# package, so the two clients install side by side and share no binary, no
-# library file and no log line. The patched tree is also kept in a standalone
-# repository next to this layer; see the README.
-SRC_URI = "git://github.com/OpenCloudGaming/OpenNOW.git;protocol=https;branch=main \
-           file://0001-hand-encoded-media-to-the-host.patch \
-           file://opennow_streamer_ffi.h \
+# The tree this recipe builds is vendored in its own files/ directory: files/native
+# is the reference tree of upstream's OpenNOW v1.0.4 = bec4a0b11fc77fb5bfe9584f012296333718e84b
+# (the tag on refs/heads/main, not on dev, which is the same commit the opennow
+# recipe pins and fetches) after this recipe's one patch, plus the further edits
+# the development session that owned that tree made on top of it. So the pin is
+# recorded here instead of fetched, and the patch stays in files/ as documentation
+# of the delta against pristine upstream rather than as something to apply: its
+# hunks are already folded into files/native, and a second application fails.
+# The file is still named opennowlite_git.bb because that name is what gives
+# this package its name, opennowlite, which is what the boards' index carries.
+SRC_URI = "file://native \
            file://opennow-lite.c \
            file://opennowlite-launch.sh"
-SRCREV = "bec4a0b11fc77fb5bfe9584f012296333718e84b"
-# +release+ is here so the version keeps sorting above the nightly string the boards
-# carry (1.0.4+nightly.1515.1+git0+b3fe71026d-r2.11): do_packagedata's
-# version-going-backwards QA check compares segment by segment, and "git0..." loses
-# against "nightly...". The pin is the released v1.0.4 tag, which is what +release+
-# records.
-PV = "1.0.4+release+git${SRCPV}"
-S = "${WORKDIR}/git"
 
-# The one patch this recipe carries. Upstream's streamer decodes the media
-# itself and only publishes decoded frames, which is what opennow-qt needs and
-# what this client does not want: paying for a decode here and re-encoding for
-# GStreamer would spend the board's VPU twice for one picture. The patch adds an
-# encoded-media tap to that same streamer, so the H.264 and Opus packets the
-# vendor sends are forwarded to this program without being touched, while the
-# Rust side keeps owning the NVST connection, the input protocol and the
-# session's lifecycle. It is applied to the pinned tree before do_compile.
+# The vendored tree descends from that tag, so the version keeps saying so. It
+# is written out rather than computed from ${SRCPV}, because there is no longer
+# a fetched commit to compute a tip from, and it still has to sort above the
+# nightly string the boards carry (1.0.4+nightly.1515.1+git0+b3fe71026d-r2.11):
+# do_packagedata's version-going-backwards QA check compares segment by segment,
+# and "git0..." loses against "nightly...".
+PV = "1.0.4+release+git0+bec4a0b11f"
+
+# The unpack puts each file:// entry under its own name in ${WORKDIR}, so the
+# source root here is ${WORKDIR} and the crate tree is reached as
+# ${S}/native/opennow-streamer: the same path, and the same cargo workspace,
+# that the opennow recipe drives inside its own upstream checkout.
+S = "${WORKDIR}"
+
+# The one patch this recipe carries, kept as documentation. Upstream's streamer
+# decodes the media itself and only publishes decoded frames, which is what
+# opennow-qt needs and what this client does not want: paying for a decode here
+# and re-encoding for GStreamer would spend the board's VPU twice for one picture.
+# The patch adds an encoded-media tap to that same streamer, so the H.264 and Opus
+# packets the vendor sends are forwarded to this program without being touched,
+# while the Rust side keeps owning the NVST connection, the input protocol and the
+# session's lifecycle. It is NOT applied here: files/native already carries it, so
+# applying it again answers with failing hunks. What it adds, and what the tree
+# therefore contains today, is the EncodedMediaKind/EncodedMediaPacket/EncodedMediaTap
+# pair, MediaSink::with_tap(), spawn_passthrough_linux(), a validate_backend()
+# bypass for a device-less engine, and the encoded_media_callback plus media_passthrough
+# fields of OpenNowStreamerConfig.
 #
-# The header in SRC_URI is the same patched header the library is built from, so
-# the OpenNowStreamerConfig layout the app fills and the layout the Rust side
-# validates cannot drift apart.
+# The header the app includes is the one inside that vendored tree, under
+# crates/opennow-streamer-ffi/include, so the layout the app fills and the layout
+# the Rust side validates are one file and cannot drift apart; the tree's own
+# native/opennow-streamer-ffi-header.h is the reading copy of the same header.
 
 # PR-server counter resets to r0.0 whenever the recipe changes; pin it so the
-# deb always installs over what the boards already carry.
+# deb always installs over what the boards already carry, which is exactly
+# 1.0.4+release+git0+bec4a0b11f-r2.12. The source moved into this layer without
+# moving the counter: a deb of the same version installs over the installed one,
+# and the round that re-measures the rebuilt client on a seat owns the bump, so
+# a seat still reporting r2.12 is not evidence about which source it runs.
 PKGR = "r2.12"
 
 DEPENDS = " \
@@ -136,7 +151,7 @@ do_compile:prepend() {
 # compositor module is involved and the picture fills the window this program
 # owns. xdg-shell is generated from the sysroot's wayland-protocols.
 #
-# The FFI library is built for this machine out of the pinned tree with no
+# The FFI library is built for this machine out of the vendored tree with no
 # backend feature selected: the media path here is a passthrough, so the
 # opennow-streamer backends (VA-API, bundled FFmpeg and its nv-codec-headers)
 # are not needed and are not pulled in. The result is installed under this
@@ -172,19 +187,24 @@ do_compile() {
     # The app first, so a broken app fails this task in seconds instead of
     # after the Rust library below has been built. -ldl: the streamer's
     # symbols come from dlopen, and this recipe must not carry OpenNOW's
-    # library at link time.
+    # library at link time. -I${WORKDIR} is where the generated protocol
+    # headers are, and the second -I is the vendored tree's own copy of the
+    # streamer's C header, so opennow-lite.c is compiled against the very
+    # header the library below is built from.
     #
     # gstreamer-app-1.0 is the appsrc library (libgstapp-1.0.so.0): it is a
     # separate shared object from libgstreamer-1.0, so GstAppSrc's symbols are
     # undefined at link time without it, and it has its own pkg-config file
     # rather than being part of gstreamer-1.0's Libs.
-    ${CC} ${CFLAGS} ${CPPFLAGS} -I${WORKDIR} -o opennow-lite \
+    ${CC} ${CFLAGS} ${CPPFLAGS} -I${WORKDIR} \
+        -I${S}/native/opennow-streamer/crates/opennow-streamer-ffi/include \
+        -o opennow-lite \
         ${WORKDIR}/opennow-lite.c ${WORKDIR}/xdg-shell-protocol.c \
         ${WORKDIR}/relative-pointer-unstable-v1-protocol.c \
         ${WORKDIR}/pointer-constraints-unstable-v1-protocol.c \
         ${LDFLAGS} -ldl $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-wayland-1.0 wayland-client)
 
-    # The streamer library, from the pinned and patched tree, for this machine.
+    # The streamer library, from the vendored tree, for this machine.
     # No --target would be the opennow idiom, but it is not what this graph
     # needs: the lite build selects no backend feature, so the vendored OpenH264
     # C++ is compiled from source by openh264-sys2 with cc-rs, and cc-rs takes

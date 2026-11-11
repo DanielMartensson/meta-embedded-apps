@@ -1,18 +1,19 @@
 SUMMARY = "LibreQuake - the free Quake game data, mounted as the id1 directory"
-DESCRIPTION = "Quake engines need an id1/ directory of game data beside the \
-executable (this vkQuake takes its basedir as the current directory and looks \
-under it for <game>/pak0.pak). LibreQuake is a full free replacement of that \
-data: at this release the game ships id1 with pak0.pak and pak1.pak rebuilt \
-from free assets, the single-player plus deathmatch maps as loose .bsp/.lit, \
-the music as track02..11.ogg and the config/doc set the engines read. It is \
-data only: there is no engine code in here, this recipe's payload is placed \
-next to the vkquake binary, and the README in the vkquake directory tells the \
-round that played it. The licensing is the repo's own two documents inside id1: \
-docs/COPYING is the BSD-3-Clause text the project puts on the models, textures \
-and sounds, and docs/misc-docs/COPYING is the GPL v2 that covers the quakec \
-progs (progs.dat, pop.lmp); docs/README-IMPORTANT-LICENCE-INFO inside id1 in \
-the zip spells this split out, and there is no one-license file at the \
-repository root, hence the combined license and the two checksums below."
+DESCRIPTION = "The Quake protocol reads its game out of a directory of data \
+named after the game, holding pak0.pak beside the maps, and an engine with no \
+data of its own can only play what some other package put there. LibreQuake is \
+a full free replacement of that data: at this release it ships id1 with pak0.pak \
+and pak1.pak rebuilt from free assets, the deathmatch maps as loose .bsp/.lit, \
+the music as track02..11.ogg, the progs.dat the multiplayer code runs and the \
+config/doc set the engines read. It is data only: there is no engine code in \
+here, this recipe's payload is the tree the fteqw launcher points its -basedir \
+and -game at, and the README in the fteqw directory tells the round that played \
+it. The licensing is the repo's own two documents inside id1: docs/COPYING is \
+the BSD-3-Clause text the project puts on the models, textures and sounds, and \
+docs/misc-docs/COPYING is the GPL v2 that covers the quakec progs (progs.dat, \
+pop.lmp); docs/README-IMPORTANT-LICENCE-INFO inside id1 in the zip spells this \
+split out, and there is no one-license file at the repository root, hence the \
+combined license and the two checksums below."
 HOMEPAGE = "https://github.com/lavenderdotpet/LibreQuake"
 
 # Both texts sit in the unpacked zip under S (${WORKDIR}/full; the license
@@ -47,11 +48,13 @@ PKGR = "r0.01"
 
 S = "${WORKDIR}/full"
 
-# The engine finds the data by looking for id1/pak0.pak under the
-# directories it was told about, and this vkQuake starts that search at its
-# current directory (main_sdl.c hands the engine basedir = "."), so the
-# deb installs the payload at a fixed, neutral place and the run dir on the
-# seat is made by hand next to /usr/bin/vkquake.
+# The engine is told where the tree is rather than guessing: the fteqw launcher
+# this layer installs runs -basedir /usr/share/librequake -game id1, and FTEQW
+# then reads id1/pak0.pak under that basedir. The name id1 is what the Quake
+# protocol's own game entry asks for, so the tree is installed under its own
+# name and no symlink is needed anywhere: an earlier round had /usr/share/lq1
+# pointing at this tree and ran -game lq1 instead, which the launcher no
+# longer does.
 do_install() {
     install -d ${D}/usr/share/librequake
     cp -a ${S}/id1 ${D}/usr/share/librequake/id1
