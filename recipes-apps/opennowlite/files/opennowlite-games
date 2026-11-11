@@ -41,6 +41,8 @@ def main():
                         help="OpenNOW data directory (default: the seat's own)")
     parser.add_argument("--json", action="store_true",
                         help="print the core's raw reply instead of a table")
+    parser.add_argument("name", nargs="?", metavar="NAME",
+                        help="only show titles containing NAME (case-insensitive)")
     args = parser.parse_args()
 
     argv = [CORE]
@@ -83,11 +85,19 @@ def main():
         games = []
         walk(reply.get("result"), games)
         seen = set()
+        needle = args.name.lower() if args.name else None
+        shown = 0
         for title, launch in games:
             if launch in seen:
                 continue
             seen.add(launch)
+            if needle and needle not in title.lower():
+                continue
             print("%-48s %s" % (title, launch))
+            shown += 1
+        if needle and not shown:
+            sys.exit('opennowlite-games: no title in the library contains "%s"'
+                     % args.name)
     finally:
         core.stdin.close()
         core.wait(timeout=10)

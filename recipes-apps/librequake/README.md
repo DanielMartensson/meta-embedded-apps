@@ -40,8 +40,10 @@ payload is, and `check-license` resolves both `file://` names against `S`.
 The launcher that mounts this tree is the fteqw recipe's `/usr/bin/fteqw` -
 it is the default pair there (`-basedir /usr/share/librequake -game id1 -quake`),
 so on the seat `/usr/bin/fteqw +wait 3 +map lqdm3` is a complete game command,
-and how the launcher and its `FTEQW_ARGS` set work is in `../fteqw/README.md`.
-The round measured on Nov 11 2026:
+and how that launcher and its `FTEQW_ARGS` set work, including the render
+buffer that decides how smooth the game runs, is in `../fteqw/README.md`.
+The round measured on Nov 11 2026, with the launcher's own defaults and nothing
+else on the command line:
 
 ```
 /usr/bin/fteqw +wait 3 +map lqdm3
@@ -49,11 +51,35 @@ The round measured on Nov 11 2026:
     current map : lqdm3 (Hyperborea)
     entities : 60/60/131072 (mem: 3.2%)
     models 50/16384   sounds 79/4096   gamedir : qw
-  top over the run:  VIRT 620080 KB  RES  55672 KB  SHR 10832 KB  %CPU 0.0 -> 16.7
-  free -m while it ran: ~240-277 MB used of the seat's 1768 MB
+  log proof (WAYLAND_DEBUG=1):
+    Setting mode 1024*576 32bpp OpenGLES2+
+    wl_surface@19.damage(0, 0, 1024, 768)
+    xdg_toplevel@26.set_fullscreen(wl_output@13)
+    lock_pointer x2, relative_pointer_v1 relative_motion x4
+    Initing default SDL audio device.
+  fps: 37.0 steady over the measured 20 s (three runs: 37.0, 37.0, 37.0;
+       at the seat's own 1920x1080 the same map ran at 14.0)
+  cost while it ran (from /proc, 6 s apart): 85 % of one core, rss 146984 kB
+  ps beside it: VSZ 1041076 KB  RSS 147104 KB  %CPU 94.0
+  free -m while it ran: 1768 total, 464 used, 1304 available
   screenshot of a rendered world: ~/.local/share/quake/fte/screenshots/
     fte-20261111025415-0.png, 128171 B
 ```
+
+The fps is counted as the `wl_surface@19.commit()` lines of the game's own
+surface in the compositor-debug log over the steady 20 s that starts 12 s into
+the run - the game prints no fps of its own in these runs, and the log's
+timestamps are milliseconds, which is the unit an earlier round got wrong
+against the same count. `lock_pointer` and `relative_pointer_v1` are answered
+by weston at the smaller buffer, so mouselook still works, and the audio line
+is the ALSA default the OS layer's `alsa-state` fix buys.
+
+The older round's shape is kept beside it for the comparison: at the seat's own
+1920x1080 the same map ran at `VIRT 620080 KB / RES 55672 KB / SHR 10832 KB /
+%CPU 0.0 -> 16.7` with the seat's monitor reading ~240-277 MB used of its 1768
+MB. The busybox `top` truncates the process name to `fteqw-g+`, so a `ps` filter
+on the game never matches on this board; `top -b -n 1` does, and `ps -o ...
+-p <pid>` off `/proc` does.
 
 The tree the seat carries today is a `cp` of the same payload rather than a
 `dpkg -i` of its deb: with the 242 MB already in place the seat's own

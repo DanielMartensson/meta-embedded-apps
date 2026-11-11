@@ -17,14 +17,16 @@ LIC_FILES_CHKSUM = "file://engine/LICENSE;md5=79c2cc4426b9e6f3b9098f02eb47aac1"
 
 # Pin: upstream's master tip at the time this recipe was written, f09ac7cc
 # "Merge pull request #458 from Xylemon/master" (27 Sep 2026). Pinned rather
-# than left at HEAD because the local patch below sits against this exact
-# tree: 0001 touches the #if at gl/glquake.h:38, and a moved HEAD would have
-# to be re-checked against it. See the README in this directory for the record
+# than left at HEAD because the local patches below sit against this exact
+# tree: 0001 touches the #if at gl/glquake.h:38 and 0002 the VALIDATEPOINTER
+# macro at plugins/quake3/svq3_game.c:838, and a moved HEAD would have to be
+# re-checked against both. See the README in this directory for the record
 # of why this engine and this renderer were chosen (the seat has no desktop
 # GL, so QuakeSpasm and the vkQuake build that used to be in this layer are
 # out).
 SRC_URI = "git://github.com/fte-team/fteqw.git;protocol=https;branch=master \
            file://0001-use-the-gles2-headers-instead-of-the-desktop-gl-ones.patch \
+           file://0002-quake3-real-time-accept-null.patch \
           "
 SRCREV = "f09ac7cccd2d713ddf881d3f1324703082c2cfe4"
 
@@ -171,14 +173,46 @@ do_compile() {
 # -basedir /usr/share/librequake -game id1; -quake then states the protocol,
 # because the directory name alone does not say which game the tree is.
 #
-# The three sets in FTEQW_ARGS are the two facts this board needs at startup and
-# one the LibreQuake progs set needs:
+# The six sets in FTEQW_ARGS are the one fact the Vivante driver needs at startup,
+# the three video settings the seat's fill-rate needs, and the two Quake-C VM sizes
+# that LibreQuake needs to fit in the seat's 1768 MB:
 #   - vid_gl_context_es 1 asks the Vivante driver for a GL ES 3.1 context. Left
 #     alone it hands back an ES-CM 1.1 one and the renderer cannot draw at all.
-#   - vid_fullscreen 2 keeps the window on the seat's own desktop size.
-#   - pr_ssqc_memsize 134217728 is the Quake-C VM arena: the engine mallocs it
-#     whole and re-mallocs it as the progs grow, and LibreQuake ships progs.dat,
-#     whose sprite sequence needs 128mb where the default is 32mb.
+#   - vid_fullscreen 1 with vid_width 1024 and vid_height 576 lets the window fill
+#     the seat's 1920x1080 output -- the seat's own desktop stays what it is -- but
+#     draws the 3d scene into a smaller buffer the compositor scales up. this is the
+#     one setting that decides how smooth the game plays: the Vivante GCNANO ULTRA31
+#     is fill-rate bound, so the framerate follows the area of the surface the seat
+#     really allocates, which the wl_surface@19.damage() rects in the WAYLAND_DEBUG
+#     log spell out. that surface is not always the size asked for: a 16:9 size that
+#     is not one the seat answers is padded up to the next 4:3 one, so 1152x648 lands
+#     on a 1152x864 surface and runs SLOWER than 1280x720, and 896x504 and 960x540
+#     both land on the same 1024x768 surface as 1024x576 and cost the same, which is
+#     why the ask is the wider 1024x576. measured on the seat over the steady 20 s of
+#     lqdm3, counting the wayland frame commits of the game's own surface: 1920x1080
+#     gives 14.0 fps, 1600x900 gives 21.6, 1280x720 gives 32.8, 1024x576 gives 37.0,
+#     768x432 gives 57.1 and 640x360 gives 63.7. the launcher ships 1024x576: 37 fps
+#     is within a whisker of the seat's own 60 Hz repaint cadence, which caps every
+#     smaller buffer at about 64 fps, so asking below it buys nearly nothing, and
+#     768x432 and 640x360 are the blockier tiers for a hand-run measurement. 1280x720
+#     is one FTEQW_ARGS away for the sharper picture at 33 fps. vid_fullscreen 0 at
+#     the same sizes costs the same but leaves a centred window on the desktop rather
+#     than a fullscreen one, and leaving vid_width/vid_height at 0 lets SDL pick a
+#     plain 4:3 mode the compositor then stretches sideways, so the size is stated by
+#     hand. what does NOT help is the quality cvars: r_vertexlight 1, r_dynamic 0,
+#     gl_picmip 2, GL_LINEAR_MIPMAP_NEAREST, r_fastsky 1,
+#     gl_texture_anisotropy 0 and r_warp 1 each moved lqdm3 by under 2 fps at 1080p
+#     on their own, measured the same way, and the only ones that buy anything at all
+#     (r_drawflat 1 at 24.6, r_lightmap 1 at 28.2) do it by not drawing the lightmap.
+#   - pr_ssqc_memsize 134217728 is the server-side Quake-C VM arena: the engine
+#     mallocs it whole and re-mallocs it as the progs grow, and LibreQuake ships
+#     progs.dat, whose sprite sequence needs 128mb where the default is 32mb.
+#   - pr_csqc_memsize 64m sizes the client-side VM. Its default is -1, and on
+#     this 64-bit build PR_ReadBytesString() maps that to 0x80000000, so the
+#     client asks malloc for 2 GB, the allocation fails and the engine aborts
+#     before the map appears (qclib/initlib.c:532). 64m is what the LibreQuake
+#     csqc progs need; measured on the seat, lqdm3 then loads and "LQ Player
+#     joined the server" follows.
 do_install() {
     install -d ${D}${bindir}
     install -m 0755 ${S}/engine/release/fteqw-glsdl ${D}${bindir}/fteqw-gles
@@ -192,9 +226,15 @@ do_install() {
         '# speaks a different protocol and has its own launcher, /usr/bin/openarena.' \
         '# Override with FTEQW_BASEDIR / FTEQW_GAME / FTEQW_ARGS, or pass your own' \
         '# -basedir, -game and -set arguments on the command line, which win.' \
+        '# The video sets draw the 3d scene into a 1024x576 buffer and let the' \
+        '# compositor scale it to the 1920x1080 of the seat TV. This seat is fill-rate' \
+        '# bound, so that buffer is what decides how smooth the game plays: 1024x576' \
+        '# measured 37 fps, 1280x720 measures 33 fps for a sharper picture, and 768x432' \
+        '# measures 57 fps for a blockier one. Nothing below 640x360 helps: the seat' \
+        '# caps a surface at about 64 fps.' \
         'basedir=${FTEQW_BASEDIR:-/usr/share/librequake}' \
         'game=${FTEQW_GAME:-id1}' \
-        'fteargs=${FTEQW_ARGS:--set vid_gl_context_es 1 -set vid_fullscreen 2 -set pr_ssqc_memsize 134217728}' \
+        'fteargs=${FTEQW_ARGS:--set vid_gl_context_es 1 -set vid_fullscreen 1 -set vid_width 1024 -set vid_height 576 -set pr_ssqc_memsize 134217728 -set pr_csqc_memsize 64m}' \
         'exec /usr/bin/fteqw-gles -basedir "$basedir" -game "$game" -quake -updatesrc "" $fteargs "$@"' \
         > ${D}${bindir}/fteqw
     chmod 0755 ${D}${bindir}/fteqw

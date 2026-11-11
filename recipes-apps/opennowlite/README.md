@@ -50,6 +50,138 @@ file. The 0001 patch stays in `files/` as documentation of the delta against
 pristine upstream rather than as something to apply: its hunks are already
 folded into `files/native`, and applying it again answers with failing hunks.
 
+## How to use it on the seat
+
+This is the short form of `files/README.md` - the project's own README,
+vendored with the source - corrected where that text still describes the
+older KMS client. The full switch list is `/usr/bin/opennow-lite --help`.
+
+**Install.** The binary is never built on the seat; the deb is built here and
+installed with `dpkg`:
+
+```bash
+cd ~/Dokument/Github/Watermelon-Wine/watermelon-wine-os
+export BUILDDIR=build-openstlinuxweston-stm32mp25-mx
+. layers/openembedded-core/oe-init-build-env "$BUILDDIR"
+bitbake opennowlite
+find "$BUILDDIR/tmp-glibc/deploy/deb/cortexa35" -name 'opennowlite*_arm64.deb'
+# relay the deb to the seat, then
+ssh root@192.168.1.33 'dpkg -i /tmp/opennowlite_1.0.4+release+git0+bec4a0b11f-r2.12_arm64.deb'
+ssh root@192.168.1.33 'dpkg -s opennowlite | head -2'
+```
+
+No configure, no make and no `apt` on the board, and no reboot: a new package
+needs nothing reloaded, only a restart of the client if one was running. Stop
+a running client with the quit chord below, not by killing the desktop's
+processes.
+
+**Start it.** The deb installs `/usr/bin/opennowlite`, a short wrapper that
+fills in `XDG_RUNTIME_DIR=/home/weston` and `WAYLAND_DISPLAY=wayland-1` when
+the session has not already set them, and execs `/usr/bin/opennow-lite` with
+the arguments it was given. From a terminal inside weston:
+
+```bash
+opennowlite --launch-app-id=100362311
+```
+
+`--launch-app-id` is required and is a CloudMatch **app id**, not a game name.
+The client opens its own xdg-shell window (`app_id=opennowlite`, 1920x1080 by
+default; `--width`/`--height`, or `--fullscreen`) and draws the stream into it
+with waylandsink, so there is no KMS hand-over to arrange.
+
+**A detached round with a log.** The client prints its event lines to stdout,
+so the log is the redirection:
+
+```bash
+HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
+  setsid nohup /usr/bin/opennowlite --launch-app-id=100362311 \
+  >/home/weston/.runs/lite.log 2>&1 </dev/null &
+```
+
+**Which game, and which id.** There is no menu and no TUI: one launch names one
+game, so changing games means quitting (chord below) and starting again with
+the other id. `files/opennowlite-games` is the lookup helper. It is not
+installed by the deb, so run it from the recipe tree (or a copy):
+
+```bash
+# the whole library, one "title  id" line per game
+files/opennowlite-games
+
+# only the titles that contain the text (case-insensitive)
+files/opennowlite-games 'dark and darker'
+
+# the core's raw catalog.library.list reply
+files/opennowlite-games --json
+```
+
+It spawns the shipped core (`/usr/bin/opennow-core`, which comes from the
+`opennow` package, not this one) and asks it for the live library
+(`catalog.library.list`), so the list is exactly what the core sees, nothing
+is cached, and the ids are the ones this account can launch. It needs the same
+signed-in account a round needs and takes about 20 s for the one reply. On
+this seat's account the table includes:
+
+```
+Destiny 2                           100362311
+Dark and Darker                     102303211
+```
+
+Read the id off this helper rather than copying one from a web page: the
+library is per account, and an id that is not in it dies at
+`media.no_allocation` or `catalog.game.get`, not at the client.
+
+**One client at a time.** The core holds an exclusive lock over its data
+directory: OpenNOW and OpenNOWLite cannot stream at the same moment, and a
+`session_conflict` means another client, or the previous one, is still alive.
+Wait 80-120 s for the core to release it.
+
+**Another data directory.** `--data-dir=DIR` points the core at another data
+directory. That is only for signing a second account in with `--login`; a
+normal round has to use the seat's own directory, where the signed-in account
+lives.
+
+**Quit.** Hold **Ctrl+Alt+Shift+O** for about 0.4 s: the client exits through
+its own shutdown path and closes the stream. If that is unavailable,
+`kill -TERM` the recorded client and the `opennow-core` it spawned. Never kill
+`weston`, `weston-keyboard`, `weston-desktop-shell` or `seatd`.
+
+**Account.** The client reads, stores and asks for no credential. It asks the
+core for `catalog.game.get`, `catalog.launch.inspect` and `session.create` /
+`session.poll`; the core owns sign-in and uses the seat's existing record.
+Sign in once with OpenNOW before the first lite round. Never move
+`~/.config/OpenNOW/fallback-sessions/<hash>.json` - that is the account, not a
+cache - and never hand-edit it. The only file this layer ever moves to
+`backup/` is `unresolved-allocation.json`, which is a failed allocation and
+blocks every new session until it is out of the way.
+
+**Watching a round nobody is in front of.** `--record=FILE` writes the first
+`--record-seconds` of picture as a raw H.264 stream (`--record-from=S` starts
+the window later), which is the witness on this seat because
+`weston-screenshooter` answers `Output capture error: unauthorized` while the
+client holds the window; `--auto-pilot` drives the game's own notices
+(`--pilot-at=63:r,212:r` by default) and then keeps the host's idle timer down
+with a pointer jiggle every `--pilot-gap` seconds, and `--test-pattern` (or
+`--pipeline`) plays a test pattern in the same window with no session at all,
+which is how the window and the input path are proven without an account.
+
+**What a round costs.** Measured from the client's own `/proc` record 672 s
+into a Destiny 2 round: `VmRSS` 36128 kB, `%CPU` 33.0 of one core, 16 threads.
+The seat as a whole read about **480 MB of its 1.7 GB and 70 % CPU** during
+that round; the rest is the shipped core, the compositor and the decoder.
+
+**When it does not start.** The first meaningful line of the log names the
+step:
+
+| Line | What it is |
+| --- | --- |
+| `catalog.game.get authentication_required` | the core has no signed-in account; sign in with OpenNOW once |
+| `session_conflict` | another client holds the core's session; wait 80-120 s |
+| `session_allocation_unresolved` | the core wrote `unresolved-allocation.json`; move it to `backup/` and retry |
+| `media.no_allocation` | wrong app id, or that game is not on this account |
+
+Full switch table, the FFI/ABI contract and the project's own layout notes:
+`files/README.md`.
+
 The design, in the order the pieces were measured:
 
 * **The window is OpenNOWLite's own.** `opennow-lite.c` creates an xdg-shell

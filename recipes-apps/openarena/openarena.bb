@@ -72,11 +72,22 @@ do_install() {
 }
 
 # The launcher. The client it runs is the one the fteqw recipe builds, and the
-# two sets here are what this board needs: vid_gl_context_es 1 asks the Vivante
+# sets here are what this board needs: vid_gl_context_es 1 asks the Vivante
 # driver for a GL ES 3.1 context rather than the ES-CM 1.1 one it hands back
-# when left alone, and vid_fullscreen 2 keeps the window at the seat's desktop
-# size. No pr_ssqc_memsize here: that arena belongs to the Quake-C progs the
-# Quake payload ships, and the Quake III gamecode has none.
+# when left alone, and vid_fullscreen 1 with vid_width 1024 vid_height 576 lets
+# the window fill the seat's 1920x1080 output while the 3d scene is drawn into
+# a 1024x576 buffer the compositor scales up. That buffer is the smoothness
+# control: the seat is fill-rate bound, so oa_dm6 measured over a steady 20 s by
+# counting the wayland frame commits of the game's surface runs 22.1 fps when the
+# buffer is the whole 1920x1080, about 47 fps at 1280x720 and about 52 fps at
+# 1024x576. OpenArena swings far more than LibreQuake from run to run: the eight
+# runs at 1280x720 gave 40.5, 42.7, 43.4, 46.5, 48.1, 48.4, 52.1 and 56.2 fps, so
+# only tiers this far apart are real, and the four at 1024x576 gave 49.5, 50.2,
+# 51.9 and 53.6. The fteqw recipe measured the same curve for the Quake payload,
+# including that the quality cvars move nothing on their own and that a 16:9 size
+# the seat does not answer gets its surface padded up to the next 4:3 one. No
+# pr_ssqc_memsize here: that arena belongs to the Quake-C progs the Quake
+# payload ships, and the Quake III gamecode has none.
 do_install:append() {
     install -d ${D}${bindir}
     printf '%s\n' \
@@ -88,9 +99,15 @@ do_install:append() {
         '# -game baseoa. Override with OPENARENA_BASEDIR / OPENARENA_GAME /' \
         '# OPENARENA_ARGS, or pass your own -basedir, -game and -set' \
         '# arguments on the command line, which win.' \
+        '# The video sets draw the 3d scene into a 1024x576 buffer and let the' \
+        '# compositor scale it to the 1920x1080 of the seat TV. This seat is fill-rate' \
+        '# bound, so that buffer decides how smooth the game plays: 1024x576 measures' \
+        '# about 52 fps, 1280x720 measures about 47 fps for a sharper picture and 768x432' \
+        '# measures about 54 fps for a blockier one. Nothing under 640x360 helps: the' \
+        '# seat caps a surface at about 64 fps.' \
         'basedir=${OPENARENA_BASEDIR:-/usr/share/openarena}' \
         'game=${OPENARENA_GAME:-baseoa}' \
-        'fteargs=${OPENARENA_ARGS:--set vid_gl_context_es 1 -set vid_fullscreen 2}' \
+        'fteargs=${OPENARENA_ARGS:--set vid_gl_context_es 1 -set vid_fullscreen 1 -set vid_width 1024 -set vid_height 576}' \
         'exec /usr/bin/fteqw-gles -basedir "$basedir" -game "$game" -quake3 -updatesrc "" $fteargs "$@"' \
         > ${D}${bindir}/openarena
     chmod 0755 ${D}${bindir}/openarena
