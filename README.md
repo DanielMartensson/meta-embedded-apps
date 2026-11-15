@@ -2,48 +2,17 @@
 
 Yocto `scarthgap` layer: the applications that run on the seat. One screen long
 on purpose -- everything that was measured, tried or patched lives in the detail
-file next to the recipe that owns it.
+file next to the recipe that owns it. The games and the engines they run on live
+in `meta-good-old-games`, and everything that is OS-level lives in
+`layers/meta-watermelon-wine`.
 
 ## What is in this branch
 
 | Application | Recipe | Upstream pin | Installed on the seat | What it does |
 | --- | --- | --- | --- | --- |
-| OpenNOW | `recipes-apps/opennow/opennow_git.bb` | [OpenCloudGaming/OpenNOW](https://github.com/OpenCloudGaming/OpenNOW) `v1.0.4` = `bec4a0b11fc77fb5bfe9584f012296333718e84b`, `branch = "main"` | `1.0.4+release+git0+bec4a0b11f-r0.76` | signs the seat into the CloudMatch account and keeps the credential the other clients use; on this board it does not stream |
-| OpenNOWLite | `recipes-apps/opennowlite/opennowlite_git.bb` | same pin as OpenNOW, vendored at `files/native` rather than fetched | `1.0.4+release+git0+bec4a0b11f-r2.12` | the client that plays: its own Wayland window, KMS scan-out, Vulkan/VAAPI decode, NVST input and Opus audio decoded in process into the seat's ALSA sink |
 | Discordo | `recipes-apps/discordo/discordo_git.bb` | [ayn2op/discordo](https://github.com/ayn2op/discordo) `31905f3e790e63cd0f2366526afe41fb278c226e` | `0.1+git0+31905f3e79-r0.01` | terminal Discord client in the seat's weston-terminal; 21 vendored Go modules, no network at build |
-| FTEQW | `recipes-apps/fteqw/fteqw_git.bb` | [fte-team/fteqw](https://github.com/fte-team/fteqw) `f09ac7cccd2d713ddf881d3f1324703082c2cfe4`, `branch = "master"` | `0.0+git0+f09ac7cccd-r0.01` | the gles-only client both games run on: two patches (`GLES2/gl*.h` includes, a null `qtime` accepted in the q3 game traps), CFLAGS `-DGLESONLY -DGLSLONLY -DFTE_GLES`, no libGL in `NEEDED`; its launcher asks for a 1024x576 buffer (a 1024x768 surface on this seat), which is the smoothness control here |
-| LibreQuake | `recipes-apps/librequake/librequake.bb` | [lavenderdotpet/LibreQuake](https://github.com/lavenderdotpet/LibreQuake) release tag `v0.09-beta`, `full.zip` pinned by sha256 | `0.09-beta-r0.01` | the free Quake data: `/usr/share/librequake/id1`, thirteen deathmatch maps, no campaign; the fteqw launcher's default game, `lqdm3` at 37 fps on the seat |
-| OpenArena | `recipes-apps/openarena/openarena.bb` | [OpenArena](https://openarena.ws) release `0.8.8`, one zip pinned by sha256 | `0.8.8-r0.01` | the second game's data: `baseoa` nine pk3s + `missionpack`, GPL-2 both for program and data; played by the FTEQW q3 gamecode through `/usr/bin/openarena`, `oa_dm6` at about 52 fps on the seat |
 | NanoBrowser | `recipes-apps/nanobrowser/nanobrowser_git.bb` | [DanielMartensson/NanoBrowser](https://github.com/DanielMartensson/NanoBrowser) `b5e01869c10140799085a20d2c18cadb37c3f977` | `0.1+git${SRCPV}-r0.32` | minimal QML browser on QtWebEngine; `--page`, `NANOBROWSER_TIMING`, build default renderer OpenGL (measured 1.3 s to first frame against Vulkan's 3.1 s) |
 | YtGst | `recipes-apps/ytgst/ytgst_git.bb` | [DanielMartensson/YtGst](https://github.com/DanielMartensson/YtGst) `9cb2a60806907c6ac91fa3924ea17f910f2172af` | `0.1+git${SRCPV}-r0.48` | YouTube client on GStreamer + yt-dlp with V4L2 hardware decode; picture in a Wayland subsurface of its own window, `YTGST_*` switches |
-
-The two CloudMatch clients pin the same upstream commit on purpose: the seat's
-account, the catalog and the CloudMatch consent are one thing both of them read,
-and a pin that lets the two disagree is the one mistake that produced two
-clients arguing over the same allocation. OpenNOWLite's tree is vendored inside
-its recipe (`files/native`) rather than fetched: the standalone repository that
-used to carry it was deleted, and the recipe builds from the vendored copy with
-`file://` entries only, driving the same cargo workspace from
-`${S}/native/opennow-streamer` that the opennow recipe drives inside its own
-upstream checkout.
-
-### The two games the seat plays natively
-
-Both are played through FTEQW's gles client, both were run on the seat on
-Nov 11 2026 while their launchers, options and payloads were set up, and both
-printed their console proof, a screenshot of a rendered world, and their cost
-while running - the seat ran LibreQuake's `lqdm3` at `rss 146984 kB / 85 % of
-one core / 464 MB used of 1768` at 37.0 fps and OpenArena's `oa_dm6` at `rss
-161688 kB / 77 % of one core / 571 MB used` at about 52 fps, and both drew into
-a 1024x768 surface that weston scales to the seat's 1920x1080. That surface is
-the one setting that decides how smooth a game plays here, because the Vivante
-is fill-rate bound: the same `lqdm3` ran at 14.0 fps over the whole 1920x1080.
-The pair follows the layer's rule that a game must be free to use AND free to
-download: LibreQuake replaces the proprietary Quake paks with free ones
-(thirteen deathmatch maps, and that is all it ships), OpenArena is free both
-ways under GPL-2, and Quake II was searched, found to have no fully free
-asset set, and skipped without a recipe. Everything measured lives in the
-games' own detail files.
 
 ### Bundled dependencies
 
@@ -52,33 +21,20 @@ needs them.
 
 | Recipe | Needed by | Why |
 | --- | --- | --- |
-| `recipes-multimedia/libsdl3/libsdl3_3.4.16.bb` | OpenNOW | SDL 3 controller input |
 | `recipes-multimedia/gstreamer/gstreamer1.0-plugins-good_%.bbappend` | YtGst | adds the Qt6 QML video sink (`qml6glsink`) |
 | `recipes-support/yt-dlp/yt-dlp_2026.08.19.bb` | YtGst | runtime downloader |
-| `recipes-devtools/rust/rust-1.85.0-host.bb`, `rust-1.89.0-host.bb` | OpenNOW, OpenNOWLite | the host Rust/Cargo their `do_compile` runs, pinned past what the core's own crate set needs |
 | `recipes-qt/qt6/qtwebengine_git.bbappend` | NanoBrowser | keeps QtWebEngine buildable on aarch64 |
 
-Nothing else is vendored here. A Go application in this layer cross-compiles
-against oe-core's own `go_1.22.12` and `go-runtime`, and a Quake-style game
-against oe-core's own SDL 2.
+Nothing else is vendored here. The one Go application in this layer cross-compiles
+against oe-core's own `go_1.22.12` and `go-runtime`, and YtGst runs on oe-core's
+own GStreamer plus the yt-dlp recipe above.
 
 ### Patches on top of upstream
 
 | Recipe | Patches applied | What they are for |
 | --- | --- | --- |
-| OpenNOW | 1: `0001-keep-the-sign-in-card-out-of-the-layer-path.patch` | the sign-in card and its primary button moved out of the QML layer path, which is where pristine `v1.0.4` segfaults under the seat's Vulkan driver |
-| OpenNOWLite | 1: `0001-hand-encoded-media-to-the-host.patch` kept as documentation (its hunks are already folded into `files/native`), plus the vendored `native/` tree, `opennow-lite.c` and `opennowlite-launch.sh` | the NVST/RTP ACK fix, the cursor path and hand-encoded media straight to the host |
-| FTEQW | 2: `0001-use-the-gles2-headers-instead-of-the-desktop-gl-ones.patch`, `0002-quake3-real-time-accept-null.patch` | the tree's one Android branch reused for this board: desktop `GL/gl*.h` includes replaced by `GLES2/gl*.h` ones under `-DFTE_GLES`; and a null `qtime` let through the q3 game-trap pointer check, which is what OpenArena's `qagame.qvm` passes to `G_REAL_TIME` and what used to end the game at `Call to game trap 41` |
-| LibreQuake, OpenArena | none | data-only recipes, the release archives installed as they are |
 | Discordo | none | pristine pin; its 21 Go dependencies are vendored as one tarball instead |
-| NanoBrowser, YtGst | none | pristine upstream |
-
-The 85 OpenNOW patch files of the older pins (`files/`,
-`files-unused-playset/` and `files-legacy-987ab3da/`, ~968 K) are not in this
-branch: none of them was in `SRC_URI` any more, so they were removed from the
-tree rather than kept as an audit trail. Their md5 manifest is on the build host
-and they are recoverable from layer commit `61673a6`. What each of them did is
-still in the running log in `recipes-apps/opennow/README.md`.
+| NanoBrowser, YtGst | none | pristine upstream; only the two bbappends above are not pristine |
 
 ## Dependencies
 
@@ -89,8 +45,7 @@ These layers must be present on `BBLAYERS` to build this layer:
 | Layer | Provides |
 | --- | --- |
 | `openembedded-core`, `meta-oe`, `meta-python`, `meta-multimedia` | Base BSP / package recipes |
-| `meta-qt6` | Qt 6.8 (`qtbase`, `qtmultimedia`, `qtwebengine`, `qtshadertools`, …) |
-| `meta-rust-bin` | Rust ≥ 1.89 / `cargo-native`; OpenNOW needs edition 2024 |
+| `meta-qt6` | Qt 6.8 (`qtbase`, `qtwebengine`, `qtshadertools`, …) - NanoBrowser |
 | `meta-clang` | Clang toolchain (required by QtWebEngine on aarch64) |
 
 ---
@@ -99,11 +54,8 @@ These layers must be present on `BBLAYERS` to build this layer:
 
 - A Yocto `scarthgap` environment with the companion layers above activated
   (ST BSP manifest pulls them in automatically).
-- **Network access** during the build:
-  - `crates.io` for the OpenNOW Rust crates (`do_compile`),
-  - GitHub for the sources fetched by `SRC_URI`,
-  - ffmpeg.org for the bundled FFmpeg 9.0 tarball (its checksum is pinned in
-    the recipe so the build script does not clone GitHub during configure).
+- **Network access** during the build: GitHub for the sources fetched by
+  `SRC_URI`.
 
 ---
 
@@ -112,7 +64,7 @@ These layers must be present on `BBLAYERS` to build this layer:
 Add the layer to `BBLAYERS` and build the applications:
 
 ```bash
-bitbake opennow opennowlite discordo fteqw librequake openarena nanobrowser ytgst
+bitbake discordo nanobrowser ytgst
 ```
 
 To build everything into the reference Weston image:
@@ -137,14 +89,13 @@ relayed through the local machine. Seat-side records live in
 
 | File | What is in it |
 | --- | --- |
-| `recipes-apps/opennow/README.md` | the layer's long record: OpenNOW's configuration defaults and how the clients run on the seat, the troubleshooting table that spans the whole layer, and the running log of every round (items 1..68) |
-| `recipes-apps/opennowlite/README.md` | the OpenNOWLite round records: what the client carried, the fps probes, what a round costs the seat, and what the vendored tree changed |
-| `recipes-apps/opennowlite/files/README.md` | how to use the playing client: its switches, its credentials, its troubleshooting - the OpenNOWLite project's own README, vendored into the recipe |
-| `recipes-apps/fteqw/README.md` | the engine: how it was chosen over what has no GLES, what its makefile flags answer, the render-buffer ladder measured on this seat, the launchers' option sets and the failure modes of the console queue |
-| `recipes-apps/librequake/README.md` | what the Quake payload carries and its two-part license, plus the lqdm3 round's proof numbers |
-| `recipes-apps/openarena/README.md` | the release's own license claim, the pin, the oa_dm6 round's proof numbers, its fps spread and the Q3 gamecode's failure modes |
 | `recipes-apps/discordo/README.md` | why the pin is not HEAD, the 21 vendored modules and their versions, and what the client is on the seat |
 | `recipes-apps/nanobrowser/README.md` | how to drive the browser on the seat, its switches as the installed binary answers them, and the OpenGL-against-Vulkan page timings |
 | `recipes-apps/ytgst/README.md` | how to drive the YouTube client, its `YTGST_*` switches, what its window and subsurface are, and the panel timings that made OpenGL the shipped renderer |
+
+The OpenNOW clients, the game engines and the games themselves live in
+`meta-good-old-games`, whose `scarthgap` branch carries the long record of
+every game round, including the OpenNOW round log and the seat's troubleshooting
+table.
 
 ---
