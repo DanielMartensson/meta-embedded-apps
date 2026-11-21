@@ -92,15 +92,79 @@ of the same shape was relayed earlier to answer the same question at a smaller s
 `/gamedata/media/vlc-probe-1080p.mp4`, 2,636,572 B, sha256 `00bbbb05eb…a38121`,
 h264 1920x1080 at 30 fps, 360 frames over 12 s.
 
-What the slice bought is a decode route that can be timed rather than described:
+What the slice bought is a route that can be counted rather than described, and
+the slice is long enough to be the whole route: vlc plays it, and the panel
+shows it. The frame size is what makes the counting exact - one frame of
+1920×1080 planar I420 from vlc's `yuv` video output costs 3,110,400 B, so a
+byte count is a frame count.
 
-| the slice, `cvlc --vout yuv --yuv-file=/dev/null --stats --play-and-exit` | rc 0, 46 s of wall time against the slice's 45.041667 s, 7 log lines of which the only entries are the dbus and interface complaints and `main playlist: end of playlist, exiting` - vlc's h264 decoder and its own `yuv` video output ran the whole 1080p film at the film's rate |
-| the same sink pointed at a file, on the probe clip | 385,690,375 B written = 124 whole 1920×1080 YUV frames at 3,110,400 B a frame, against the clip's 360 frames, and a second run wrote 127: this sink is mmcfs-write bound, not decode bound, and it is the only way this build counts frames, since it prints no statistics block |
-| the same file pointed at the seat's default `gles2` display, the slice | 14,757 lines, 2,408 refused video outputs (`parent window not available` → `video output creation failed` → `failed to create video output` → `decode_slice_header error`), 301 × `no frame!` |
+## vlc's own leg
 
-So the film answers the question it was relayed for - vlc plays 1080p at the frame
-rate the media carries, audio and all - and it leaves exactly one thing open: the
-panel. `cvlc`'s interface is `dummy`, so the video output chain never gets a
-parent window, and the seat has no `/dev/fb*` device and no `/usr/share/terminfo`
-to answer that with; the window-capable legs of the film are the gstreamer and
-GL routes instead.
+| the slice, `cvlc --vout yuv --yuv-file=/dev/null --stats --play-and-exit` | rc 0, 46 s of wall time against the slice's 45.041667 s, 7 log lines of which the only entries are the dbus and interface complaints and `main playlist: end of playlist, exiting` |
+| the 12 s probe clip written through a fifo on the seat's `/tmp`, drained by `dd … bs=3110400 iflag=fullblock` | `358+1 records in` = 358 whole frames in 12 s against the clip's 360 frames at 30 fps, rc 0 - the whole clip through vlc's decoder and its own output at the clip's rate, with no compositor and no mmcfs in the way |
+| the same sink pointed at a file on the mmcfs `/gamedata` | 385,690,375 B = 124 whole frames against the clip's 360, 127 on a second run: the mmcfs write, not the decode, caps this one |
+| the seat's statistics block | not printed: `--stats` answers silence, `--print-stats` answers `vlc: unknown option or missing mandatory argument` - which is why the tallies here are byte counts and dd's records |
+
+## the same film on the panel
+
+vlc's frames go through `filesrc … ! rawvideoparse … ! waylandsink`, in 6 s
+chunks because the spool sits on a 885M tmpfs and one frame costs 3,110,400 B.
+A tee branch shrinks every frame to 32×32 GRAY8 (1,024 B) and counts it, so
+the frames the window was handed are exact, and `max-lateness = -1` means the
+sink is never told to drop.
+
+| chunk of the film | vlc wrote | frames | window open | frames to the window |
+| --- | --- | --- | --- | --- |
+| 0–6 s | 7 s | 147 | 6 s | 147 |
+| 6–12 s | 7 s | 151 | 7 s | 151 |
+| 12–18 s | 7 s | 114 | 7 s | 114 |
+| 18–24 s | 7 s | 152 | 7 s | 152 |
+| 24–30 s | 8 s | 100 | 6 s | 100 |
+| 30–36 s | 8 s | 117 | 6 s | 117 |
+| 36–42 s | 7 s | 151 | 7 s | 151 |
+| 42–48 s | 4 s | 74 | 6 s | 74 |
+| the whole film | 66 s | 1,006 | 52 s | **1,006** |
+
+The film is 1,081 frames over 45.041667 s, so 1,006 of its frames reached the
+window, 93 % of them, over 52 s of window time: about 19 fps presented against
+the film's own 24 fps, and 16 to 24 fps per chunk. The whole film costs about
+118 s of wall time, because the write leg and the window leg run one after the
+other.
+
+The window is read out of the seat's own scene graph, 2 s into a chunk, and its
+PID is the `gst-launch` of that chunk:
+
+```
+View 0 (role xdg_toplevel, PID 109136, surface ID 3, top-level window)
+View 1 (role wl_subsurface, PID 109136, surface ID 10, sub-surface)
+```
+
+The gallery record is the capture taken inside every chunk: `chunk0.png` …
+`chunk7.png` carry the film, 497,624 B to 3,519,568 B, eight distinct md5s,
+against `start.png` at 157,537 B of unchanged panel.
+
+## why the chunks, and what the fifo does instead
+
+Wiring vlc and gstreamer to the same fifo makes the two halves wait for each
+other, and the loss is measurable: over the 12 s probe clip the tally branch
+counted **8 frames of the clip's 360** in 16 s of wall time, both sides rc 0,
+and over the 45 s film the window simply stops - the captures at +10 s and
++20 s carry the film (2,525,855 B and 3,587,978 B), the captures at +30 s and
++40 s are the unchanged panel (157,653 B each), and the sink logged 27 ×
+"A lot of buffers are being dropped". vlc's own log across such a run carries
+no complaint at all, so the player silently stops delivering when its write
+end is starved, and the chunking is what lets the writer finish before the
+window reads.
+
+| what vlc's default `gles2` display does instead, over the slice | 14,757 log lines, 2,408 refused video outputs (`parent window not available` → `video output creation failed` → `failed to create video output` → `decode_slice_header error`), 301 × `no frame!` |
+
+So the film answers the question it was relayed for, in the two parts it takes
+on this seat: vlc decodes and presents the film at the frame rate the media
+carries (its own `yuv` output, the film's whole length inside its own wall
+time, audio included), and the panel shows 93 % of the film's frames at about
+19 fps in 6 s chunks through the gstreamer sink. What vlc cannot do is put its
+pixels on the panel itself - `cvlc`'s interface is `dummy`, so the output chain
+never gets a parent window, and this seat has no `/dev/fb*` device and no
+`/usr/share/terminfo` to answer that with. The panel leg of a 1080p film is
+therefore the seat's compositor and the sink, not the player, and making the
+player itself own a window belongs to `layers/meta-watermelon-wine`.

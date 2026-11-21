@@ -36,10 +36,32 @@ HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
   cvlc --stats --play-and-exit /gamedata/media/my-clip.mp4
 ```
 
-`--stats` is the part that makes a play measurable: it prints the player's own
-end-of-play block, and the seat's frame rate of a video is `frames decoded` against
-the clip's own frame count, with `frames missed` and `frames dropped` as the two
-ways it can lose them.
+That play is complete but **sound only**: vlc's own window-capable displays
+(`gles2`, `egl_wl`, `wl_shell`, `xdg_shell`, `wl_shm`) all refuse on this seat,
+so no pixels reach the panel and the player's statistics block is not printed
+either (`--stats` answers silence, `--print-stats` answers `unknown option`).
+The frame counts of this build come from the bytes its `yuv` video output
+writes - one 1920x1080 planar frame is a fixed size, so bytes are frames.
+
+To get the film **on the panel**, hand those bytes to the seat's compositor
+through gstreamer's `waylandsink`, one chunk at a time:
+
+```sh
+HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
+  cvlc --vout yuv --yuv-file=/tmp/spool.yuv --start-time=0 --stop-time=6 \
+  --play-and-exit /gamedata/media/bbb-45s.mp4
+
+HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
+  gst-launch-1.0 -f filesrc location=/tmp/spool.yuv \
+  ! rawvideoparse width=1920 height=1080 framerate=24/1 format=i420 \
+  ! waylandsink
+```
+
+`rawvideoparse` reads raw bytes, so the decode in that pair is always vlc's.
+The chunk is 6 s because the spool sits on the seat's `/tmp`, whose size sets
+the chunk; the write leg and the window leg run one after the other, so a
+chunk's picture and its sound are not in step - play the first command alone
+when the sound has to be in step.
 
 Put a clip on the seat's own writable `/gamedata/media/` rather than in `/usr/share`:
 the seat's rootfs has no room for a 1080p master, which is why the film this layer

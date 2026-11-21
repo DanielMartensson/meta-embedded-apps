@@ -29,9 +29,21 @@ HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
   cvlc --stats --play-and-exit /gamedata/media/bbb-45s.mp4
 ```
 
-Then read the player's own statistics block against the clip's own frame count:
-`frames decoded` out of `frame count`, with `frames missed` and `frames dropped`
-as the two ways it can lose them. That is the seat's video frame rate.
+That play carries the film and its sound, and vlc's decode rate is proved by the
+wall time against the slice's own length: the 45 s slice runs inside its own 45 s.
+This build prints no statistics block, so the seat's video frame rate is counted
+from the bytes vlc's `yuv` output writes - one 1920x1080 planar frame is a fixed
+size, so bytes are frames - and the film's frames reach the panel in chunks:
+
+```sh
+HOME=/home/weston XDG_RUNTIME_DIR=/home/weston WAYLAND_DISPLAY=wayland-1 \
+  gst-launch-1.0 -f filesrc location=/tmp/spool.yuv \
+  ! rawvideoparse width=1920 height=1080 framerate=24/1 format=i420 \
+  ! waylandsink
+```
+
+The spool is what the `cvlc --vout yuv` above wrote, so the decode stays vlc's:
+`rawvideoparse` only reads raw bytes.
 
 A still of what is on the panel is taken the way every other round on this seat
 takes one:
