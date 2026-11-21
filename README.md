@@ -6,24 +6,31 @@ file next to the recipe that owns it. The games and the engines they run on live
 in `meta-good-old-games`, and everything that is OS-level lives in
 `layers/meta-watermelon-wine`.
 
+Every upstream source below is pinned to a commit or a tarball, and the pin's exact
+hash lives in the recipe's `SRC_URI` - and in the recipe's `PROOF.md` where that file
+exists - rather than in this table: hashes do not belong on the screen this file is
+meant to be read from.
+
 ## What is in this branch
 
 | Application | Recipe | Upstream pin | Installed on the seat | What it does |
 | --- | --- | --- | --- | --- |
-| Discordo | `recipes-apps/discordo/discordo_git.bb` | [ayn2op/discordo](https://github.com/ayn2op/discordo) `31905f3e790e63cd0f2366526afe41fb278c226e` | `0.1+git0+31905f3e79-r0.01` | terminal Discord client in the seat's weston-terminal; 21 vendored Go modules, no network at build |
-| NanoBrowser | `recipes-apps/nanobrowser/nanobrowser_git.bb` | [DanielMartensson/NanoBrowser](https://github.com/DanielMartensson/NanoBrowser) `b5e01869c10140799085a20d2c18cadb37c3f977` | `0.1+git${SRCPV}-r0.32` | minimal QML browser on QtWebEngine; `--page`, `NANOBROWSER_TIMING`, build default renderer OpenGL (measured 1.3 s to first frame against Vulkan's 3.1 s) |
-| YtGst | `recipes-apps/ytgst/ytgst_git.bb` | [DanielMartensson/YtGst](https://github.com/DanielMartensson/YtGst) `9cb2a60806907c6ac91fa3924ea17f910f2172af` | `0.1+git${SRCPV}-r0.48` | YouTube client on GStreamer + yt-dlp with V4L2 hardware decode; picture in a Wayland subsurface of its own window, `YTGST_*` switches |
-| VLC | `recipes-multimedia/vlc/vlc_3.0.20.bbappend` | upstream's own [vlc_3.0.20.bb](https://get.videolan.org/vlc/3.0.20/vlc-3.0.20.tar.xz) in `meta-multimedia`, tar `adc7285b4d2721cddf40eb5270cada2aaa10a334cb546fd55a06353447ba29b5` | `3.0.20-r0.0` + `libvlc 3.0.20-r0.0`, built and not yet installed (see the seat note below) | media player whose decode route is GStreamer, whose display half is Wayland + GL ES 2 and whose whole X half is switched off |
+| Discordo | `recipes-apps/discordo/discordo_git.bb` | [ayn2op/discordo](https://github.com/ayn2op/discordo), pinned to a commit | installed | terminal Discord client in the seat's weston-terminal; 21 vendored Go modules, no network at build |
+| NanoBrowser | `recipes-apps/nanobrowser/nanobrowser_git.bb` | [DanielMartensson/NanoBrowser](https://github.com/DanielMartensson/NanoBrowser), pinned to a commit | installed | minimal QML browser on QtWebEngine; `--page`, `NANOBROWSER_TIMING`, build default renderer OpenGL (measured 1.3 s to first frame against Vulkan's 3.1 s) |
+| YtGst | `recipes-apps/ytgst/ytgst_git.bb` | [DanielMartensson/YtGst](https://github.com/DanielMartensson/YtGst), pinned to a commit | installed | YouTube client on GStreamer + yt-dlp with V4L2 hardware decode; picture in a Wayland subsurface of its own window, `YTGST_*` switches |
+| VLC | `recipes-multimedia/vlc/vlc_3.0.20.bbappend` | upstream's own [vlc_3.0.20.bb](https://get.videolan.org/vlc/3.0.20/vlc-3.0.20.tar.xz) in `meta-multimedia`, which this layer only appends | installed: `vlc` and `libvlc`, both at `3.0.20-r0.0` | media player whose decode route is GStreamer, whose display half is Wayland + GL ES 2 and whose whole X half is switched off |
 
 ### Media payloads
 
 The film that makes the player above a proof rather than an installation: a
 1080p H.264 master is what shows the `--enable-gst-decode` route carries a real
-picture to this board's panel at the seat's own 1920x1080.
+picture to this board's panel at the seat's own 1920x1080. **The film is that
+example and nothing more** - it is not part of the seat's shelf, and what the
+seat-side proof needs of it is a slice, relayed and then deleted.
 
-| Payload | Recipe | Upstream pin | Installed on the seat | What it is |
+| Payload | Recipe | Upstream pin | How it gets to the seat | What it is |
 | --- | --- | --- | --- | --- |
-| Big Buck Bunny 1080p | `recipes-multimedia/bigbuckbunny/bigbuckbunny.bb` | [download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov.zip](https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov.zip) `402d6625f614631627d518b931865c9c4aefbbf3b75ed0494672e77ff510666d` | `1.0.0-r0.01`, built and not yet deployed (see the seat note below) | the Blender Foundation's open film, 725,106,140 B, one file, licensed CC BY 3.0 and pinned as a `LicenseRef` in the recipe |
+| Big Buck Bunny 1080p | `recipes-multimedia/bigbuckbunny/bigbuckbunny.bb` | [download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov.zip](https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_1080p_h264.mov.zip), pinned to its sha256 | the member is relayed to `/gamedata/media`, never `dpkg -i` | the Blender Foundation's open film, one file, licensed CC BY 3.0 and pinned as a `LicenseRef` in the recipe |
 
 ### Bundled dependencies
 
@@ -42,7 +49,7 @@ own GStreamer plus the yt-dlp recipe above. VLC brings no new recipe at all: the
 three gstreamer packages its decode route names, and the ffmpeg packages its
 `Depends` names, are already on the seat, and the film is one file with no
 `Depends`. The only file the layer vendors for the pair is the film's
-`files/LICENSE.txt`, the 657-byte CC BY 3.0 note `LIC_FILES_CHKSUM` checksums,
+`files/LICENSE.txt`, the CC BY 3.0 note `LIC_FILES_CHKSUM` checksums,
 because a movie has no source-tree license file of its own.
 
 ### Patches on top of upstream
@@ -112,27 +119,30 @@ reboot is needed. This board's build host cannot ssh to the seat, so the deb is
 relayed through the local machine. Seat-side records live in
 `layers/meta-watermelon-wine`.
 
-The film is the exception, and the numbers say why: its deb unpacks 725,106,140
-bytes, against a rootfs that measured 231,616 kB free, so `dpkg -i` of that
-deb is not attempted at all. The member is relayed as the file it already is,
-to `/gamedata/media/bigbuckbunny/` on the seat's 8 GB writable mount, and
-verified there against the member's sha256. VLC's two debs, at 2,299,708 and
-430,968 bytes, do go through `dpkg -i`.
+The film is the exception, and the reason is space rather than licence: its deb
+unpacks the whole 1080p master into `/usr/share`, against a rootfs that has
+kilobytes of room left rather than megabytes, so `dpkg -i` of that deb is not
+attempted at all. The member is relayed as the file it already is, to the seat's
+own writable `/gamedata` mount, and verified there against the member's sha256 -
+the numbers of both ends are in
+[`recipes-multimedia/bigbuckbunny/PROOF.md`](recipes-multimedia/bigbuckbunny/PROOF.md).
+VLC's two debs do go through `dpkg -i`, and the seat's package database says so
+once they are in.
 
 ## Where the details live
 
 | File | What is in it |
 | --- | --- |
-| `recipes-apps/discordo/README.md` | why the pin is not HEAD, the 21 vendored modules and their versions, and what the client is on the seat |
+| `recipes-apps/discordo/README.md` + `PROOF.md` | README: how to build and run the client on the seat. PROOF: why the pin is not HEAD, the 21 vendored modules and their versions, and what the seat has |
 | `recipes-apps/nanobrowser/README.md` | how to drive the browser on the seat, its switches as the installed binary answers them, and the OpenGL-against-Vulkan page timings |
 | `recipes-apps/ytgst/README.md` | how to drive the YouTube client, its `YTGST_*` switches, what its window and subsurface are, and the panel timings that made OpenGL the shipped renderer |
-| `recipes-multimedia/vlc/README.md` | why the player is a bbappend of upstream's recipe rather than one of this layer, what upstream asks for that this board does not have, the deb's measured size, hash and plugin tree, and how to run `cvlc` on the seat |
-| `recipes-multimedia/bigbuckbunny/README.md` | the carrier's and the member's sizes and sha256s, the CC BY 3.0 note and the two build answers the payload needed, and how the film gets to the seat's writable mount without a `dpkg -i` |
+| `recipes-multimedia/vlc/README.md` + `PROOF.md` | README: how to build and run the player on the seat. PROOF: why it is a bbappend of upstream's recipe, what upstream asks for that this board does not have, the debs, the plugin tree's counts, the seat's install and the measured 1080p play |
+| `recipes-multimedia/bigbuckbunny/README.md` + `PROOF.md` | README: what the film is for and how the decode route is proved on the seat. PROOF: the carrier's and the member's sizes and sha256s, the CC BY 3.0 note, and the two build answers the payload needed |
 
-This layer keeps no `PROOF.md` files: where the games layer splits its long
-record into a `PROOF.md` next to each engine, the measurements of these
-applications live in the `README.md` beside the recipe that owns them, and the
-games layer's `PROOF.md` files stay in that layer.
+Where an application of this layer was measured, its numbers now live in a `PROOF.md`
+next to its recipe rather than in the `README.md`, so the README stays the one screen
+a human reads before building or running something. The games layer keeps the same
+shape, and its `PROOF.md` files stay in that layer.
 
 The OpenNOW clients, the game engines and the games themselves live in
 `meta-good-old-games`, whose `scarthgap` branch carries the long record of
