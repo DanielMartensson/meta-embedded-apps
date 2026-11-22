@@ -1,0 +1,235 @@
+#!/bin/sh
+# vlc-play - play a film on this seat's panel, at the film's own rate.
+#
+#   vlc-play film.mp4            the smooth route
+#   vlc-play --count film.mp4    the same run, with the window's frame tally
+#   vlc-play --sw film.mp4       gstreamer's own software decode, with sound
+#   vlc-play --count --sw film   the counted software leg (no sound, see below)
+#   vlc-play --vlc film.mp4      vlc's own decode, chunked through a spool
+#
+# VLC 3.0.20 on this board puts no picture on the panel by itself: every one of
+# its window-capable outputs (egl_wl, gl, gles2, wl_shell, xdg_shell, wl_shm,
+# fb, vmem) answers "main video output error: video output creation failed",
+# because the display asks weston for a parent window and the interface the
+# player runs has none to give. So the film's pixels go to the panel through
+# the seat's compositor by way of gstreamer, and the decode is chosen by what
+# the file's first video stream actually is, read off with ffprobe rather than
+# guessed from the extension:
+#
+#   H.264 in an mp4/MOV-family container - gstreamer's v4l2slh264dec, which is
+#   the SoC's own stateless H.264 block (st,stm32mp25-vdec-dec, /dev/video5),
+#   and the seat's ALSA sink for the sound. One pipeline, one pass over the
+#   file: the 45 s 1080p film reaches the window with all 1,081 of its frames
+#   in 45.5 s of wall time and 30 % of one core, so the seat's headroom is
+#   what makes the play smooth.
+#
+#   anything else, or --sw - gstreamer's own software decode. Uncounted that is
+#   playbin, whose picture sink is this file's waylandsink and whose sound goes
+#   to the seat's own sink; counted it is one uridecodebin with a tee branch,
+#   and that counted leg has no sound, because the two pads of one uridecodebin
+#   stall on this build. Both forms run the film at its own rate too, but the
+#   software decode spends nearly both of the seat's two cores.
+#
+#   --vlc - cvlc --vout yuv writes the film's frames to a spool on the seat's
+#   /tmp and gstreamer presents the spool, chunk by chunk, because the spool
+#   has to fit in /tmp (one 1920x1080 planar frame costs w*h*3/2 bytes and
+#   /tmp is 885M). This is the route where vlc's own decoder does the work, and
+#   it is the slower one; its numbers are in PROOF.md beside this file.
+#
+# The count is the same runs with a tee branch that shrinks every frame to
+# 32x32 GRAY8 (1,024 B) and counts it, so the frames the window was handed are
+# exact rather than the frames the decoder read. The seat's H.264 block cannot
+# be reached through uridecodebin - asking that element for an h264 stream
+# answers "Internal data stream error" and "pipeline doesn't want to preroll",
+# and the two-pad form with an h264 cap never ends - so the hardware route is
+# the one that names its own demuxer, whose pads are really called video_0 and
+# audio_0.
+#
+# The run needs the seat's Weston session, which a shell that was not started
+# inside it does not carry, so the environment is set here when it is missing.
+
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    HOME=/home/weston
+    XDG_RUNTIME_DIR=/home/weston
+    WAYLAND_DISPLAY=wayland-1
+    export HOME XDG_RUNTIME_DIR WAYLAND_DISPLAY
+fi
+
+count=""
+vlc_route=""
+sw_route=""
+film=""
+for a in "$@"; do
+    case $a in
+        --count) count=1 ;;
+        --vlc) vlc_route=1 ;;
+        --sw) sw_route=1 ;;
+        -h|--help) film=help ;;
+        -*) echo "vlc-play: not a switch of this file: $a" >&2; exit 1 ;;
+        *) film=$a ;;
+    esac
+done
+
+if [ "$film" = help ] || [ ! -f "$film" ]; then
+    [ "$film" = help ] || echo "vlc-play: no such file: ${film:-none}" >&2
+    echo "usage: vlc-play [--count] [--sw] [--vlc] film" >&2
+    exit 1
+fi
+case $film in
+    /*) ;;
+    *) film=$(readlink -f -- "$film" 2>/dev/null || echo "x") ;;
+esac
+
+ff() {
+    what=$1
+    shift
+    ffprobe -v error -show_entries "$what" -of default=noprint_wrappers=1:nokey=1 \
+        "$@" 2>/dev/null
+}
+vcodec=$(ff stream=codec_name -select_streams v:0 "$film" | head -1)
+vshape=$(ff stream=width,height -select_streams v:0 "$film")
+vratio=$(ff stream=r_frame_rate -select_streams v:0 "$film" | head -1)
+audio=$(ff stream=codec_name -select_streams a:0 "$film" | head -1)
+container=$(ff format=format_name "$film" | head -1)
+long=$(ff format=duration "$film" | head -1)
+w=$(echo "$vshape" | sed -n 1p)
+h=$(echo "$vshape" | sed -n 2p)
+
+echo "vlc-play: $film - $container, $vcodec $w x $h @ $vratio, audio ${audio:-none}, $long s"
+
+if [ -z "$vcodec" ]; then
+    echo "vlc-play: ffprobe does not read a video stream out of this file" >&2
+    exit 1
+fi
+
+tally=/tmp/vlc-play-tally.gray
+hw=""
+case $container in
+    *mp4*|*mov*|*mj2*|*3gp*|*3g2*) [ "$vcodec" = h264 ] && hw=1 ;;
+esac
+
+if [ -z "$vlc_route" ] && [ -z "$sw_route" ] && [ -n "$hw" ]; then
+    echo "vlc-play: the seat's own H.264 block, one pass over the file"
+    rm -f "$tally"
+    if [ -n "$count" ]; then
+        if [ -n "$audio" ]; then
+            gst-launch-1.0 -q filesrc location="$film" \
+                ! qtdemux name=d \
+                d.video_0 ! queue ! h264parse ! v4l2slh264dec ! videoconvert \
+                ! tee name=t \
+                t. ! queue ! waylandsink max-lateness=-1 \
+                t. ! queue ! videoscale ! video/x-raw,width=32,height=32 \
+                ! videoconvert ! video/x-raw,format=GRAY8 \
+                ! filesink location="$tally" \
+                d.audio_0 ! queue ! decodebin \
+                ! audioconvert ! audioresample ! alsasink
+        else
+            gst-launch-1.0 -q filesrc location="$film" \
+                ! qtdemux name=d \
+                d.video_0 ! queue ! h264parse ! v4l2slh264dec ! videoconvert \
+                ! tee name=t \
+                t. ! queue ! waylandsink max-lateness=-1 \
+                t. ! queue ! videoscale ! video/x-raw,width=32,height=32 \
+                ! videoconvert ! video/x-raw,format=GRAY8 \
+                ! filesink location="$tally"
+        fi
+    else
+        if [ -n "$audio" ]; then
+            gst-launch-1.0 -q filesrc location="$film" \
+                ! qtdemux name=d \
+                d.video_0 ! queue ! h264parse ! v4l2slh264dec \
+                ! videoconvert ! waylandsink max-lateness=-1 \
+                d.audio_0 ! queue ! decodebin \
+                ! audioconvert ! audioresample ! alsasink
+        else
+            gst-launch-1.0 -q filesrc location="$film" \
+                ! qtdemux name=d \
+                d.video_0 ! queue ! h264parse ! v4l2slh264dec \
+                ! videoconvert ! waylandsink max-lateness=-1
+        fi
+    fi
+    rc=$?
+    if [ -n "$count" ]; then
+        t=$(stat -c %s "$tally" 2>/dev/null)
+        echo "vlc-play: the window was handed $(( ${t:-0} / 1024 )) frames"
+    fi
+    rm -f "$tally"
+    exit $rc
+fi
+
+if [ -z "$vlc_route" ]; then
+    echo "vlc-play: gstreamer's own software decode, its sound on the seat's sink"
+    rm -f "$tally"
+    if [ -n "$count" ]; then
+        if [ -n "$audio" ]; then
+            gst-launch-1.0 -q uridecodebin name=dec uri="file://$film" \
+                dec. ! video/x-raw ! tee name=t \
+                t. ! queue ! waylandsink max-lateness=-1 \
+                t. ! queue ! videoscale ! video/x-raw,width=32,height=32 \
+                ! videoconvert ! video/x-raw,format=GRAY8 \
+                ! filesink location="$tally" \
+                dec. ! audio/x-raw ! audioconvert ! audioresample ! alsasink
+        else
+            gst-launch-1.0 -q uridecodebin name=dec uri="file://$film" \
+                dec. ! video/x-raw ! tee name=t \
+                t. ! queue ! waylandsink max-lateness=-1 \
+                t. ! queue ! videoscale ! video/x-raw,width=32,height=32 \
+                ! videoconvert ! video/x-raw,format=GRAY8 \
+                ! filesink location="$tally"
+        fi
+    else
+        if [ -n "$audio" ]; then
+            gst-launch-1.0 -q uridecodebin name=dec uri="file://$film" \
+                dec. ! video/x-raw ! queue ! waylandsink max-lateness=-1 \
+                dec. ! audio/x-raw ! audioconvert ! audioresample ! alsasink
+        else
+            gst-launch-1.0 -q uridecodebin name=dec uri="file://$film" \
+                dec. ! video/x-raw ! queue ! waylandsink max-lateness=-1
+        fi
+    fi
+    rc=$?
+    if [ -n "$count" ]; then
+        t=$(stat -c %s "$tally" 2>/dev/null)
+        echo "vlc-play: the window was handed $(( ${t:-0} / 1024 )) frames"
+    fi
+    rm -f "$tally"
+    exit $rc
+fi
+
+echo "vlc-play: vlc's own decode, the film's frames spooled and presented"
+frame_b=$((w * h * 3 / 2))
+fps=$(echo "$vratio" | cut -d/ -f1)
+t0=$(date +%s)
+start=0
+whole=$(printf '%s' "$long" | cut -d. -f1)
+tot=0
+while [ "$start" -lt "$whole" ]; do
+    stop=$((start + 6))
+    spool=/tmp/vlc-play-spool-$$-$start.yuv
+    rm -f "$spool"
+    cvlc --vout yuv --yuv-file="$spool" --start-time="$start" \
+        --stop-time="$stop" --play-and-exit "$film" >/dev/null 2>&1
+    n=$(( $(stat -c %s "$spool" 2>/dev/null) / frame_b ))
+    rm -f "$tally"
+    if [ -n "$count" ]; then
+        gst-launch-1.0 -q filesrc location="$spool" \
+            ! rawvideoparse width="$w" height="$h" framerate="$fps"/1 format=i420 \
+            ! tee name=t \
+            t. ! queue ! waylandsink max-lateness=-1 \
+            t. ! queue ! videoscale ! video/x-raw,width=32,height=32 \
+            ! videoconvert ! video/x-raw,format=GRAY8 ! filesink location="$tally" \
+            >/dev/null 2>&1
+        g=$(( $(stat -c %s "$tally" 2>/dev/null) / 1024 ))
+        tot=$((tot + g))
+        echo "vlc-play: chunk at ${start}s: vlc wrote $n frames, window got $g"
+    else
+        gst-launch-1.0 -q filesrc location="$spool" \
+            ! rawvideoparse width="$w" height="$h" framerate="$fps"/1 format=i420 \
+            ! waylandsink max-lateness=-1 >/dev/null 2>&1
+        echo "vlc-play: chunk at ${start}s: vlc wrote $n frames"
+    fi
+    rm -f "$spool"
+    start=$stop
+done
+echo "vlc-play: $(( $(date +%s) - t0 )) s of wall time, $tot frames handed"
+rm -f "$tally"

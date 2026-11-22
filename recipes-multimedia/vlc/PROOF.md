@@ -82,6 +82,44 @@ The seat's copy of the plugin tree is the shape above: 25 categories under
 68,584 B. Installing the player took the rootfs from 239,392 kB free to 214,656 kB
 free - it fits, and it is the reason the film is not deployed the same way.
 
+## The interface question, read off the seat rather than off the deb
+
+The three wrappers the deb installs name themselves, and the answer they give to
+"does this build have a UI at all" is better than the one an earlier round wrote:
+
+```
+/usr/bin/cvlc   exec /usr/bin/vlc -I "dummy" -L "dumb" "$@"
+/usr/bin/nvlc   exec /usr/bin/vlc -I "ncurses" -L "dumb" "$@"
+/usr/bin/rvlc   exec /usr/bin/vlc -I "rc" "$@"
+```
+
+`TERM=linux nvlc /gamedata/media/vlc-probe-1080p.mp4` answers rc 0 and draws the
+whole text interface on the panel: the title line `VLC media player - 3.0.20`, the
+help box with its keys, and the information box with `Position : 00:00/00:12`,
+`Volume : 100%`, `[Stream 0] Codec: H264` and `Frame rate: 30`. The sweep over
+`TERM` says which of those names the seat's database knows:
+
+| `TERM` given to `nvlc` | answer |
+| --- | --- |
+| `linux`, `rxvt`, `ansi`, `dumb`, `vt100`, `xterm`, `xterm-256color` | rc 0, the same UI |
+| `weston`, `putty`, `unknown` | rc 1, `Error opening terminal: <name>.` |
+
+The reason the earlier round's `Error opening terminal: unknown.` looked like a
+missing terminal database is a missing `TERM`, not a missing database: this seat
+carries its terminfo tree at `/etc/terminfo` and has no `/usr/share/terminfo` at
+all, which is also why `weston` and `putty` are not in it. So the ncurses
+interface is reachable from this layer and the sentence that called a GUI
+unreachable was wrong; what is still true is that no **picture** is, because the
+video output chain is dead in this build and an interface that owns a window is
+an OS-level change to `layers/meta-watermelon-wine`, not this recipe's.
+
+The same `nvlc` run with vlc's own `yuv` output attached is what puts the frame
+count on the text UI's clock: `nvlc --vout yuv --yuv-file=/tmp/nvlc-yuv.yuv
+<probe clip>` wrote 182 whole 1920×1080 I420 frames, 566,093,923 B, in about 7 s
+of wall time - ~26 frames a second against the clip's 30 - while the box printed
+the position, the volume, the codec and the frame rate above. That is leg one of
+the table below, with a UI in front of it.
+
 ## The measured 1080p play
 
 The seat runs `cvlc`, whose interface is `dummy` (`-I dummy`), so there is no
@@ -153,6 +191,40 @@ The gallery record is the captures taken inside each chunk: `chunk0.png` …
 while `start.png` taken before any of it plays is 157,537 B of unchanged
 panel.
 
+## The gstreamer route, which is the one that plays smoothly
+
+The chunked spool above is vlc's decode handed over. The route that does not
+need that hand-over is the seat's own decode: gstreamer's `v4l2slh264dec`,
+which is this SoC's stateless H.264 block - `st,stm32mp25-vdec-dec` at
+`/dev/video5`, one of the four media devices the board exposes and the one
+whose name says decode - fed by `filesrc` and `qtdemux` and presented by
+`waylandsink`. Both halves of that are packages the seat already carries at
+`1.22.12-r0.0`: `gstreamer1.0-plugins-bad-v4l2codecs` for the decoder and
+`gstreamer1.0-plugins-bad-waylandsink` for the sink.
+
+Measured on the 12 s probe clip, decode only into `fakesink`, the two decoders
+against each other:
+
+| the probe clip's h264 stream | decode alone | the same chain to the panel |
+| --- | --- | --- |
+| `filesrc ! qtdemux ! h264parse ! v4l2slh264dec ! fakesink` | 9.51 s of wall time for the clip's 360 frames | 12.27 s at 4 % of one core once `videoconvert ! waylandsink max-lateness=-1` is added |
+| the same chain with `avdec_h264` in place of the block | 9.58 s at 178 % of the seat's two cores | - |
+
+So the block reads the clip faster than its own length and costs the seat
+nothing, and the software decoder costs a whole core. That is what made the
+route a launcher rather than an experiment: [../vlc-play/PROOF.md](../vlc-play/PROOF.md)
+carries the launcher's own measured rounds - the 45 s film reaching the window
+with all 1,081 of its frames at 28 % of one core on this route, its software
+route at 86 % of the seat's cores, and its `--vlc` route, which is the chunked
+spool above, at 105 %.
+
+The film's own two captures from inside that hardware round are at
+`/gamedata/installs/shots/vlc-play/` (`film-at-10s.png` 2,320,798 B,
+`film-at-30s.png` 3,340,549 B): the 1080p frame is fullscreen on the panel in
+both, the hillside at +10 s and the burrow at +30 s, with the seat's own
+`weston-desktop-shell` bar under it. They are that directory's, not this
+recipe's, and the launcher owns them.
+
 ## The fifo route, which is why the chunking is needed
 
 Pointing vlc at the fifo and gstreamer at the same fifo makes the two halves
@@ -177,15 +249,18 @@ decodes and presents the film at the film's own rate, and the panel leg shows
 93 % of its frames at ~19 fps in 6 s chunks. What this seat cannot do is put
 vlc's pixels on the panel by itself, and the reason is the same in all of them
 - the video output chain asks its display for a parent window and the dummy
-interface never gives one, and this seat has no `/dev/fb*` device to fall back
-to and no `/usr/share/terminfo` at all.
+interface never gives one, and this seat has no `/dev/fb*` to fall back to.
+The terminal half of the same sentence is no longer a dead end: the seat's
+terminfo lives at `/etc/terminfo` rather than at `/usr/share/terminfo`, and
+the interface sweep above is what reaches it.
 
 | failure mode | what the seat does | what answers it |
 | --- | --- | --- |
 | `--vout chain=`, `--vout display=`, `--vout module=`, `--vout shell=` - eleven spellings swept | all silently ignored: each leaves the identical 360-failure signature on the probe clip, and `--vout bogus=1` is accepted too, so the spelling cannot even be validated | `--vout` takes exactly ONE bare value: `--vout yuv`, `--vout egl_wl`, `--vout fb` |
 | `--vout egl_wl`, `--vout egl`, `--vout gl`, `--vout fb --fbdev=/dev/null`, `--vmem-width/height/pitch`, `--flaschen-width/height` on the probe clip | `main video output error: video output creation failed` once per attempted frame and `no frame!` once per attempted frame; `parent window not available` stops appearing, because only the display's name moved | the Wayland display plugins are in the tree (`libegl_wl_plugin.so`, `libwl_shell_plugin.so`, `libxdg_shell_plugin.so`, `libwl_shm_plugin.so` - `libegl_wl_plugin.so` links `wl_egl_window_create`) and are in the deb's 363 entries, but a chain with no window provider is dead in this build |
 | `--fb`, `--yuv`, `--vmem`, `--flaschen`, `--gl` as bare module names | `vlc: unknown option or missing mandatory argument` - the option wants an argument, and its argument is what enables the module | the namespaced names from `--longhelp`: `--fbdev`, `--yuv-file`, `--vmem-width`/`--vmem-height`/`--vmem-pitch`, `--flaschen-width`/`--flaschen-height` |
-| `--intf=sdl`, `--intf=ncurses` | `--intf=sdl` exits at rc 1 with an empty log and puts no window on the panel; `--intf=ncurses` answers `Error opening terminal: unknown.` | the seat has no `/usr/share/terminfo` directory at all; an interface that provides a window is an OS-level layer change, not this recipe's |
+| `-v 2` asked for as a verbose run | `vlc: unknown option or missing mandatory argument`, and a file called `2` is opened as an MRL | `--longhelp` reads `-v --verbose <integer>`: the value has to be attached, and `-v` alone means verbose plus a playlist |
+| `--intf=sdl`, `--intf=ncurses`, a bare `nvlc` with no `TERM` | `--intf=sdl` exits at rc 1 with an empty log and puts no window on the panel; a bare `nvlc` answers `Error opening terminal: unknown.` | the seat has no `/usr/share/terminfo` at all, and a bare `nvlc` from an ssh session has no `TERM` either - the fix is `TERM=linux nvlc`, which answers rc 0, so the row is about the name, not about the database |
 | `--gl-vout`, `--egl-vout`, `--wayland-vout`, `--x11-vout` | `vlc: unknown option or missing mandatory argument` for all of them | they are not this build's option names; `--longhelp` at 1,343 lines carries no `vout` option and no Wayland section, only the `yuv`/`vmem`/`flaschen`/`fb` output sections |
 | `--dump-config`, `--help-list` | `vlc: unknown option or missing mandatory argument`; `--help-list` prints 2 lines | the config file's shape is not readable this way, only `--longhelp` |
 
@@ -196,4 +271,6 @@ The seat's deb is the unsplit 3.0.20 shape and already carries that same plugin 
 `codec/libgstdecode_plugin.so` at 68,584 B - and the measured `--codec=gstdecode`
 round failed at the video output rather than at the demuxer, so nothing is
 missing on the seat. The open item stays the panel leg: vlc 3.0.20's window-capable
-displays need a window provider this seat does not have.
+displays need a window provider this seat does not have, which is why the film
+goes to the panel through gstreamer instead - and, since this round, through the
+launcher this layer now ships beside it.
