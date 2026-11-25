@@ -10,15 +10,16 @@ meta-layer for that release series. `main` is only the index.
 | --- | --- | --- |
 | `main` | Index only | This landing page |
 | `scarthgap` | Active | Meta-layer for Yocto `scarthgap` |
+| `wrynose` | Active | Meta-layer for Yocto `wrynose` |
 | *(next release)* | — | New release branches are added here following the same naming |
 
 ## Applications
 
 | Application | Description | Recipe | Branch |
 | --- | --- | --- | --- |
-| **Discordo** | Terminal Discord client, written in Go, with its 21 dependencies vendored | `recipes-apps/discordo` | `scarthgap` |
-| **NanoBrowser** | Minimal QtWebEngine/QML browser | `recipes-apps/nanobrowser` | `scarthgap` |
-| **YtGst** | YouTube client on GStreamer + yt-dlp (V4L2 hardware decode) | `recipes-apps/ytgst` | `scarthgap` |
+| **Discordo** | Terminal Discord client, written in Go, with its 21 dependencies vendored | `recipes-apps/discordo` | `scarthgap`,`wrynose`  |
+| **NanoBrowser** | Minimal QtWebEngine/QML browser | `recipes-apps/nanobrowser` | `scarthgap`,`wrynose` |
+| **YtGst** | YouTube client on GStreamer + yt-dlp (V4L2 hardware decode) | `recipes-apps/ytgst` | `scarthgap`,`wrynose` |
 
 Dependency recipes (GStreamer, Qt 6, yt-dlp etc.) live alongside the
 applications in each branch. The games and the CloudMatch clients are not in
